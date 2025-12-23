@@ -1,0 +1,74 @@
+# 持续性身份认证（Continuous Authentication）统一配置文件
+# 说明：
+# - 本文件集中管理“数据预处理/滑窗/训练/认证策略”的关键阈值，方便后期直接修改参数而无需改代码。
+# - 采用 TOML（支持中文注释），由 server 侧代码在运行时读取。
+
+[processing]
+# 触发预处理的阈值：当单个用户（一个设备ID目录）下的 raw session 文件总量达到该值（MB）才开始处理。
+# 对应需求中的“100MB”。
+min_total_mb = 100
+
+# 选择用于处理的数据量目标：将 session 按时间顺序（文件名时间戳或 mtime 升序）排序，
+# 再从最早的 session 开始累加，优先凑够该目标值（MB）后停止（得到前 x 个 session）。
+# 对应需求中的“取优先满足100M数据的前 x 个 session 文件”。
+target_total_mb = 100
+
+# 数据预处理并发进程数（session 重采样、滑窗生成均受此限制）。
+# 需求要求使用 5 个进程；后期如需调参可修改此值。
+workers = 5
+
+# HMOG 攻击者用户选择（按 HMOG 目录名排序后的顺序）：
+# - val：使用第 1 个 HMOG 用户作为恶意用户数据
+# - test：使用第 2 个 HMOG 用户作为恶意用户数据
+hmog_val_subject_count = 1
+hmog_test_subject_count = 1
+
+# HMOG 攻击者数据体量控制（非常关键）：
+# HMOG 原始 CSV 单用户可达数百 MB；如果不做上限，会导致 val/test 达到千万级行数，
+# 进一步引发滑窗 CSV 输出“指数膨胀”（每个窗口尺寸约产生 ~2x 行数，10 个窗口尺寸约 ~20x）。
+# 为保证端到端训练在可控时间/磁盘内完成，这里默认做行数截断（可按需调大）。
+
+# 单个 HMOG 用户（一个 subject_id）最多读取多少行（跨 train/val/test 三个 CSV 合计）。
+hmog_max_rows_per_subject = 200000
+
+# 单次合并（val 或 test）所有 HMOG 用户最多读取多少行（跨多个 subject_id 合计）。
+hmog_max_rows_total = 1000000
+
+[windows]
+# 训练 / 认证 / 数据处理需要的时间窗口列表（秒）。
+# 当前需求：w=0.2s。
+sizes = [0.2]
+
+# 滑窗重叠率：0.5 表示 stride = window_size * (1 - overlap) = window_size / 2。
+# 与需求中“步长 step_size 为 window_size 的 1/2”一致。
+overlap = 0.5
+
+# 三种传感器统一对齐到的采样频率（Hz），与手机端采集率一致（100Hz）。
+sampling_rate_hz = 100
+
+[auth]
+# 认证策略目标：期望在该时间内完成首次打断决策（秒）。
+# 当前需求：T=2s。
+max_decision_time_sec = 2.0
+
+# 判定策略（投票规则）：
+# 最近连续 N 个窗口中，若 reject>=M，则判定为恶意用户并触发打断（如锁屏等）。
+#
+# 当前策略：连续 7 个窗口内，若至少 6 个窗口为恶意，则判定为恶意并触发打断。
+vote_window_size = 7
+vote_min_rejects = 6
+
+# （兼容保留）“连续拒绝 K 次”策略的 K 计算方式：
+# - "by_window": K = ceil(max_decision_time_sec / stride_sec)
+#   其中 stride_sec = window_size_sec * (1 - overlap)。
+#   示例：window=0.2s, overlap=0.5 -> stride=0.1s => K=20。
+# 当 vote_* 配置启用时，server 默认使用投票策略。
+k_rejects_mode = "by_window"
+
+# 为了提升恶意用户检出率、降低漏报率，可允许对正常用户产生少量“打断”（误报）。
+# 值越大越敏感，漏报更低但误报/打断更多。
+#
+# 本轮需求：在尽可能少打断正常用户的前提下提升恶意用户检测率，
+# 因此把窗口级误打断率（FRR）上限收紧到 0.05。
+# 注意：这里的 FRR 以“窗口”为粒度统计，并会排除每个 session 末尾 (N-1) 个窗口（无法组成完整 N 窗投票窗口）。
+target_window_frr = 0.05

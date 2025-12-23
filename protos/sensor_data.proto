@@ -1,0 +1,224 @@
+syntax = "proto3";
+
+package com.continuousauth.proto;
+
+option java_multiple_files = true;
+option java_package = "com.continuousauth.proto";
+
+// 数据包消息
+message DataPacket {
+    string packet_id = 1;                  // 批次唯一标识, e.g., UUID
+    string device_id_hash = 2;             // HMAC(key_id, device_instance_id) - 非明文
+    int64 base_wall_ms = 3;                // 批次创建时的 wall clock (UTC, NTP 校准后)
+    int64 device_uptime_ns = 4;            // 批次创建时的 elapsed monotonic time
+    optional int64 ntp_offset_ms = 5;      // 客户端计算的 NTP 时钟偏移量
+    
+    // Envelope 加密字段
+    bytes encrypted_sensor_payload = 6;    // Tink StreamingAead 或 AEAD 的密文（通常包含一个完整窗口/批次的数据）
+    bytes encrypted_dek = 7;               // DEK 用服务器公钥加密后的密文（HybridEncrypt）
+    string dek_key_id = 8;                 // 服务器用于解密的公钥版本标识
+    
+    Metadata metadata = 9;
+    
+    // 抗重放与序号
+    int64 packet_seq_no = 10;              // 全局递增序号
+    bytes sha256 = 11;                     // payload 或文件的 SHA256 校验（用于磁盘队列）
+}
+
+message Metadata {
+    string app_version = 1;
+    int32 android_api_level = 2;
+    string schema_version = 3;
+    string transmission_profile = 4;       // "WIFI_ONLY" / "UNRESTRICTED" —— 客户端上传偏好（非必需）
+    string compression = 5;                // "lz4"/"none"
+    string encryption_scheme = 6;          // "Envelope-StreamingAead-AES256GCM" 等
+    string key_version = 7;                // 本次使用的 keyset/version
+    int32 uncompressed_size_bytes = 8;     // 未压缩数据大小
+    int64 client_processing_time_ms = 9;   // 客户端处理时间
+}
+
+message SerializedSensorBatch {
+    repeated SensorSample samples = 1;
+    string user_id_hash = 2;               // HMAC(key_id, user_id) - 非明文
+    string session_id = 3;
+}
+
+message SensorSample {
+    SensorType type = 1;
+    int64 event_timestamp_ns = 2;          // 相对时间戳 (elapsedRealtimeNanos)
+    float x = 3;
+    float y = 4;
+    float z = 5;
+    int32 accuracy = 6;
+    int64 seq_no = 7;                      // 自增序号，保障一致性/防重放
+    string foreground_app_hash = 8;        // HMAC(key_id, packageName) - 非明文
+}
+
+enum SensorType {
+    SENSOR_TYPE_UNKNOWN = 0;
+    ACCELEROMETER = 1;
+    GYROSCOPE = 2;
+    MAGNETOMETER = 3;
+}
+
+// 服务端下发的指令消息
+message ServerDirective {
+    oneof directive {
+        Ack ack = 1;
+        PolicyUpdate policy = 2;
+        KeyRotationNotice key_rotation = 3;
+        EmergencyStop emergency = 4;
+        AuthResult auth_result = 5;
+    }
+}
+
+message Ack {
+    string packet_id = 1;
+    int64 creation_server_ts = 2;           // 服务器接收时间戳（必需）
+    bool success = 3;
+    string error_code = 4;                  // 错误码，用于客户端错误处理
+    int32 retry_after_ms = 5;               // 建议重试时间
+}
+
+message PolicyUpdate {
+    string policy_id = 1;
+    string policy_version = 2;
+    
+    // 传输/批处理 配置（移除 fast/slow 特殊模式）
+    int32 batch_interval_ms = 3;            // 建议的客户端批次窗口，单位 ms
+    int32 max_payload_size_bytes = 4;       // 单个 DataPacket 最大字节数
+    float upload_rate_limit = 5;            // 每秒允许上传的包数量（或字节率）
+    
+    // 传输配置
+    string transmission_profile = 6;        // "WIFI_ONLY" / "UNRESTRICTED"
+    string compression_algorithm = 7;       // "lz4"
+    int32 batch_size_threshold = 8;         // 样本或时间阈值触发上传
+    
+    // 采集配置
+    map<string, int32> sensor_sampling_rates = 9;  // 传感器采样率
+    repeated string enabled_sensors = 10;
+    
+    // 用户特定配置
+    map<string, string> user_config = 11;
+    
+    // 异常检测配置
+    AnomalyConfig anomaly_config = 12;
+}
+
+message AnomalyConfig {
+    bool enabled = 1;
+    float threshold_multiplier = 2;         // 异常阈值倍数
+    int32 window_size_sec = 3;              // 检测窗口大小
+    int32 cooldown_period_sec = 4;          // 冷却期
+}
+
+message KeyRotationNotice {
+    string new_key_id = 1;
+    string public_key_fingerprint = 2;
+    int64 effective_from_ts = 3;
+    int64 deprecate_old_after_ts = 4;
+}
+
+message EmergencyStop {
+    string reason = 1;
+    int32 stop_duration_sec = 2;
+    bool clear_local_cache = 3;
+}
+
+// 心跳消息定义
+message Heartbeat {
+    int64 client_timestamp = 1;
+    int32 pending_packets = 2;              // 待发送数据包数
+    int64 last_packet_seq_no = 3;
+}
+
+message HeartbeatAck {
+    int64 server_timestamp = 1;
+    int64 client_timestamp_echo = 2;        // 回显客户端时间戳
+}
+
+// 策略请求消息
+message PolicyRequest {
+    string device_id_hash = 1;              // HMAC(key_id, device_instance_id) - 非明文
+    string app_version = 2;
+    int32 android_api_level = 3;
+    string current_policy_id = 4;
+}
+
+// 认证会话请求
+message AuthSessionRequest {
+    string device_id_hash = 1;
+    string session_id = 2;
+    string app_version = 3;
+    int32 android_api_level = 4;
+}
+
+message AuthSessionResponse {
+    bool accepted = 1;
+    string session_id = 2;
+    string message = 3;
+    string model_version = 4;
+    float window_size_sec = 5;
+    float decision_time_sec = 6;
+}
+
+message AuthResult {
+    string device_id_hash = 1;
+    string session_id = 2;
+    int64 server_timestamp_ms = 3;
+    float score = 4;
+    float threshold = 5;
+    bool accept = 6;
+    bool interrupt = 7;
+    float window_size_sec = 8;
+    int64 window_id = 9;
+    float normalized_score = 10;
+    int32 k_rejects = 11;
+    string model_version = 12;
+    string message = 13;
+}
+
+// 可观测性指标消息
+message MetricsReport {
+    string device_id_hash = 1;              // HMAC(key_id, device_instance_id) - 非明文
+    int64 timestamp_ms = 2;
+    int64 reporting_period_ms = 3;
+    
+    // 聚合指标（不包含敏感数据）
+    int64 batches_processed = 4;
+    int64 uploads_success = 5;
+    int64 uploads_failed = 6;
+    int64 sensor_samples_collected = 7;
+    int64 anomalies_detected = 8;
+    
+    // 性能指标
+    double avg_upload_latency_ms = 9;
+    double avg_cpu_usage_percent = 10;
+    int64 peak_memory_usage_mb = 11;
+    
+    // 上传成功率
+    double upload_success_rate = 12;
+}
+
+message MetricsResponse {
+    bool accepted = 1;
+    optional string message = 2;
+}
+
+// gRPC 双向流服务定义
+service SensorDataService {
+    // 双向流RPC：客户端发送DataPacket，服务器返回ServerDirective
+    rpc StreamSensorData(stream DataPacket) returns (stream ServerDirective);
+    
+    // 单向RPC：获取初始策略配置
+    rpc GetInitialPolicy(PolicyRequest) returns (PolicyUpdate);
+
+    // 单向RPC：开始认证会话
+    rpc StartAuthentication(AuthSessionRequest) returns (AuthSessionResponse);
+    
+    // 单向RPC：心跳检测
+    rpc SendHeartbeat(Heartbeat) returns (HeartbeatAck);
+    
+    // 单向RPC：上报聚合指标
+    rpc ReportMetrics(MetricsReport) returns (MetricsResponse);
+}
