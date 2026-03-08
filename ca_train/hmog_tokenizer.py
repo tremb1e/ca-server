@@ -7,8 +7,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
-from torch import amp
 
+from accelerator import autocast_context
 from vqgan import VQGAN
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ def encode_windows_to_tokens(
 
     for i in range(0, n, batch_size):
         batch = torch.from_numpy(windows[i : i + batch_size]).to(device=device, dtype=torch.float32, non_blocking=True)
-        with amp.autocast(device_type=device.type, enabled=use_amp):
+        with autocast_context(device, enabled=bool(use_amp)):
             quant_z, indices, _ = vqgan.encode(batch)
         if codebook_hw is None:
             codebook_hw = (int(quant_z.shape[2]), int(quant_z.shape[3]))
@@ -75,4 +75,3 @@ def encode_windows_to_tokens(
         logger.info("[TOKENIZE] %s tokens=%s codebook_hw=%s latency=%.6fs/sample", desc, tokens.shape, codebook_hw, latency)
 
     return TokenizationResult(tokens=tokens, codebook_hw=codebook_hw, latency_sec_per_sample=latency)
-

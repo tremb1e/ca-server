@@ -15,6 +15,7 @@ from .ca_config import get_ca_config
 from .config import settings
 from .crypto.decryption import AESDecryptor
 from .crypto.decompression import DataDecompressor
+from .crypto.payload_codec import decrypt_then_decompress
 from .authentication.manager import AuthSessionManager
 from .storage.file_storage import FileStorage
 from .training.manager import TrainingManager
@@ -199,38 +200,38 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         if packet.HasField("metadata"):
             metadata_dict = _message_to_dict(packet.metadata, include_defaults=True)
 
-        # Try decrypt -> decompress -> parse SerializedSensorBatch
+        # Strict processing order: decrypt first, then decompress.
         if packet.encrypted_sensor_payload:
-            decryption_status = "decrypt_failed"
-            decrypt_ok, decrypted_payload, decrypt_err = self.decryptor.decrypt(packet.encrypted_sensor_payload)
-            if decrypt_ok and decrypted_payload:
-                decryption_status = "decrypt_ok"
-                decompress_ok, decompressed_payload, decompress_err = self.decompressor.decompress(
-                    decrypted_payload,
-                    compression_hint=(packet.metadata.compression if packet.HasField("metadata") else None),
-                )
-                if decompress_ok and decompressed_payload:
-                    decryption_status = "decompressed"
-                    try:
-                        batch = sensor_data_pb2.SerializedSensorBatch()
-                        batch.ParseFromString(decompressed_payload)
-                        parsed_batch = _message_to_dict(batch, include_defaults=True)
-                        # Ensure axis fields exist even if zero to avoid “missing” impressions
-                        for sample in parsed_batch.get("samples", []):
-                            for axis in ("x", "y", "z"):
-                                sample.setdefault(axis, 0.0)
-                        session_id = batch.session_id or session_id
-                        decryption_status = "parsed_sensor_batch"
-                    except Exception as exc:  # noqa: BLE001
-                        decryption_status = "parse_failed"
-                        error_detail = f"parse_batch_failed: {exc}"
-                        logger.warning("Failed to parse SerializedSensorBatch: %s", exc)
-                else:
-                    error_detail = decompress_err
-                    logger.warning("Decompression failed for packet %s: %s", packet.packet_id, decompress_err)
+            processed_ok, decompressed_payload, error_reason, processing_err = decrypt_then_decompress(
+                encrypted_payload=packet.encrypted_sensor_payload,
+                decryptor=self.decryptor,
+                decompressor=self.decompressor,
+                compression_hint=(packet.metadata.compression if packet.HasField("metadata") else None),
+            )
+            if processed_ok and decompressed_payload:
+                decryption_status = "decompressed"
+                try:
+                    batch = sensor_data_pb2.SerializedSensorBatch()
+                    batch.ParseFromString(decompressed_payload)
+                    parsed_batch = _message_to_dict(batch, include_defaults=True)
+                    # Ensure axis fields exist even if zero to avoid “missing” impressions
+                    for sample in parsed_batch.get("samples", []):
+                        for axis in ("x", "y", "z"):
+                            sample.setdefault(axis, 0.0)
+                    session_id = batch.session_id or session_id
+                    decryption_status = "parsed_sensor_batch"
+                except Exception as exc:  # noqa: BLE001
+                    decryption_status = "parse_failed"
+                    error_detail = f"parse_batch_failed: {exc}"
+                    logger.warning("Failed to parse SerializedSensorBatch: %s", exc)
             else:
-                error_detail = decrypt_err
-                logger.warning("Decryption failed for packet %s: %s", packet.packet_id, decrypt_err)
+                error_detail = processing_err
+                if error_reason == "decompression_failed":
+                    decryption_status = "decompress_failed"
+                    logger.warning("Decompression failed for packet %s: %s", packet.packet_id, processing_err)
+                else:
+                    decryption_status = "decrypt_failed"
+                    logger.warning("Decryption failed for packet %s: %s", packet.packet_id, processing_err)
         else:
             error_detail = "no_encrypted_payload"
             logger.warning("Received packet without encrypted payload: %s", packet.packet_id)

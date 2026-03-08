@@ -6,7 +6,11 @@ import pytest
 
 from src.processing.pipeline import (
     ProcessingConfig,
+    _ensure_split_has_both_classes,
+    _load_hmog_attackers,
     _list_sessions_for_user,
+    _resolve_hmog_root,
+    _select_hmog_attacker_ids,
     _select_sessions_for_processing,
     _write_windows,
 )
@@ -158,3 +162,68 @@ def test_write_windows_generates_fixed_length_windows_without_crossing_sessions(
     assert counts.max() == window_points
     assert sorted(counts.index.tolist()) == list(range(len(counts)))
     assert out_df.groupby("window_id")["session"].nunique().max() == 1
+
+
+def test_resolve_hmog_root_uses_local_fallback(tmp_path: Path) -> None:
+    processed_root = tmp_path / "processed_data"
+    processed_root.mkdir(parents=True, exist_ok=True)
+    fallback_root = tmp_path / "hmog_preprocessed"
+    fallback_root.mkdir(parents=True, exist_ok=True)
+
+    resolved = _resolve_hmog_root(tmp_path / "missing_hmog", processed_root)
+    assert resolved == fallback_root
+
+
+def test_select_hmog_attacker_ids_uses_fixed_rank_ranges() -> None:
+    subjects = [str(i) for i in range(1, 31)]
+    val_ids, test_ids = _select_hmog_attacker_ids(subjects)
+    assert val_ids == [str(i) for i in range(1, 11)]
+    assert test_ids == [str(i) for i in range(11, 21)]
+
+
+def test_load_hmog_attackers_keeps_only_requested_session_range(tmp_path: Path) -> None:
+    import pandas as pd
+
+    cfg = _make_cfg(tmp_path, min_total_bytes=0, target_total_bytes=0)
+    for sid in ("100669", "151985"):
+        subject_dir = cfg.hmog_root / sid
+        subject_dir.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(
+            {
+                "subject": [sid, sid, sid],
+                "session": [f"{sid}_session_1", f"{sid}_session_6", f"{sid}_session_7"],
+                "timestamp": [1, 2, 3],
+                "acc_x": [0.1, 0.2, 0.3],
+                "acc_y": [0.1, 0.2, 0.3],
+                "acc_z": [0.1, 0.2, 0.3],
+                "gyr_x": [0.1, 0.2, 0.3],
+                "gyr_y": [0.1, 0.2, 0.3],
+                "gyr_z": [0.1, 0.2, 0.3],
+                "mag_x": [0.1, 0.2, 0.3],
+                "mag_y": [0.1, 0.2, 0.3],
+                "mag_z": [0.1, 0.2, 0.3],
+            }
+        )
+        df.to_csv(subject_dir / f"{sid}_train.csv", index=False)
+
+    attackers = _load_hmog_attackers(["100669", "151985"], cfg, session_range=(1, 6))
+    assert not attackers.empty
+    assert set(attackers["subject"].astype(str).unique().tolist()) == {"100669", "151985"}
+    sessions = attackers["session"].astype(str).tolist()
+    assert all(s.endswith("_session_1") or s.endswith("_session_6") for s in sessions)
+    assert not any(s.endswith("_session_7") for s in sessions)
+
+
+def test_ensure_split_has_both_classes_rejects_single_class() -> None:
+    import pandas as pd
+
+    df = pd.DataFrame({"subject": ["u1", "u1"], "session": ["s1", "s1"], "timestamp": [1, 2]})
+    with pytest.raises(ValueError, match="must contain both classes"):
+        _ensure_split_has_both_classes(df, split_name="val", user_id="u1", hmog_root=Path("/tmp/hmog"))
+
+
+def test_ensure_split_has_both_classes_accepts_mixed_subjects() -> None:
+    import pandas as pd
+
+    df = pd.DataFrame({"subject": ["u1", "attacker"], "session": ["s1", "s2"], "timestamp": [1, 2]})
+    _ensure_split_has_both_classes(df, split_name="test", user_id="u1", hmog_root=Path("/tmp/hmog"))

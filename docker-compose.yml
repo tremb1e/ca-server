@@ -1,43 +1,114 @@
+name: ca-server
+
+x-ca-common-env: &ca-common-env
+  TZ: ${TZ:-Asia/Shanghai}
+  HOST: 0.0.0.0
+  PORT: ${CA_SERVER_CONTAINER_PORT:-8000}
+  HTTP_ENABLED: ${HTTP_ENABLED:-false}
+  GRPC_HOST: 0.0.0.0
+  GRPC_PORT: ${CA_SERVER_CONTAINER_PORT:-8000}
+  DATA_STORAGE_PATH: /app/data_storage/raw_data
+  PROCESSED_DATA_PATH: /app/data_storage/processed_data
+  INFERENCE_STORAGE_PATH: /app/data_storage/inference
+  HMOG_DATA_PATH: /app/data_storage/hmog_preprocessed
+  LOG_PATH: /app/logs
+
+  # Ascend runtime knobs (no CUDA dependency).
+  ASCEND_VISIBLE_DEVICES: ${ASCEND_VISIBLE_DEVICES:-0}
+  ASCEND_RT_VISIBLE_DEVICES: ${ASCEND_RT_VISIBLE_DEVICES:-0}
+  ASCEND_PROCESS_LOG_PATH: /app/ascend_logs
+  ASCEND_GLOBAL_LOG_LEVEL: ${ASCEND_GLOBAL_LOG_LEVEL:-3}
+  ASCEND_TOOLKIT_HOME: /usr/local/Ascend/ascend-toolkit/latest
+  ASCEND_AICPU_PATH: /usr/local/Ascend/ascend-toolkit/latest
+  ASCEND_OPP_PATH: /usr/local/Ascend/ascend-toolkit/latest/opp
+  ASCEND_HOME_PATH: /usr/local/Ascend/ascend-toolkit/latest
+  LD_LIBRARY_PATH: /usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver
+  PYTHONPATH: /app:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe
+  PYTHONUNBUFFERED: "1"
+
+x-ca-common-volumes: &ca-common-volumes
+  # Config mapping (host -> container)
+  - ./deploy/config/ca_config.toml:/app/ca_config.toml:ro
+  - ./deploy/config/server.env:/app/.env:ro
+
+  # Persistent business data
+  - ./deploy/data/raw_data:/app/data_storage/raw_data
+  - ./deploy/data/processed_data:/app/data_storage/processed_data
+  - ./deploy/data/inference:/app/data_storage/inference
+  - ./deploy/data/models:/app/data_storage/models
+  - ./deploy/data/hmog_preprocessed:/app/data_storage/hmog_preprocessed
+
+  # Persistent training/intermediate artifacts
+  - ./deploy/data/ca_train_cached_windows:/app/ca_train/cached_windows
+  - ./deploy/data/ca_train_token_caches:/app/ca_train/token_caches
+  - ./deploy/data/results:/app/results
+  - ./deploy/data/ascend/kernel_meta:/app/kernel_meta
+  - ./deploy/data/ascend/log:/app/ascend_logs
+
+  # Logs and certs
+  - ./deploy/logs:/app/logs
+  - ./deploy/certs:/app/certs:ro
+
+  # Ascend userspace runtime files from host
+  - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+  - /usr/local/Ascend/ascend-toolkit:/usr/local/Ascend/ascend-toolkit:ro
+  - /etc/localtime:/etc/localtime:ro
+
 services:
-  server:
+  ca-server:
+    container_name: ca-server
+    image: ${CA_SERVER_IMAGE:-ca-server:latest}
+    platform: linux/arm64
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        HTTP_PROXY: "http://172.17.0.1:9999"
-        HTTPS_PROXY: "http://172.17.0.1:9999"
-        NO_PROXY: "localhost,127.0.0.1"
-    container_name: server
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+
+        # Optional for full training/inference inside image:
+        # set INSTALL_TORCH_NPU=1 and provide index or wheel path.
+        INSTALL_TORCH: ${INSTALL_TORCH:-1}
+        INSTALL_TORCH_NPU: ${INSTALL_TORCH_NPU:-0}
+        TORCH_VERSION: ${TORCH_VERSION:-2.6.0}
+        TORCH_NPU_VERSION: ${TORCH_NPU_VERSION:-2.6.0.post5}
+        TORCH_EXTRA_INDEX_URL: ${TORCH_EXTRA_INDEX_URL:-}
+        TORCH_FIND_LINKS: ${TORCH_FIND_LINKS:-}
+    env_file:
+      - ./deploy/config/server.env
+    environment: *ca-common-env
     ports:
-      - "10500:8000"
-    volumes:
-      - ./data_storage:/app/data_storage
-      - ./logs:/app/logs
-      # - ./hmog_data:/app/hmog_data:ro   # Optional: mount HMOG attacker dataset
-      # - ./certs:/app/certs:ro           # Optional: mount TLS cert/key bundle
-    environment:
-      - HOST=0.0.0.0
-      - PORT=8000
-      - HTTP_ENABLED=false
-      - DATA_STORAGE_PATH=/app/data_storage/raw_data
-      - PROCESSED_DATA_PATH=/app/data_storage/processed_data
-      - INFERENCE_STORAGE_PATH=/app/data_storage/inference
-      - LOG_PATH=/app/logs
-      # - HMOG_DATA_PATH=/app/hmog_data   # Optional: override HMOG dataset path
-      - ENCRYPTION_KEY=Continuous_Authentication
-      - LOG_LEVEL=INFO
-      - LOG_FORMAT=json
-      - GRPC_HOST=0.0.0.0
-      - GRPC_PORT=8000
-      # - TLS_CERTFILE=/app/certs/server.crt   # Optional: enable TLS 1.2/1.3
-      # - TLS_KEYFILE=/app/certs/server.key
-      # - TLS_CA_CERTS=/app/certs/ca_bundle.pem
-      # - TLS_KEYFILE_PASSWORD=changeit
+      - "${CA_SERVER_PORT:-10500}:${CA_SERVER_CONTAINER_PORT:-8000}"
+    volumes: *ca-common-volumes
+
+    # Ascend device passthrough. Keep privileged for stable access on 910B2.
+    privileged: true
     restart: unless-stopped
-    # Healthcheck using gRPC health service over h2c (single exposed port)
+    init: true
+    stop_grace_period: 30s
+    shm_size: "2gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
     healthcheck:
-      test: ["CMD", "python", "-c", "import grpc; from grpc_health.v1 import health_pb2, health_pb2_grpc; stub = health_pb2_grpc.HealthStub(grpc.insecure_channel('localhost:8000')); resp = stub.Check(health_pb2.HealthCheckRequest(service='')); print(resp.status)"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import grpc; from grpc_health.v1 import health_pb2, health_pb2_grpc; stub = health_pb2_grpc.HealthStub(grpc.insecure_channel('localhost:8000')); resp = stub.Check(health_pb2.HealthCheckRequest(service='')); print(resp.status)",
+        ]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 40s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks:
+      - ca-server-net
+
+networks:
+  ca-server-net:
+    driver: bridge

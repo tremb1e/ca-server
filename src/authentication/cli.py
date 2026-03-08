@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional policy json path; defaults to data_storage/models/<user>/best_lock_policy.json.",
     )
     parser.add_argument("--csv-path", required=True, help="Input window CSV path (server processed_data/window/*/*/*.csv).")
-    parser.add_argument("--device", default="cuda:0", help="Inference device, e.g. cuda:0 / cuda:1 / cpu.")
+    parser.add_argument("--device", default="auto", help="Inference device, e.g. auto / npu:0 / cuda:0 / cpu.")
     parser.add_argument("--output-csv", default=None, help="Optional output CSV path; defaults under data_storage/models/<user>/inference/.")
     parser.add_argument("--max-windows", type=int, default=None, help="Debug: stop after N windows (avoid scanning huge CSVs).")
     return parser.parse_args()

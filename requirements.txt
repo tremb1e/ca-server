@@ -15,5 +15,7 @@ grpcio-tools>=1.67.0,<2.0.0
 grpcio-health-checking>=1.67.0,<2.0.0
 googleapis-common-protos>=1.70.0,<2.0.0
 pandas>=2.2.0,<3.0.0
-numpy>=2.1.0,<3.0.0
+# Ascend CANN Python runtime (te/tbe) is currently incompatible with NumPy 2.x.
+# Keep NumPy on 1.26.x for stable torch_npu initialization on 910B2.
+numpy>=1.26.0,<2.0.0
 tomli>=2.0.1,<3.0.0; python_version < "3.11"

@@ -17,7 +17,7 @@ A lightweight server for receiving and storing encrypted sensor data from Androi
 ### Using Docker Compose
 
 ```bash
-docker-compose up --build
+docker compose up -d --build
 ```
 
 ### Manual Installation
@@ -56,39 +56,81 @@ Configure via environment variables (or a `.env` file) as needed:
 pytest
 ```
 
-## Docker Packaging
+## Docker Packaging (ARM + Ascend, No CUDA)
 
 ### Build Image
 
-- **Using helper script:** `scripts/build_docker.sh [image_name] [tag]`
-- **Manual build:** `docker build -t continuous-auth-server-lite:latest .`
+- **Using helper script (default: install torch):** `scripts/build_docker.sh [image_name] [tag]`
+- **Manual build (default: install torch):** `docker build -t ca-server:latest .`
+- **Manual build (install torch + torch-npu in image):**
+  ```bash
+  docker build -t ca-server:latest \
+    --build-arg INSTALL_TORCH=1 \
+    --build-arg INSTALL_TORCH_NPU=1 \
+    --build-arg TORCH_VERSION=2.6.0 \
+    --build-arg TORCH_NPU_VERSION=2.6.0.post5 \
+    --build-arg TORCH_EXTRA_INDEX_URL=<your_torch_npu_index> \
+    .
+  ```
 
 ### Run Container
 
-- **Basic run:**
+- **docker compose（推荐）:** `docker compose up -d --build`
+- **首次部署建议：**
   ```bash
-  docker run -d --name continuous-auth-server \
-    -p 8000:8000 \
-    -v $(pwd)/data_storage:/app/data_storage \
-    -v $(pwd)/logs:/app/logs \
-    --env LOG_LEVEL=INFO --env HTTP_ENABLED=false \
-    continuous-auth-server-lite:latest
+  mkdir -p \
+    deploy/data/raw_data \
+    deploy/data/processed_data \
+    deploy/data/inference \
+    deploy/data/models \
+    deploy/data/hmog_preprocessed \
+    deploy/data/ca_train_cached_windows \
+    deploy/data/ca_train_token_caches \
+    deploy/data/results \
+    deploy/data/ascend/kernel_meta \
+    deploy/data/ascend/log \
+    deploy/logs \
+    deploy/certs
   ```
-- **docker-compose:** `docker-compose up --build`
 
-### Verify HTTP/2 Support
+### Host Path Mapping
 
-- Health check (HTTP/1.1, when HTTP enabled): `curl http://localhost:8000/health`
-- HTTP/2 (h2c) probe (when HTTP enabled): `curl --http2-prior-knowledge http://localhost:8000/health`
-- TLS + HTTP/2 probe (if certs provided and HTTP enabled): `curl -vk --http2 https://localhost:8000/health`
-- gRPC (h2c): `grpcurl -plaintext localhost:8000 list com.continuousauth.proto.SensorDataService`
-- gRPC (TLS): `grpcurl -insecure localhost:8000 list com.continuousauth.proto.SensorDataService`
-- gRPC 健康检查 (h2c): `grpcurl -plaintext localhost:8000 grpc.health.v1.Health/Check`
+`docker-compose.yml` 已将以下路径映射到宿主机（均在项目根目录下）：
+
+- `./deploy/config/ca_config.toml` -> `/app/ca_config.toml`
+- `./deploy/config/server.env` -> `/app/.env`
+- `./deploy/data/raw_data` -> `/app/data_storage/raw_data`
+- `./deploy/data/processed_data` -> `/app/data_storage/processed_data`
+- `./deploy/data/inference` -> `/app/data_storage/inference`
+- `./deploy/data/models` -> `/app/data_storage/models`
+- `./deploy/data/hmog_preprocessed` -> `/app/data_storage/hmog_preprocessed`
+- `./deploy/data/ca_train_cached_windows` -> `/app/ca_train/cached_windows`
+- `./deploy/data/ca_train_token_caches` -> `/app/ca_train/token_caches`
+- `./deploy/data/results` -> `/app/results`
+- `./deploy/data/ascend/kernel_meta` -> `/app/kernel_meta`
+- `./deploy/data/ascend/log` -> `/app/ascend_logs`
+- `./deploy/logs` -> `/app/logs`
+- `./deploy/certs` -> `/app/certs`（可选）
+
+此外会映射宿主机 Ascend 运行时目录（只读）：
+- `/usr/local/Ascend/driver` -> `/usr/local/Ascend/driver`
+- `/usr/local/Ascend/ascend-toolkit` -> `/usr/local/Ascend/ascend-toolkit`
+
+### Verify HTTP/2 / gRPC Support
+
+- Health check (HTTP/1.1, when HTTP enabled): `curl http://localhost:10500/health`
+- HTTP/2 (h2c) probe (when HTTP enabled): `curl --http2-prior-knowledge http://localhost:10500/health`
+- TLS + HTTP/2 probe (if certs provided and HTTP enabled): `curl -vk --http2 https://localhost:10500/health`
+- gRPC (h2c): `grpcurl -plaintext localhost:10500 list com.continuousauth.proto.SensorDataService`
+- gRPC (TLS): `grpcurl -insecure localhost:10500 list com.continuousauth.proto.SensorDataService`
+- gRPC 健康检查 (h2c): `grpcurl -plaintext localhost:10500 grpc.health.v1.Health/Check`
 
 ### Configuration Tips
 
-- Adjust `PORT`, `DATA_STORAGE_PATH`, and other environment variables in `docker-compose.yml` or via `docker run --env` overrides.
-- Mount volumes for `data_storage` and `logs` to persist sensor data and structured logs.
+- 主要业务参数建议修改 `deploy/config/server.env`。
+- 预处理/滑窗/认证策略建议修改 `deploy/config/ca_config.toml`。
+- 若启用 TLS，请把证书放到 `deploy/certs` 并在 `deploy/config/server.env` 中启用 `TLS_CERTFILE/TLS_KEYFILE`。
+- 可通过 `ASCEND_VISIBLE_DEVICES` / `ASCEND_RT_VISIBLE_DEVICES` 限定容器使用的 NPU 卡号。
 
 ## TLS / HTTP/2 Behavior
 
@@ -133,7 +175,7 @@ What it does:
 The reference training code is vendored under `server/ca_train`. The server provides a thin wrapper to train per-window models from the generated window CSVs and store artifacts under `data_storage/models/<user>/`.
 
 ```bash
-python -m src.training.cli --user <device_hash> --device cuda:0
+python -m src.training.cli --user <device_hash> --device auto
 # 仅跑一个窗口尺寸（用于快速 smoke test）：
 python -m src.training.cli --user <device_hash> --device cpu --window-sizes 0.1 --vqgan-epochs 1 --lm-epochs 1
 ```
@@ -149,8 +191,8 @@ Outputs:
 Run an offline grid search over vote policies `(N, M, target_window_frr, w, overlap)` on cached per-window scores:
 
 ```bash
-python -m src.policy_search.cli --user <device_hash> --device cuda:0                 # default: vqgan-only
-python -m src.policy_search.cli --user <device_hash> --device cuda:0 --auth-method both
+python -m src.policy_search.cli --user <device_hash> --device auto                 # default: vqgan-only
+python -m src.policy_search.cli --user <device_hash> --device auto --auth-method both
 ```
 
 Outputs (under `data_storage/models/<user>/policy_search/`):
@@ -166,7 +208,7 @@ Once `best_lock_policy.json` exists, you can run inference on any window CSV (e.
 python -m src.authentication.cli \
   --user <device_hash> \
   --csv-path data_storage/processed_data/window/0.1/<device_hash>/test.csv \
-  --device cuda:0
+  --device auto
 ```
 
 Outputs:

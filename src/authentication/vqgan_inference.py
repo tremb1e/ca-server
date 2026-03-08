@@ -8,8 +8,8 @@ from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch import amp
 
+from ..utils.accelerator import autocast_context
 from ..utils.ca_train import ensure_ca_train_on_path
 
 AXIS_COLUMNS = (
@@ -83,7 +83,7 @@ def score_windows(
     for i in range(0, len(windows), batch_size):
         batch_np = windows[i : i + batch_size]
         batch = torch.from_numpy(batch_np).to(device=device, dtype=torch.float32, non_blocking=True)
-        with amp.autocast(device_type=device.type, enabled=use_amp):
+        with autocast_context(device, enabled=bool(use_amp)):
             decoded, _, _ = model(batch)
             if score_metric == "l1":
                 errors = torch.mean(torch.abs(batch - decoded), dim=(1, 2, 3))

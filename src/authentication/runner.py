@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 
+from ..utils.accelerator import resolve_torch_device
 from ..utils.ca_train import ensure_ca_train_on_path
 from .vqgan_inference import VQGANPolicy, load_vqgan, score_windows
 
@@ -90,7 +91,7 @@ def run_auth_inference(
     *,
     csv_path: Path,
     policy: AuthRunConfig,
-    device: str = "cuda:0",
+    device: str = "auto",
     output_csv: Optional[Path] = None,
     max_windows: Optional[int] = None,
 ) -> Tuple[Path, Dict]:
@@ -112,7 +113,7 @@ def run_auth_inference(
         output_csv = Path(output_csv)
         output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    torch_device = torch.device(device if torch.cuda.is_available() else "cpu")
+    torch_device = resolve_torch_device(device)
     vqgan = load_vqgan(policy.vqgan_checkpoint, device=torch_device, config_path=policy.vqgan_config)
 
     k_tracker = ConsecutiveRejectTracker()

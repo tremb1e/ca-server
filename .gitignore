@@ -1,7 +1,8 @@
-# Python bytecode
+# Python bytecode / native extensions
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
 
 # Virtual environments
 .venv/
@@ -11,7 +12,7 @@ env/
 env.bak/
 venv.bak/
 
-# Packaging/build artifacts
+# Packaging / build artifacts
 .Python
 build/
 dist/
@@ -21,7 +22,7 @@ dist/
 share/python-wheels/
 pip-wheel-metadata/
 
-# Test/coverage artifacts
+# Test / coverage artifacts
 .pytest_cache/
 .coverage
 .coverage.*
@@ -29,10 +30,11 @@ htmlcov/
 .tox/
 .nox/
 .cache/
+.hypothesis/
 *.cover
 *.py,cover
 
-# Lint/type caches
+# Lint / type-check caches
 .mypy_cache/
 .pyre/
 .pytype/
@@ -40,24 +42,46 @@ htmlcov/
 .dmypy.json
 dmypy.json
 
-# Logs
-logs/
-*.log
+# Notebook / REPL state
+.ipynb_checkpoints/
 
-# Generated data/artifacts
-data_storage/
-reports/
-
-# Local config/secrets
+# Local config / secrets
 .env
 .env.*
 *.local
-certs/
+/certs/
 *.key
 *.pem
 *.p12
 
-# OS/IDE
+# Runtime logs / temporary outputs
+/logs/
+*.log
+/kernel_meta/
+/ascend_logs/
+/fusion_result.json
+
+# Generated data / model artifacts
+/data_storage/
+/reports/
+/results/
+/experiment_results/
+/tmp_hmog/
+/testtest/
+/ca_train/cached_windows/
+/ca_train/token_caches/
+
+# Docker / deploy runtime mounts
+/deploy/config/server.env
+/deploy/data/**
+!/deploy/data/**/
+!/deploy/data/**/.gitkeep
+/deploy/logs/**
+!/deploy/logs/.gitkeep
+/deploy/certs/**
+!/deploy/certs/.gitkeep
+
+# OS / IDE files
 .DS_Store
 Thumbs.db
 .idea/

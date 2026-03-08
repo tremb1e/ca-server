@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -9,7 +10,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..ca_config import CAConfig, get_ca_config
+from ..utils.accelerator import normalize_device
 from ..utils.ca_train import ca_train_script, ensure_ca_train_on_path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,22 @@ def _write_vqgan_config(cfg: Dict, checkpoint: Path) -> Path:
     return config_path
 
 
+def _extract_last_training_error(log_dir: Path) -> Optional[str]:
+    log_path = log_dir / "hmog_vqgan.log"
+    if not log_path.exists():
+        return None
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    patterns = ("[ERROR]", "Traceback", "ValueError:", "RuntimeError:")
+    for raw in reversed(lines):
+        line = raw.strip()
+        if line and any(p in line for p in patterns):
+            return line
+    return None
+
+
 def _read_best_window(log_dir: Path, user_id: str) -> Dict:
     summary_path = log_dir / "best_windows.json"
     if not summary_path.exists():
@@ -73,7 +93,20 @@ def _read_best_window(log_dir: Path, user_id: str) -> Dict:
         raise ValueError(f"Unexpected best_windows.json format: {summary_path}")
     record = payload.get(str(user_id))
     if not isinstance(record, dict):
-        raise ValueError(f"Missing user={user_id} entry in {summary_path}")
+        details: List[str] = []
+        if not payload:
+            details.append("summary is empty")
+        available_users = [str(k) for k, v in payload.items() if isinstance(v, dict)]
+        if available_users:
+            head = available_users[:3]
+            if len(available_users) > 3:
+                head.append("...")
+            details.append(f"available_users={head}")
+        last_error = _extract_last_training_error(log_dir)
+        if last_error:
+            details.append(f"last_training_error={last_error}")
+        suffix = f" ({'; '.join(details)})" if details else ""
+        raise ValueError(f"Missing user={user_id} entry in {summary_path}{suffix}")
     return record
 
 
@@ -131,7 +164,7 @@ def _write_vqgan_policy(
 def run_window_sweep_for_user(
     user_id: str,
     *,
-    device: str = "cuda:0",
+    device: str = "auto",
     window_sizes: Optional[Sequence[float]] = None,
     vqgan_epochs: int = 10,
     batch_size: Optional[int] = None,
@@ -168,6 +201,8 @@ def run_window_sweep_for_user(
     num_workers, cpu_threads = _pick_workers()
     results: List[TrainingRunResult] = []
 
+    resolved_device = normalize_device(device)
+
     for ws in window_sizes:
         ws_f = float(ws)
         target_width = int(round(ws_f * float(ca_cfg.windows.sampling_rate_hz)))
@@ -175,9 +210,22 @@ def run_window_sweep_for_user(
         log_dir.mkdir(parents=True, exist_ok=True)
 
         best_summary_path = log_dir / "best_windows.json"
+        summary: Optional[Dict] = None
+        reuse_error: Optional[str] = None
         if reuse_checkpoints and best_summary_path.exists():
-            summary = _read_best_window(log_dir, user_id)
-        else:
+            try:
+                summary = _read_best_window(log_dir, user_id)
+            except Exception as exc:
+                reuse_error = str(exc)
+
+        if summary is None:
+            if reuse_error:
+                logger.warning(
+                    "Ignoring cached window sweep summary for user=%s ws=%.1f; will retrain. reason=%s",
+                    user_id,
+                    ws_f,
+                    reuse_error,
+                )
             cmd: List[str] = [
                 sys.executable,
                 str(ca_train_script),
@@ -192,7 +240,7 @@ def run_window_sweep_for_user(
                 "--target-width",
                 str(int(target_width)),
                 "--device",
-                str(device),
+                str(resolved_device),
                 "--batch-size",
                 str(int(batch_size) if batch_size is not None else 128),
                 "--num-workers",

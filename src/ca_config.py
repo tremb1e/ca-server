@@ -16,16 +16,18 @@ class ProcessingConfig:
     min_total_mb: int = 100
     target_total_mb: int = 100
     workers: int = 5
-    # HMOG 攻击者用户选择：
-    # - val 使用 HMOG 的第 1 个用户（按目录名排序后的第一个）
-    # - test 使用 HMOG 的第 2 个用户（按目录名排序后的第二个）
-    hmog_val_subject_count: int = 1
-    hmog_test_subject_count: int = 1
-    # HMOG 攻击者数据体量控制（避免 val/test 过大导致滑窗文件爆炸）。
+    # HMOG 攻击者用户选择（按目录名排序）：
+    # - val 使用第 1~10 个用户
+    # - test 使用第 11~20 个用户
+    # 说明：实际选择逻辑在 processing.pipeline 中固定按上述区间切分。
+    hmog_val_subject_count: int = 10
+    hmog_test_subject_count: int = 10
+    # HMOG 攻击者数据体量控制。
+    # 默认 0=不截断（由 session 1~6 规则控制总体规模）。
     # - max_rows_per_subject: 单个 HMOG 用户最多读取多少行（跨 train/val/test 三个 CSV 合计）。
     # - max_rows_total: 单次合并（val 或 test）总共最多读取多少行（跨多个 HMOG 用户合计）。
-    hmog_max_rows_per_subject: int = 200_000
-    hmog_max_rows_total: int = 1_000_000
+    hmog_max_rows_per_subject: int = 0
+    hmog_max_rows_total: int = 0
 
 
 @dataclass(frozen=True)

@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..ca_config import CAConfig, get_ca_config
+from ..utils.accelerator import autocast_context, normalize_device, resolve_torch_device
 from ..utils.ca_train import ca_train_root
 from .metrics import first_interrupt_times_sec_per_session, p_first_interrupt_le_columns
 from .pareto import ParetoPoint, pareto_frontier
@@ -244,13 +245,12 @@ def _score_split_vqgan_transformer_inprocess(
     _ensure_ca_train_on_path()
 
     import torch  # local import to keep policy_search import light
-    from torch import amp
 
     from hmog_token_auth_inference import load_lm, load_vqgan
     from hmog_data import iter_windows_from_csv_unlabeled_with_session
     from hmog_tokenizer import encode_windows_to_tokens
 
-    torch_device = torch.device(device)
+    torch_device = resolve_torch_device(device)
     vqgan = load_vqgan(Path(vqgan_ckpt), device=torch_device, cfg_path=None)
     lm = load_lm(Path(lm_ckpt), device=torch_device, cfg_path=None)
 
@@ -278,7 +278,7 @@ def _score_split_vqgan_transformer_inprocess(
             use_amp=bool(use_amp),
         )
         tokens = torch.from_numpy(tok.tokens).to(device=torch_device, dtype=torch.long, non_blocking=True)
-        with amp.autocast(device_type=torch_device.type, enabled=bool(use_amp)):
+        with autocast_context(torch_device, enabled=bool(use_amp)):
             scores = lm.score(tokens).detach().cpu().numpy().astype(np.float32, copy=False)
         scores_chunks.append(scores)
         labels_chunks.append(np.asarray(batch_labels, dtype=np.int8))
@@ -332,12 +332,11 @@ def _score_split_vqgan_only_inprocess(
     _ensure_ca_train_on_path()
 
     import torch  # local import to keep policy_search import light
-    from torch import amp
 
     from hmog_token_auth_inference import load_vqgan
     from hmog_data import iter_windows_from_csv_unlabeled_with_session
 
-    torch_device = torch.device(device)
+    torch_device = resolve_torch_device(device)
     vqgan = load_vqgan(Path(vqgan_ckpt), device=torch_device, cfg_path=None)
 
     batch_windows: List[np.ndarray] = []
@@ -357,7 +356,7 @@ def _score_split_vqgan_only_inprocess(
             return
         windows_np = np.stack(batch_windows, axis=0).astype(np.float32, copy=False)
         batch = torch.from_numpy(windows_np).to(device=torch_device, dtype=torch.float32, non_blocking=True)
-        with amp.autocast(device_type=torch_device.type, enabled=bool(use_amp)):
+        with autocast_context(torch_device, enabled=bool(use_amp)):
             decoded, _, _ = vqgan(batch)
             errors = torch.mean((batch - decoded) ** 2, dim=(1, 2, 3))
         scores = (-errors).detach().cpu().numpy().astype(np.float32, copy=False)
@@ -399,19 +398,23 @@ def _score_split_vqgan_only_inprocess(
     return ScoreArrays(session_ids=sessions_all, labels=labels_all, scores=scores_all)
 
 
-def _resolve_target_width(lm_ckpt: Path, default: int = 50) -> int:
-    cfg_path = lm_ckpt.with_suffix(".json")
-    if not cfg_path.exists():
-        return int(default)
-    try:
-        payload = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except Exception:
-        return int(default)
-    value = payload.get("target_width", default)
-    try:
-        return int(value)
-    except Exception:
-        return int(default)
+def _resolve_target_width(*checkpoint_paths: Path, default: int = 50) -> int:
+    for ckpt in checkpoint_paths:
+        cfg_path = Path(ckpt).with_suffix(".json")
+        if not cfg_path.exists():
+            continue
+        try:
+            payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        value = payload.get("target_width", payload.get("input_width", default))
+        try:
+            return int(value)
+        except Exception:
+            continue
+    return int(default)
 
 
 @dataclass(frozen=True)
@@ -467,7 +470,7 @@ def _resolve_vote_min_rejects_range(cfg: GridSearchConfig, n: int) -> Tuple[int,
 def run_policy_grid_search(
     user: str,
     *,
-    device: str = "cuda:0",
+    device: str = "auto",
     auth_method: str = AUTH_METHOD_VQGAN_TRANSFORMER,
     cfg: Optional[GridSearchConfig] = None,
     ca_cfg: Optional[CAConfig] = None,
@@ -484,6 +487,7 @@ def run_policy_grid_search(
     server_root = _server_root()
     dataset_root = Path(dataset_root) if dataset_root is not None else _default_dataset_root(server_root)
     models_root = Path(models_root) if models_root is not None else _default_models_root(server_root)
+    resolved_device = normalize_device(device)
 
     if cfg is None:
         cfg = GridSearchConfig(
@@ -524,10 +528,12 @@ def run_policy_grid_search(
     for ws in cfg.window_sizes:
         ws_f = float(ws)
         vqgan_ckpt, lm_ckpt = _ckpt_paths(models_root, user, ws_f)
-        if not vqgan_ckpt.exists() or not lm_ckpt.exists():
-            raise FileNotFoundError(f"Missing checkpoints for user={user} ws={ws_f:.1f}: {vqgan_ckpt} / {lm_ckpt}")
+        if not vqgan_ckpt.exists():
+            raise FileNotFoundError(f"Missing VQGAN checkpoint for user={user} ws={ws_f:.1f}: {vqgan_ckpt}")
+        if auth_method == AUTH_METHOD_VQGAN_TRANSFORMER and not lm_ckpt.exists():
+            raise FileNotFoundError(f"Missing transformer checkpoint for user={user} ws={ws_f:.1f}: {lm_ckpt}")
 
-        target_width = _resolve_target_width(lm_ckpt, default=50)
+        target_width = _resolve_target_width(lm_ckpt, vqgan_ckpt, default=50)
 
         ws_tag = f"{ws_f:.1f}"
         user_dir = dataset_root / ws_tag / user
@@ -547,7 +553,7 @@ def run_policy_grid_search(
             csv_path=val_csv_path,
             vqgan_ckpt=vqgan_ckpt,
             lm_ckpt=lm_ckpt,
-            device=device,
+            device=resolved_device,
             token_batch_size=int(cfg.token_batch_size),
             use_amp=bool(cfg.use_amp),
             cache_dir=cache_dir,
@@ -562,7 +568,7 @@ def run_policy_grid_search(
             csv_path=test_csv_path,
             vqgan_ckpt=vqgan_ckpt,
             lm_ckpt=lm_ckpt,
-            device=device,
+            device=resolved_device,
             token_batch_size=int(cfg.token_batch_size),
             use_amp=bool(cfg.use_amp),
             cache_dir=cache_dir,

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Offline policy grid search + Pareto frontier for Continuous Authentication")
     parser.add_argument("--user", required=True, help="Target user/device hash (subject ID).")
-    parser.add_argument("--device", default="cuda:0", help="Scoring device, e.g. cuda:0 / cuda:1 / cpu.")
+    parser.add_argument("--device", default="auto", help="Scoring device, e.g. auto / npu:0 / cuda:0 / cpu.")
     parser.add_argument(
         "--auth-method",
         choices=["vqgan-only", "vqgan+transformer", "both"],

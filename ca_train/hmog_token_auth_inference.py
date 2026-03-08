@@ -17,8 +17,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-from torch import amp
 
+from accelerator import autocast_context, resolve_torch_device
 from hmog_consecutive_rejects import ConsecutiveRejectTracker, VoteRejectTracker, k_from_interrupt_time
 from hmog_data import DEFAULT_OVERLAP, iter_windows_from_csv_unlabeled_with_session
 from hmog_token_transformer import TokenGPTAuthenticator, TokenLMConfig
@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-size", type=float, required=True, help="Window size in seconds (e.g., 0.8)")
     parser.add_argument("--overlap", type=float, default=DEFAULT_OVERLAP, help="Window overlap ratio (server default=0.5)")
     parser.add_argument("--target-width", type=int, default=50, help="Resample width; 0 => round(window_size*100)")
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default="auto", help="auto / npu:0 / cuda:0 / cpu")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--use-amp", dest="use_amp", action="store_true")
     parser.add_argument("--no-amp", dest="use_amp", action="store_false")
@@ -140,7 +140,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    device = resolve_torch_device(args.device)
     csv_path = Path(args.csv_path)
 
     target_width = int(args.target_width) if int(args.target_width) > 0 else int(round(float(args.window_size) * 100))
@@ -232,7 +232,7 @@ def main() -> None:
             use_amp=bool(args.use_amp),
         )
         tokens = torch.from_numpy(tok.tokens).to(device=device, dtype=torch.long, non_blocking=True)
-        with amp.autocast(device_type=device.type, enabled=bool(args.use_amp)):
+        with autocast_context(device, enabled=bool(args.use_amp)):
             scores = lm.score(tokens).detach().cpu().numpy()
         for meta, score in zip(batch_meta, scores):
             row = dict(**meta, score=float(score))

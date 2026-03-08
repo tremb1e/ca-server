@@ -5,6 +5,7 @@ import logging
 from typing import Optional
 from ..crypto.decryption import AESDecryptor
 from ..crypto.decompression import DataDecompressor
+from ..crypto.payload_codec import decrypt_then_decompress
 from ..validators.packet_validator import PacketValidator
 from ..storage.file_storage import FileStorage
 from ..config import settings
@@ -54,22 +55,16 @@ async def receive_sensor_data(
 
         logger.info(f"{request_id}: Received {len(encrypted_data)} bytes of encrypted data")
 
-        success, decrypted_data, error = decryptor.decrypt(encrypted_data)
+        success, decompressed_data, reason, error = decrypt_then_decompress(
+            encrypted_payload=encrypted_data,
+            decryptor=decryptor,
+            decompressor=decompressor,
+        )
         if not success:
-            logger.error(f"{request_id}: Decryption failed - {error}")
+            logger.error(f"{request_id}: Payload processing failed ({reason}) - {error}")
             return JSONResponse(
                 status_code=400,
-                content={"status": "error", "reason": "decryption_failed"}
-            )
-
-        logger.info(f"{request_id}: Successfully decrypted to {len(decrypted_data)} bytes")
-
-        success, decompressed_data, error = decompressor.decompress(decrypted_data)
-        if not success:
-            logger.error(f"{request_id}: Decompression failed - {error}")
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "reason": "decompression_failed"}
+                content={"status": "error", "reason": reason}
             )
 
         logger.info(f"{request_id}: Successfully decompressed to {len(decompressed_data)} bytes")

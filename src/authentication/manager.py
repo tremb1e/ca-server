@@ -16,6 +16,7 @@ from ..config import settings
 from ..processing.pipeline import _extract_sensor_records, _resample_records, build_config
 from ..processing.scaler import apply_scaler, load_scaler
 from ..storage.inference_storage import InferenceStorage
+from ..utils.accelerator import resolve_torch_device
 from ..utils.ca_train import ensure_ca_train_on_path
 from .runner import AuthRunConfig, load_best_policy
 from .vqgan_inference import VQGANPolicy, load_vqgan, score_windows, windowize_dataframe
@@ -53,7 +54,7 @@ class AuthSessionState:
 class VQGANModelCache:
     def __init__(self, *, max_models: int = 4, device: Optional[str] = None) -> None:
         self._max_models = int(max_models)
-        self._device = device or "cuda:0"
+        self._device = device or "auto"
         self._cache: Dict[str, torch.nn.Module] = {}
         self._order: List[str] = []
 
@@ -67,7 +68,7 @@ class VQGANModelCache:
             evict = self._order.pop(0)
             self._cache.pop(evict, None)
 
-        device = torch.device(self._device if torch.cuda.is_available() else "cpu")
+        device = resolve_torch_device(self._device)
         model = load_vqgan(policy.vqgan_checkpoint, device=device, config_path=policy.vqgan_config)
         self._cache[key] = model
         self._order.append(key)

@@ -19,8 +19,16 @@ from scipy.optimize import brentq
 from sklearn.metrics import precision_recall_curve, roc_auc_score, roc_curve
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from torch import amp
 
+from accelerator import (
+    autocast_context,
+    device_count,
+    make_grad_scaler,
+    normalize_device,
+    resolve_torch_device,
+    seed_all,
+    set_visible_device,
+)
 from hmog_data import (
     DEFAULT_OVERLAP,
     WINDOW_SIZES,
@@ -32,12 +40,10 @@ from hmog_data import (
 from vqgan import VQGAN
 
 
-def set_seed(seed: int, cuda: bool = False) -> None:
+def set_seed(seed: int, device_type: Optional[str] = None) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    if cuda and torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    seed_all(seed, device_type=device_type)
 
 
 def setup_logging(log_dir: Path) -> Tuple[Path, Path]:
@@ -61,6 +67,7 @@ def build_loaders(
     test_y: np.ndarray,
     batch_size: int,
     num_workers: int,
+    pin_memory: bool,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     train_dataset = WindowedHMOGDataset(train_x, train_y)
     val_dataset = WindowedHMOGDataset(val_x, val_y)
@@ -68,7 +75,7 @@ def build_loaders(
 
     common_kwargs = dict(
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=bool(pin_memory),
         persistent_workers=bool(num_workers),
     )
 
@@ -105,7 +112,7 @@ def reconstruction_step(
     batch = batch.to(device, non_blocking=True)
     if input_noise_std and input_noise_std > 0:
         batch = batch + torch.randn_like(batch) * float(input_noise_std)
-    with amp.autocast(device_type=device.type, enabled=use_amp):
+    with autocast_context(device, enabled=bool(use_amp)):
         decoded, _, q_loss = model(batch)
         if rec_loss_metric == "mse":
             rec_loss = torch.mean((batch - decoded) ** 2)
@@ -177,7 +184,7 @@ def evaluate_model(
         for batch, labels in loader:
             batch = batch.to(device, non_blocking=True)
             labels = labels.cpu().numpy()
-            with amp.autocast(device_type=device.type, enabled=use_amp):
+            with autocast_context(device, enabled=bool(use_amp)):
                 decoded, _, _ = model(batch)
                 # 传感器重建误差越小代表越接近合法用户
                 if score_metric == "l1":
@@ -232,6 +239,48 @@ def save_text_log(text_path: Path, payload: Dict) -> None:
     )
     with text_path.open("a") as f:
         f.write(line + "\n")
+
+
+def _check_split_class_separation(
+    split_x: np.ndarray,
+    split_y: np.ndarray,
+    *,
+    split_name: str,
+    user_id: str,
+    window_size: float,
+    seed: int,
+    eps: float = 1e-10,
+) -> None:
+    """
+    Quick guardrail: verify positive/negative windows are not numerically identical.
+
+    If this check fails, training will inevitably collapse to AUC≈0.5 with threshold=inf.
+    """
+    if split_x.size == 0 or split_y.size == 0:
+        return
+    pos = split_x[split_y == 1]
+    neg = split_x[split_y == 0]
+    if len(pos) == 0 or len(neg) == 0:
+        return
+
+    rng = np.random.default_rng(int(seed))
+    k = min(256, len(pos), len(neg))
+    idx_pos = rng.choice(len(pos), size=k, replace=False)
+    idx_neg = rng.choice(len(neg), size=k, replace=False)
+    pair_mse = float(np.mean((pos[idx_pos] - neg[idx_neg]) ** 2))
+    if (not np.isfinite(pair_mse)) or pair_mse <= float(eps):
+        raise ValueError(
+            f"[DATA] {split_name} split for user={user_id} ws={window_size:.1f} has degenerate class separation: "
+            f"sampled pos/neg mean_pair_mse={pair_mse}. "
+            f"Check window construction/loader for aliasing or mislabeled samples."
+        )
+    logging.info(
+        "[DATA] %s user=%s ws=%.1f sampled_pos_neg_mse=%.6f",
+        split_name,
+        user_id,
+        window_size,
+        pair_mse,
+    )
 
 
 def train_single_window(
@@ -289,6 +338,22 @@ def train_single_window(
                 f"(subject=={user_id} -> 1, attackers -> 0); got labels={uniq}. "
                 f"Check {args.dataset_path}/{window_size:.1f}/{user_id}/{split_name}.csv subject column."
             )
+    _check_split_class_separation(
+        val_x,
+        val_y,
+        split_name="val",
+        user_id=user_id,
+        window_size=window_size,
+        seed=args.seed + 11,
+    )
+    _check_split_class_separation(
+        test_x,
+        test_y,
+        split_name="test",
+        user_id=user_id,
+        window_size=window_size,
+        seed=args.seed + 23,
+    )
     prep_dur = time.time() - prep_start
     # 预处理阶段也输出日志，便于观察长时间无输出时的进度（数据量 = 正样本 + 负样本）
     logging.info(
@@ -302,7 +367,17 @@ def train_single_window(
         train_x = train_x[idx]
         train_y = train_y[idx]
 
-    loaders = build_loaders(train_x, train_y, val_x, val_y, test_x, test_y, args.batch_size, loader_workers)
+    loaders = build_loaders(
+        train_x,
+        train_y,
+        val_x,
+        val_y,
+        test_x,
+        test_y,
+        args.batch_size,
+        loader_workers,
+        pin_memory=(device.type != "cpu"),
+    )
     train_loader, val_loader, test_loader = loaders
 
     # Let the model know the expected spatial size (used by the decoder upsampling plan).
@@ -317,7 +392,7 @@ def train_single_window(
     args.use_nonlocal = not getattr(args, "no_nonlocal", False)
 
     model = VQGAN(args).to(device)
-    use_dp = torch.cuda.device_count() > 1 and not args.no_data_parallel
+    use_dp = (device.type == "cuda") and (torch.cuda.device_count() > 1) and (not args.no_data_parallel)
     if use_dp:
         model = nn.DataParallel(model)
 
@@ -327,7 +402,7 @@ def train_single_window(
         betas=(args.beta1, args.beta2),
         weight_decay=float(getattr(args, "weight_decay", 0.0) or 0.0),
     )
-    scaler = amp.GradScaler(device.type, enabled=args.use_amp)
+    scaler = make_grad_scaler(device, enabled=bool(args.use_amp))
 
     for epoch in range(epochs):
         model.train()
@@ -416,34 +491,35 @@ def _train_worker_entry(
     user_id: str,
     window_size: float,
     epochs: int,
-    gpu_id: int,
+    gpu_id: Optional[int],
     json_log_path: str,
     text_log_path: str,
     users: Sequence[str],
 ) -> Dict:
-    # 将 GPU 绑定到每个子进程，避免 DataParallel 与并行作业冲突
-    if gpu_id is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
     args = argparse.Namespace(**args_dict)
     if not logging.getLogger().handlers:
         setup_logging(Path(args.log_dir))
 
-    device_str = args.device
-    if gpu_id is None:
-        device_str = "cpu"
-    elif torch.cuda.is_available():
-        device_str = "cuda:0"
+    backend = str(getattr(args, "backend", "cpu"))
+    if gpu_id is not None and backend in {"npu", "cuda"}:
+        set_visible_device(backend, gpu_id)
 
-    device = torch.device(device_str if torch.cuda.is_available() else "cpu")
+    if gpu_id is None:
+        device_str = normalize_device(args.device)
+    else:
+        device_str = f"{backend}:0"
+
+    device = resolve_torch_device(device_str)
+    npu_available = bool(getattr(torch, "npu", None) and torch.npu.is_available()) if hasattr(torch, "npu") else False
     logging.info(
         f"[WORKER] pid={os.getpid()} start_method={mp.get_start_method()} "
-        f"gpu_id={gpu_id} device={device} cuda_available={torch.cuda.is_available()}"
+        f"device_id={gpu_id} device={device} cuda_available={torch.cuda.is_available()} npu_available={npu_available}"
     )
     torch.set_num_threads(args.cpu_threads)
-    torch.backends.cudnn.benchmark = True
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     # 使用窗口大小扰动种子，避免完全相同的随机序列
-    set_seed(args.seed + int(window_size * 10), cuda=device.type == "cuda")
+    set_seed(args.seed + int(window_size * 10), device_type=device.type)
 
     base_path = Path(args.dataset_path)
     return train_single_window(
@@ -468,15 +544,19 @@ def dispatch_training_tasks(
     epochs: int,
     log_path: Path,
     text_log_path: Path,
-) -> List[Dict]:
+) -> Tuple[List[Dict], List[str]]:
     """Launch parallel training jobs for (user, window) pairs."""
     if not tasks:
-        return []
+        return [], []
 
+    backend = str(getattr(args, "backend", "cpu"))
     available_gpus = args.gpu_ids
-    if available_gpus is None:
-        available_gpus = list(range(torch.cuda.device_count()))
-    if not available_gpus:
+    if backend in {"npu", "cuda"}:
+        if available_gpus is None:
+            available_gpus = list(range(device_count(backend)))
+        if not available_gpus:
+            available_gpus = [None]
+    else:
         available_gpus = [None]
 
     max_workers = args.max_parallel_train or len(available_gpus) or 1
@@ -485,7 +565,7 @@ def dispatch_training_tasks(
     max_workers = min(max_workers, len(tasks))
 
     args_dict = vars(args)
-    job_specs: List[Tuple[str, float, int]] = []
+    job_specs: List[Tuple[str, float, Optional[int]]] = []
     for idx, (user_id, window_size) in enumerate(tasks):
         gpu_id = available_gpus[idx % len(available_gpus)]
         job_specs.append((user_id, window_size, gpu_id))
@@ -493,6 +573,7 @@ def dispatch_training_tasks(
     user_list = list({user_id for user_id, _ in tasks})
 
     results: List[Dict] = []
+    errors: List[str] = []
     with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context("spawn")) as ex:
         future_map = {
             ex.submit(
@@ -515,9 +596,11 @@ def dispatch_training_tasks(
                 res = fut.result()
                 results.append(res)
             except Exception as exc:
-                logging.exception(f"[ERROR] user={job_user} ws={ws:.1f} gpu={gpu_id}: {exc}")
+                msg = f"user={job_user} ws={ws:.1f} gpu={gpu_id}: {exc}"
+                errors.append(msg)
+                logging.exception(f"[ERROR] {msg}")
 
-    return results
+    return results, errors
 
 
 def run_experiments(args: argparse.Namespace, text_log_path: Path) -> None:
@@ -529,16 +612,21 @@ def run_experiments(args: argparse.Namespace, text_log_path: Path) -> None:
 
     logging.info(f"[MP] start_method={mp.get_start_method()} mp_context_spawn_available={mp.get_all_start_methods()}")
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    args.device = normalize_device(args.device)
+    args.backend = "cpu" if args.device == "cpu" else str(args.device).split(":", 1)[0]
+    device = resolve_torch_device(args.device)
     if device.type == "cpu":
-        logging.warning("CUDA 未启用，训练将退回到 CPU，可能很慢。")
+        logging.warning("未检测到 NPU/CUDA，训练将退回到 CPU，可能很慢。")
+    elif device.type == "npu":
+        logging.info("[NPU] device_count=%d use_dp=%s", device_count("npu"), False)
     else:
-        logging.info(f"[CUDA] device_count={torch.cuda.device_count()} use_dp={not args.no_data_parallel}")
+        logging.info("[CUDA] device_count=%d use_dp=%s", torch.cuda.device_count(), (not args.no_data_parallel))
 
-    # 仅设定 CPU 随机种子，避免在主进程初始化 CUDA 导致后续 fork/spawn 的限制
-    set_seed(args.seed, cuda=False)
+    # 仅设定 CPU 随机种子，避免在主进程提前初始化设备上下文影响后续 spawn
+    set_seed(args.seed, device_type=None)
     torch.set_num_threads(args.cpu_threads)
-    torch.backends.cudnn.benchmark = True
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     base_path = Path(args.dataset_path)
     users = args.users or list_available_users(base_path)
@@ -567,7 +655,7 @@ def run_experiments(args: argparse.Namespace, text_log_path: Path) -> None:
         logging.info("[CACHE] 已按参数跳过预处理缓存构建")
 
     sweep_tasks = [(user_id, ws) for user_id in users for ws in args.window_sizes]
-    sweep_results = dispatch_training_tasks(
+    sweep_results, sweep_errors = dispatch_training_tasks(
         args=args,
         tasks=sweep_tasks,
         epochs=args.sweep_epochs,
@@ -575,19 +663,28 @@ def run_experiments(args: argparse.Namespace, text_log_path: Path) -> None:
         text_log_path=text_log_path,
     )
 
+    missing_users: List[str] = []
     for user_id in users:
         user_results = [r for r in sweep_results if r and r.get("user") == user_id]
         if not user_results:
             logging.warning(f"[WARN] 未获得 user={user_id} 的 sweep 结果，跳过挑选最佳窗口")
+            missing_users.append(user_id)
             continue
         best = max(user_results, key=lambda r: r["val"]["auc"])
         best_windows[user_id] = best
         logging.info(f"[SELECT] user={user_id} best_window={best['window']:.1f} val_auc={best['val']['auc']:.4f}")
 
+    if missing_users:
+        err_preview = " | ".join(sweep_errors[:3]) if sweep_errors else "no worker error details captured"
+        raise RuntimeError(
+            f"Sweep failed for users={missing_users}; first errors: {err_preview}. "
+            f"See {log_dir / 'hmog_vqgan.log'} for full trace."
+        )
+
     if args.final_epochs > args.sweep_epochs and best_windows:
         logging.info(f"[RETRAIN] 针对最佳窗口重新训练 {len(best_windows)} 位用户，每个 {args.final_epochs} 轮")
         final_tasks = [(user_id, info["window"]) for user_id, info in best_windows.items()]
-        final_results = dispatch_training_tasks(
+        final_results, _ = dispatch_training_tasks(
             args=args,
             tasks=final_tasks,
             epochs=args.final_epochs,
@@ -631,13 +728,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu-threads", type=int, default=40, help="Torch 内部算子使用的 CPU 线程数")
     parser.add_argument("--cache-processes", type=int, default=40, help="缓存预处理的顶层进程数（目标 40 CPU 并行）")
     parser.add_argument("--skip-cache-build", action="store_true", help="跳过运行前的窗口缓存构建")
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default="auto", help="auto / npu:0 / cuda:0 / cpu")
     parser.add_argument(
         "--gpu-ids",
         nargs="*",
         type=int,
         default=None,
-        help="并行训练所使用的 GPU 编号，缺省时自动使用所有可用 GPU。",
+        help="并行训练所使用的设备编号（NPU/CUDA），缺省时自动使用全部可用设备。",
     )
     parser.add_argument(
         "--max-parallel-train",

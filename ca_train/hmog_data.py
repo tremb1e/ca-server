@@ -105,7 +105,11 @@ def _window_points(window_size_sec: float) -> int:
 def _resample_time_axis(window: np.ndarray, target_width: int) -> np.ndarray:
     """Linear-resample a (H, T) window to (H, target_width) along the time axis."""
     if window.shape[1] == target_width:
-        return window
+        # Important: callers reuse a preallocated `window_raw` buffer while
+        # streaming CSV rows. Returning the original view here will alias all
+        # emitted windows to the same mutable memory, causing val/test positives
+        # and negatives to collapse into identical tensors.
+        return window.astype(np.float32, copy=True)
     x_old = np.linspace(0.0, 1.0, window.shape[1], dtype=np.float32)
     x_new = np.linspace(0.0, 1.0, target_width, dtype=np.float32)
     out = np.empty((window.shape[0], target_width), dtype=np.float32)
