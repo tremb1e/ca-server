@@ -11,6 +11,7 @@ import torch
 
 from ..utils.accelerator import resolve_torch_device
 from ..utils.ca_train import ensure_ca_train_on_path
+from ..utils.policy_paths import resolve_policy_path
 from .vqgan_inference import VQGANPolicy, load_vqgan, score_windows
 
 
@@ -69,8 +70,18 @@ def load_best_policy(
         else:
             interrupt_rule = "none"
 
-    vqgan_checkpoint = Path(str(policy.get("vqgan_checkpoint")))
-    vqgan_config = Path(str(policy.get("vqgan_config") or vqgan_checkpoint.with_suffix(".json")))
+    vqgan_checkpoint = resolve_policy_path(
+        policy.get("vqgan_checkpoint"),
+        policy_path=policy_path,
+        server_root=server_root,
+        models_root=models_root,
+    )
+    vqgan_config = resolve_policy_path(
+        policy.get("vqgan_config") or vqgan_checkpoint.with_suffix(".json"),
+        policy_path=policy_path,
+        server_root=server_root,
+        models_root=models_root,
+    )
     return AuthRunConfig(
         user=str(policy.get("user", user)),
         window_size=float(policy.get("window", 0.0)),

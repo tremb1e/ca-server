@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from ..ca_config import CAConfig, get_ca_config
 from ..utils.accelerator import normalize_device
 from ..utils.ca_train import ca_train_script, ensure_ca_train_on_path
+from ..utils.policy_paths import serialize_policy_path
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,7 @@ def _write_vqgan_policy(
     vqgan_checkpoint: Path,
     vqgan_config: Path,
 ) -> Path:
+    policy_path = user_output_dir / "best_lock_policy.json"
     policy = {
         "user": str(user_id),
         "window": float(window_size),
@@ -152,11 +154,10 @@ def _write_vqgan_policy(
         "vote_window_size": 0,
         "vote_min_rejects": 0,
         "auth_method": "vqgan-only",
-        "vqgan_checkpoint": str(vqgan_checkpoint),
-        "vqgan_config": str(vqgan_config),
+        "vqgan_checkpoint": serialize_policy_path(vqgan_checkpoint, relative_to=policy_path.parent),
+        "vqgan_config": serialize_policy_path(vqgan_config, relative_to=policy_path.parent),
         "model_version": vqgan_checkpoint.name,
     }
-    policy_path = user_output_dir / "best_lock_policy.json"
     policy_path.write_text(json.dumps({str(user_id): policy}, indent=2, ensure_ascii=False), encoding="utf-8")
     return policy_path
 

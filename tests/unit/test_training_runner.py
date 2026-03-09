@@ -111,6 +111,8 @@ def test_run_window_sweep_retrains_when_cached_summary_has_other_user(tmp_path, 
 
     policy = json.loads((models_root / user_id / "best_lock_policy.json").read_text(encoding="utf-8"))
     assert user_id in policy
+    assert policy[user_id]["vqgan_checkpoint"] == f"checkpoints/vqgan_user_{user_id}_ws_{ws:.1f}.pt"
+    assert policy[user_id]["vqgan_config"] == f"checkpoints/vqgan_user_{user_id}_ws_{ws:.1f}.json"
 
     summary_rows = json.loads((models_root / user_id / "training_summary.json").read_text(encoding="utf-8"))
     assert isinstance(summary_rows, list)

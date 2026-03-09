@@ -15,6 +15,7 @@ import numpy as np
 from ..ca_config import CAConfig, get_ca_config
 from ..utils.accelerator import autocast_context, normalize_device, resolve_torch_device
 from ..utils.ca_train import ca_train_root
+from ..utils.policy_paths import serialize_policy_path
 from .metrics import first_interrupt_times_sec_per_session, p_first_interrupt_le_columns
 from .pareto import ParetoPoint, pareto_frontier
 
@@ -793,6 +794,7 @@ def run_policy_grid_search(
 
     best = _pick_best_policy(ca_cfg, feasible_rows)
     if best and write_best_policy:
+        policy_dir = best_json.parent
         policy = {
             str(user): {
                 "user": str(user),
@@ -810,11 +812,11 @@ def run_policy_grid_search(
                 "k_rejects_mode": str(ca_cfg.auth.k_rejects_mode),
                 "threshold": float(best["threshold"]),
                 "interrupt_time_sec": float(best["interrupt_time_sec_min"]),
-                "vqgan_checkpoint": str(best["vqgan_checkpoint"]),
-                "lm_checkpoint": str(best["lm_checkpoint"]),
+                "vqgan_checkpoint": serialize_policy_path(Path(str(best["vqgan_checkpoint"])), relative_to=policy_dir),
+                "lm_checkpoint": serialize_policy_path(Path(str(best["lm_checkpoint"])), relative_to=policy_dir),
                 "grid_search": {
-                    "grid_results_csv": str(grid_csv),
-                    "pareto_frontier_csv": str(pareto_csv),
+                    "grid_results_csv": serialize_policy_path(grid_csv, relative_to=policy_dir),
+                    "pareto_frontier_csv": serialize_policy_path(pareto_csv, relative_to=policy_dir),
                 },
             }
         }
