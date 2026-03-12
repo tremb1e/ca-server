@@ -96,7 +96,7 @@ def build_hypercorn_config() -> "Config":
     return config
 
 
-if __name__ == "__main__":
+def run_server() -> None:
     import asyncio
     from hypercorn.asyncio import serve
     from .grpc_server import create_grpc_server
@@ -138,3 +138,7 @@ if __name__ == "__main__":
             logger.info("gRPC server stopped")
 
     asyncio.run(_run_servers())
+
+
+if __name__ == "__main__":
+    run_server()

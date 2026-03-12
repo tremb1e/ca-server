@@ -1,6 +1,10 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 from typing import Optional
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .utils.runtime import app_root
 
 
 class Settings(BaseSettings):
@@ -9,7 +13,7 @@ class Settings(BaseSettings):
 
     host: str = "0.0.0.0"
     port: int = 10500
-    http_enabled: bool = True
+    http_enabled: bool = False
 
     # gRPC endpoint (h2c by default, upgrade to TLS when cert/key provided)
     grpc_host: str = "0.0.0.0"
@@ -23,11 +27,11 @@ class Settings(BaseSettings):
     tls_ca_certs: Optional[Path] = None
     tls_keyfile_password: Optional[str] = None
 
-    data_storage_path: Path = Path("./data_storage/raw_data")
-    processed_data_path: Path = Path("./data_storage/processed_data")
-    inference_storage_path: Path = Path("./data_storage/inference")
-    log_path: Path = Path("./logs")
-    hmog_data_path: Path = Path("/data/code/ca/refer/ContinAuth/src/data/processed/raw_hmog_data")
+    data_storage_path: Path = Field(default_factory=lambda: app_root() / "data_storage" / "raw_data")
+    processed_data_path: Path = Field(default_factory=lambda: app_root() / "data_storage" / "processed_data")
+    inference_storage_path: Path = Field(default_factory=lambda: app_root() / "data_storage" / "inference")
+    log_path: Path = Field(default_factory=lambda: app_root() / "logs")
+    hmog_data_path: Path = Field(default_factory=lambda: app_root() / "data_storage" / "hmog_preprocessed")
     processing_sampling_rate: int = 100
     processing_min_total_mb: int = 100
     processing_target_mb: int = 100

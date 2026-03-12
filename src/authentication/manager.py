@@ -17,7 +17,7 @@ from ..processing.pipeline import _extract_sensor_records, _resample_records, bu
 from ..processing.scaler import apply_scaler, load_scaler
 from ..storage.inference_storage import InferenceStorage
 from ..utils.accelerator import resolve_torch_device
-from ..utils.ca_train import ensure_ca_train_on_path
+from ..utils.reject_trackers import ConsecutiveRejectTracker, VoteRejectTracker
 from .runner import AuthRunConfig, load_best_policy
 from .vqgan_inference import VQGANPolicy, load_vqgan, score_windows, windowize_dataframe
 
@@ -160,9 +160,6 @@ class AuthSessionManager:
             return False, f"model_not_ready: {exc}", None
 
         policy = self._policy_from_config(cfg)
-        ensure_ca_train_on_path()
-        from hmog_consecutive_rejects import ConsecutiveRejectTracker, VoteRejectTracker  # type: ignore
-
         state = AuthSessionState(user_id=user_id, session_id=session_id, policy=policy)
         state.consecutive_rejects = ConsecutiveRejectTracker()
         state.vote_rejects = VoteRejectTracker()

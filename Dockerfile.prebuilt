@@ -1,0 +1,82 @@
+FROM python:3.11-slim-bookworm AS runtime
+
+WORKDIR /app
+
+ARG GRPC_HEALTH_PROBE_VERSION=v0.4.38
+
+# Runtime intentionally consumes the host Ascend driver/toolkit via bind mounts.
+# Do not install Ascend driver packages into the image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    libglib2.0-0 \
+    libgomp1 \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN arch="$(dpkg --print-architecture)" && \
+    case "${arch}" in \
+      arm64) probe_arch='linux-arm64' ;; \
+      amd64) probe_arch='linux-amd64' ;; \
+      *) echo "Unsupported architecture: ${arch}" >&2; exit 1 ;; \
+    esac && \
+    curl --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -fsSL -o /usr/local/bin/grpc_health_probe \
+      "https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc_health_probe-${probe_arch}" && \
+    chmod +x /usr/local/bin/grpc_health_probe
+
+COPY dist/ca-server/ /app/bin/
+COPY ca_config.toml /app/ca_config.toml
+COPY deploy/entrypoint.sh /usr/local/bin/ca-entrypoint.sh
+
+RUN mkdir -p /usr/local/Ascend/driver /usr/local/Ascend/ascend-toolkit
+
+RUN chmod +x /usr/local/bin/ca-entrypoint.sh /usr/local/bin/grpc_health_probe /app/bin/ca-server && \
+    mkdir -p \
+      /app/data_storage/raw_data \
+      /app/data_storage/processed_data \
+      /app/data_storage/inference \
+      /app/data_storage/models \
+      /app/data_storage/hmog_preprocessed \
+      /app/runtime/ca_train/cached_windows \
+      /app/runtime/ca_train/token_caches \
+      /app/results \
+      /app/kernel_meta \
+      /app/ascend_logs \
+      /app/logs \
+      /app/certs
+
+ENV APP_ROOT=/app \
+    CA_CONFIG_PATH=/app/ca_config.toml \
+    HOST=0.0.0.0 \
+    PORT=18000 \
+    HTTP_ENABLED=false \
+    GRPC_HOST=0.0.0.0 \
+    GRPC_PORT=8000 \
+    DATA_STORAGE_PATH=/app/data_storage/raw_data \
+    PROCESSED_DATA_PATH=/app/data_storage/processed_data \
+    INFERENCE_STORAGE_PATH=/app/data_storage/inference \
+    HMOG_DATA_PATH=/app/data_storage/hmog_preprocessed \
+    CA_TRAIN_WINDOW_CACHE_DIR=/app/runtime/ca_train/cached_windows \
+    CA_TRAIN_TOKEN_CACHE_DIR=/app/runtime/ca_train/token_caches \
+    CA_RESULTS_PATH=/app/results \
+    LOG_PATH=/app/logs \
+    ASCEND_DRIVER_HOME=/usr/local/Ascend/driver \
+    ASCEND_INSTALL_INFO=/etc/ascend_install.info \
+    ASCEND_TOOLKIT_ROOT=/usr/local/Ascend/ascend-toolkit \
+    ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest \
+    ASCEND_AICPU_PATH=/usr/local/Ascend/ascend-toolkit/latest \
+    ASCEND_OPP_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp \
+    ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest \
+    TOOLCHAIN_HOME=/usr/local/Ascend/ascend-toolkit/latest/toolkit \
+    ASCEND_PROCESS_LOG_PATH=/app/ascend_logs \
+    ASCEND_VISIBLE_DEVICES=0 \
+    ASCEND_RT_VISIBLE_DEVICES=0 \
+    PATH=/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/sbin:${PATH} \
+    LD_LIBRARY_PATH=/app/bin/_internal:/app/bin/_internal/torch:/app/bin/_internal/torch/lib:/app/bin/_internal/torch_npu:/app/bin/_internal/torch_npu/lib:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver \
+    PYTHONPATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe
+
+EXPOSE 8000 18000
+
+ENTRYPOINT ["/usr/local/bin/ca-entrypoint.sh"]
+CMD ["server"]

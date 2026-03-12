@@ -14,8 +14,9 @@ import numpy as np
 
 from ..ca_config import CAConfig, get_ca_config
 from ..utils.accelerator import autocast_context, normalize_device, resolve_torch_device
-from ..utils.ca_train import ca_train_root
+from ..utils.ca_train import ensure_ca_train_on_path
 from ..utils.policy_paths import serialize_policy_path
+from ..utils.runtime import app_root
 from .metrics import first_interrupt_times_sec_per_session, p_first_interrupt_le_columns
 from .pareto import ParetoPoint, pareto_frontier
 
@@ -74,20 +75,11 @@ def _auth_method_tag(auth_method: str) -> str:
 
 
 def _server_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def _ca_train_root() -> Path:
-    return ca_train_root()
+    return app_root()
 
 
 def _ensure_ca_train_on_path() -> Path:
-    root = _ca_train_root()
-    if not root.exists():
-        raise FileNotFoundError(f"Missing CA-train directory: {root}")
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    return root
+    return ensure_ca_train_on_path()
 
 
 def _default_dataset_root(server_root: Path) -> Path:

@@ -37,6 +37,7 @@ from hmog_data import (
     prepare_user_datasets,
     precompute_all_user_windows,
 )
+from runtime_paths import dataset_root as default_dataset_root, results_dir as default_results_dir, window_cache_dir as default_window_cache_dir
 from vqgan import VQGAN
 
 
@@ -706,12 +707,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-path",
         type=str,
-        default="/data/code/server/data_storage/processed_data/window",
+        default=default_dataset_root(),
     )
     parser.add_argument(
         "--window-cache-dir",
         type=str,
-        default=str(Path(__file__).parent / "cached_windows"),
+        default=default_window_cache_dir(),
         help="已切分窗口的本地缓存目录，默认写入当前项目。",
     )
     parser.add_argument("--users", nargs="*", help="仅训练指定用户 id，默认遍历全部目录。")
@@ -780,8 +781,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="完整扫描 val/test CSV 做均匀采样（很慢但更接近无偏评估）；默认按需读取到负样本上限即停止。",
     )
-    parser.add_argument("--output-dir", type=str, default="results")
-    parser.add_argument("--log-dir", type=str, default="results/experiment_logs", help="指标/文本日志输出目录")
+    parser.add_argument("--output-dir", type=str, default=default_results_dir())
+    parser.add_argument("--log-dir", type=str, default=str(Path(default_results_dir()) / "experiment_logs"), help="指标/文本日志输出目录")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 

@@ -4,15 +4,16 @@ import json
 import logging
 import os
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..ca_config import CAConfig, get_ca_config
 from ..utils.accelerator import normalize_device
-from ..utils.ca_train import ca_train_script, ensure_ca_train_on_path
+from ..utils.ca_train import ca_train_command, ca_train_script
 from ..utils.policy_paths import serialize_policy_path
+from ..utils.reject_trackers import k_from_interrupt_time
+from ..utils.runtime import app_root
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +28,7 @@ class TrainingRunResult:
 
 
 def _server_root() -> Path:
-    # server/src/training/runner.py -> server/
-    return Path(__file__).resolve().parents[2]
+    return app_root()
 
 
 def _default_dataset_path(server_root: Path) -> Path:
@@ -182,15 +182,12 @@ def run_window_sweep_for_user(
     server_root = _server_root()
     dataset_path = Path(dataset_path) if dataset_path is not None else _default_dataset_path(server_root)
     models_root = Path(models_root) if models_root is not None else _default_models_root(server_root)
-    ca_train_script = Path(ca_train_script) if ca_train_script is not None else _default_ca_train_script()
+    ca_train_override = Path(ca_train_script) if ca_train_script is not None else None
 
-    if not ca_train_script.exists():
-        raise FileNotFoundError(f"Missing CA-train script: {ca_train_script}")
+    if ca_train_override is not None and not ca_train_override.exists():
+        raise FileNotFoundError(f"Missing CA-train script: {ca_train_override}")
     if not dataset_path.exists():
         raise FileNotFoundError(f"Missing window dataset path: {dataset_path}")
-
-    ensure_ca_train_on_path()
-    from hmog_consecutive_rejects import k_from_interrupt_time  # type: ignore
 
     window_sizes = list(window_sizes) if window_sizes is not None else list(ca_cfg.windows.sizes)
     if not window_sizes:
@@ -228,8 +225,7 @@ def run_window_sweep_for_user(
                     reuse_error,
                 )
             cmd: List[str] = [
-                sys.executable,
-                str(ca_train_script),
+                *ca_train_command("hmog_vqgan_experiment.py", override=ca_train_override),
                 "--dataset-path",
                 str(dataset_path),
                 "--users",

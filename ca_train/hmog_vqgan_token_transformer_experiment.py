@@ -34,6 +34,7 @@ from hmog_data import (
 from hmog_metrics import compute_metrics
 from hmog_token_transformer import build_token_lm
 from hmog_tokenizer import encode_windows_to_tokens
+from runtime_paths import dataset_root as default_dataset_root, results_dir as default_results_dir, token_cache_dir as default_token_cache_dir
 from vqgan import VQGAN
 
 
@@ -1550,7 +1551,7 @@ def run_single_window(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="HMOG VQGAN -> Token -> Transformer(LM) window sweep")
-    parser.add_argument("--dataset-path", type=str, default="/data/code/server/data_storage/processed_data/window")
+    parser.add_argument("--dataset-path", type=str, default=default_dataset_root())
     parser.add_argument("--users", nargs="*", help="仅训练指定用户 id，默认遍历全部目录。")
     parser.add_argument("--window-sizes", nargs="*", type=float, default=list(WINDOW_SIZES))
     parser.add_argument("--overlap", type=float, default=DEFAULT_OVERLAP)
@@ -1598,7 +1599,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reuse-vqgan", action="store_true", help="如果存在 checkpoint 则跳过 VQGAN 训练")
 
     # Tokenization
-    parser.add_argument("--token-cache-dir", type=str, default=str(Path(__file__).parent / "token_caches"))
+    parser.add_argument("--token-cache-dir", type=str, default=default_token_cache_dir())
     parser.add_argument("--token-batch-size", type=int, default=512)
 
     # Token LM config
@@ -1722,8 +1723,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-amp", dest="use_amp", action="store_false")
     parser.set_defaults(use_amp=True)
 
-    parser.add_argument("--output-dir", type=str, default="results")
-    parser.add_argument("--log-dir", type=str, default="results/experiment_logs")
+    parser.add_argument("--output-dir", type=str, default=default_results_dir())
+    parser.add_argument("--log-dir", type=str, default=str(Path(default_results_dir()) / "experiment_logs"))
     return parser.parse_args()
 
 

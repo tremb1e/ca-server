@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Literal, Optional
@@ -9,6 +10,8 @@ try:
     import tomllib
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib
+
+from .utils.runtime import app_root
 
 
 @dataclass(frozen=True)
@@ -77,8 +80,10 @@ class CAConfig:
 
 
 def _default_config_path() -> Path:
-    # server/src/ca_config.py -> server/ca_config.toml
-    return Path(__file__).resolve().parents[1] / "ca_config.toml"
+    configured = os.getenv("CA_CONFIG_PATH")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return app_root() / "ca_config.toml"
 
 
 def load_ca_config(path: Optional[Path] = None) -> CAConfig:

@@ -6,6 +6,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv-build/
 venv/
 ENV/
 env/
@@ -16,6 +17,7 @@ venv.bak/
 .Python
 build/
 dist/
+/nuitka-dist/
 *.egg-info/
 *.egg
 .eggs/
@@ -48,6 +50,9 @@ dmypy.json
 # Local config / secrets
 .env
 .env.*
+.envrc
+.python-version
+.direnv/
 *.local
 /certs/
 *.key
@@ -63,6 +68,7 @@ dmypy.json
 
 # Generated data / model artifacts
 /data_storage/
+/runtime/
 /reports/
 /results/
 /experiment_results/

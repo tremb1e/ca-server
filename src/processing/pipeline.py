@@ -12,6 +12,7 @@ import pandas as pd
 
 from ..ca_config import get_ca_config
 from ..config import settings
+from ..utils.runtime import app_root
 from .scaler import apply_scaler, write_scaler
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,7 @@ class ProcessingConfig:
 
 
 def _default_hmog_root() -> Path:
-    return Path("/data/code/ca/refer/ContinAuth/src/data/processed/raw_hmog_data")
+    return app_root() / "data_storage" / "hmog_preprocessed"
 
 
 def _resolve_hmog_root(configured_root: Path, processed_root: Path) -> Path:
@@ -90,7 +91,7 @@ def _resolve_hmog_root(configured_root: Path, processed_root: Path) -> Path:
     # Local fallback for packaged/dev environments where HMOG path is vendored
     # inside this repository instead of an absolute external mount.
     local_hmog = processed_root.parent / "hmog_preprocessed"
-    local_tmp_hmog = Path(__file__).resolve().parents[2] / "tmp_hmog"
+    local_tmp_hmog = app_root() / "tmp_hmog"
     for candidate in (local_hmog, local_tmp_hmog):
         if candidate not in candidates:
             candidates.append(candidate)

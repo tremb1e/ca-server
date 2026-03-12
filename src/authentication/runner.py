@@ -9,6 +9,8 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 
+from ..utils.reject_trackers import ConsecutiveRejectTracker, VoteRejectTracker
+from ..utils.runtime import app_root
 from ..utils.accelerator import resolve_torch_device
 from ..utils.ca_train import ensure_ca_train_on_path
 from ..utils.policy_paths import resolve_policy_path
@@ -32,8 +34,7 @@ class AuthRunConfig:
 
 
 def _server_root() -> Path:
-    # server/src/authentication/runner.py -> server/
-    return Path(__file__).resolve().parents[2]
+    return app_root()
 
 
 def _default_models_root(server_root: Path) -> Path:
@@ -107,7 +108,6 @@ def run_auth_inference(
     max_windows: Optional[int] = None,
 ) -> Tuple[Path, Dict]:
     ensure_ca_train_on_path()
-    from hmog_consecutive_rejects import ConsecutiveRejectTracker, VoteRejectTracker  # type: ignore
     from hmog_data import iter_windows_from_csv_unlabeled_with_session  # type: ignore
 
     csv_path = Path(csv_path)

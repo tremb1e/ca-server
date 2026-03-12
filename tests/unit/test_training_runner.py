@@ -85,13 +85,8 @@ def test_run_window_sweep_retrains_when_cached_summary_has_other_user(tmp_path, 
 
         return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr(training_runner, "ensure_ca_train_on_path", lambda: None)
     monkeypatch.setattr(training_runner.subprocess, "run", _fake_run)
-    monkeypatch.setitem(
-        sys.modules,
-        "hmog_consecutive_rejects",
-        SimpleNamespace(k_from_interrupt_time=lambda *args, **kwargs: 3),
-    )
+    monkeypatch.setattr(training_runner, "k_from_interrupt_time", lambda *args, **kwargs: 3)
 
     results = run_window_sweep_for_user(
         user_id,

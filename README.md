@@ -1,215 +1,207 @@
 # Continuous Authentication Server
 
-A lightweight server for receiving and storing encrypted sensor data from Android devices.
+持续身份认证服务，默认以 gRPC 为主；只有在 `HTTP_ENABLED=true` 且 `PORT != GRPC_PORT` 时才额外开启 HTTP。
 
-## Features
+## 容器化方案
 
-- AES-256-GCM decryption
-- LZ4 decompression
-- Data validation with Pydantic
-- File-based storage using JSONL format
-- Comprehensive JSON logging
-- Docker support
-- FastAPI async framework
+本仓库已收敛为**方案 A：单镜像、单编译产物、多子命令**：
+- 运行时主进程为编译后的 `ca-server` 二进制，不再使用 `python -m src.main`
+- 预处理、训练、策略搜索、离线认证统一复用同一个二进制子命令
+- `src/training/runner.py` 在冻结运行时会通过 `sys.executable ca-train-vqgan ...` 调起内置训练 helper，不再依赖运行时源码目录
+- 运行时镜像不保留 `/app/src`、`/app/ca_train`、`/app/tests`、`/app/docs`
 
-## Quick Start
+当前默认打包方案是 **PyInstaller onedir**。
+原因：在 Ascend / `torch` / 可选 `torch_npu` 依赖存在时，PyInstaller 对动态库与 Python 扩展的兼容性更稳；`BUNDLE_TOOL=nuitka` 保留为实验构建路径，但未作为默认发布方案。
 
-### Using Docker Compose
+## 构建镜像
+
+### Docker build
+
+```bash
+docker build -t ca-server:latest .
+```
+
+### 脚本构建
+
+```bash
+./scripts/build_docker.sh ca-server latest
+```
+
+脚本现在会按顺序执行：
+- 若存在旧的 `ca-server:latest`（或你传入的 tag），先删除旧镜像
+- 重新执行 `docker build`
+- 自动导出镜像到 `dist/docker-images/<image>_<tag>.tar`
+
+可选构建参数：
+- `BUNDLE_TOOL=pyinstaller`：默认、已验证
+- `BUNDLE_TOOL=nuitka`：实验路径，若与 `torch` / `torch_npu` / Ascend 动态库不兼容可能失败
+- `INSTALL_TORCH_NPU=1`：在可用私有源或本地 wheel 时安装 `torch_npu`
+- `TORCH_FIND_LINKS` / `TORCH_EXTRA_INDEX_URL`：指定 `torch` / `torch_npu` wheel 来源
+
+说明：
+- `docker compose` 当前默认会以 `INSTALL_TORCH_NPU=1` 构建镜像，避免训练镜像遗漏 `torch_npu`
+- 运行时镜像不会安装 Ascend 驱动和 toolkit，而是直接挂载宿主机上的 `/usr/local/Ascend/*`
+- 若你明确只需要 CPU/CUDA 版本，可在构建时显式设置 `INSTALL_TORCH_NPU=0`
+
+## 启动服务
+
+### Docker Compose
 
 ```bash
 docker compose up -d --build
 ```
 
-### Manual Installation
+默认端口：
+- gRPC：宿主机 `10500`
+- HTTP：宿主机 `18000`（仅当 `HTTP_ENABLED=true` 时真正监听）
+
+当前 compose 采用 `network_mode: host`。
+原因：在线上“远端 OpenResty -> 域名/VIP -> 本机”链路下，需要让容器监听方式与 `python -m src.main` 直跑一致，避免 Docker bridge/端口映射在特定 VIP 路径上表现不一致。
+
+### 启用独立 HTTP 端口
 
 ```bash
-pip install -r requirements.txt
-# 默认同时启动：
-# - gRPC 服务 (SensorDataService + gRPC health): 0.0.0.0:8000 (h2c by default)
-# - 若需要 HTTP/JSON API，请将 PORT 调整为与 GRPC_PORT 不同的端口，否则会被自动禁用以保证单端口模式
+HTTP_ENABLED=true \
+CA_SERVER_HTTP_PORT=18000 \
+docker compose up -d --build
+```
+
+注意：
+- 若 `HTTP_ENABLED=true` 但 `PORT == GRPC_PORT`，程序会自动关闭 HTTP，仅保留 gRPC
+- 默认 compose 已把 `PORT` 与 `GRPC_PORT` 分开设置，是否开启 HTTP 仅取决于 `HTTP_ENABLED`
+
+## 容器内子命令
+
+容器入口脚本 `deploy/entrypoint.sh` 已做命令分发：
+
+```bash
+docker compose run --rm ca-server training --user <user_id> --device cpu
+docker compose run --rm ca-server processing --user <user_id>
+docker compose run --rm ca-server policy-search --user <user_id> --device cpu
+docker compose run --rm ca-server auth --user <user_id> --csv-path /app/data_storage/processed_data/window/0.2/<user_id>/test.csv --device cpu
+```
+
+## 宿主机目录映射
+
+Compose 保留并补全了以下目录映射：
+
+- `deploy/config/ca_config.toml` -> `/app/ca_config.toml`
+- `deploy/config/server.env` -> `/app/.env`
+- `deploy/data/raw_data` -> `/app/data_storage/raw_data`
+- `deploy/data/processed_data` -> `/app/data_storage/processed_data`
+- `deploy/data/inference` -> `/app/data_storage/inference`
+- `deploy/data/models` -> `/app/data_storage/models`
+- `deploy/data/hmog_preprocessed` -> `/app/data_storage/hmog_preprocessed`
+- `deploy/data/ca_train_cached_windows` -> `/app/runtime/ca_train/cached_windows`
+- `deploy/data/ca_train_token_caches` -> `/app/runtime/ca_train/token_caches`
+- `deploy/data/results` -> `/app/results`
+- `deploy/data/ascend/kernel_meta` -> `/app/kernel_meta`
+- `deploy/data/ascend/log` -> `/app/ascend_logs`
+- `deploy/logs` -> `/app/logs`
+- `deploy/certs` -> `/app/certs`
+
+其中：
+- `HMOG_DATA_PATH` 默认改为容器内可配置目录 `/app/data_storage/hmog_preprocessed`
+- 训练缓存目录已从原先 `/app/ca_train/*` 收敛到 `/app/runtime/ca_train/*`，避免运行时镜像出现源码目录假象
+
+此外，compose 现在会显式映射 Ascend 设备节点：
+- `/dev/davinci_manager`
+- `/dev/devmm_svm`
+- `/dev/hisi_hdc`
+- `/dev/davinci0` ... `/dev/davinci7`
+
+这一步是为了解决容器内 `torch_npu` / `torch.npu.is_available()` 看不到宿主机 NPU 的问题；若目标机器的 NPU 数量不是 8 张，请按实际设备节点增删对应条目。
+
+## 健康检查与验收
+
+### Compose 健康检查
+
+当前 compose 健康检查已切换为 `grpc_health_probe`：
+
+```bash
+docker inspect --format '{{json .State.Health}}' ca-server | jq
+```
+
+### gRPC 健康检查
+
+```bash
+grpcurl -plaintext localhost:10500 grpc.health.v1.Health/Check
+```
+
+或：
+
+```bash
+docker exec ca-server grpc_health_probe -addr=127.0.0.1:10500
+```
+
+### HTTP 健康检查
+
+仅在 `HTTP_ENABLED=true` 且 HTTP 使用独立端口时执行：
+
+```bash
+curl --http2-prior-knowledge http://localhost:18000/health
+```
+
+### 验收建议
+
+- 镜像构建成功：`docker build -t ca-server:latest .`
+- 容器启动成功：`docker compose up -d`
+- gRPC health 成功：`docker exec ca-server grpc_health_probe -addr=127.0.0.1:10500`
+- HTTP 模式验收：`curl http://localhost:18000/health`
+- 日志落盘：检查 `deploy/logs`
+- 业务数据落盘：检查 `deploy/data/raw_data`、`deploy/data/inference`、`deploy/data/models`
+- 运行时镜像无源码目录：`docker exec ca-server sh -lc 'test ! -d /app/src && test ! -d /app/ca_train && test ! -d /app/tests && test ! -d /app/docs'`
+- 主进程为编译二进制：`docker exec ca-server ps -o pid,comm,args -p 1`
+
+## Ascend 依赖说明
+
+Compose 保留了 Ascend 910B2 所需环境变量与只读挂载：
+- `/etc/ascend_install.info:/etc/ascend_install.info:ro`
+- `/usr/local/Ascend/driver:/usr/local/Ascend/driver:ro`
+- `/usr/local/Ascend/ascend-toolkit:/usr/local/Ascend/ascend-toolkit:ro`
+- `/usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi:ro`
+- `/usr/bin/msnpureport:/usr/bin/msnpureport:ro`
+- `/dev/davinci_manager:/dev/davinci_manager`
+- `/dev/devmm_svm:/dev/devmm_svm`
+- `/dev/hisi_hdc:/dev/hisi_hdc`
+- `/dev/davinci0` ... `/dev/davinci7`
+- `ASCEND_VISIBLE_DEVICES`
+- `ASCEND_RT_VISIBLE_DEVICES`
+- `ASCEND_DRIVER_HOME`
+- `ASCEND_INSTALL_INFO`
+- `ASCEND_TOOLKIT_ROOT`
+- `ASCEND_TOOLKIT_HOME`
+- `ASCEND_OPP_PATH`
+- `LD_LIBRARY_PATH`
+- `PYTHONPATH`（仅保留 Ascend Python site-packages，不再注入 `/app` 源码路径）
+
+当前约束是：未来运行环境需与本机一致，即宿主机继续提供上述 Ascend 驱动、toolkit、设备节点和工具文件；容器只消费挂载，不在镜像内重复安装驱动/toolkit。
+
+当前仍保留 `privileged: true`，原因是：
+- Ascend 910B2 设备访问通常依赖驱动栈、设备节点与 runtime 行为的组合
+- 在只列设备节点而不启用 `privileged` 的场景下，训练/推理链路常出现不稳定或初始化失败
+- 现阶段优先保证与现网 Ascend 宿主机的兼容性；若后续要继续收紧权限，应基于目标机器逐项裁剪 `devices`、`cap_add` 与驱动映射
+
+## 已知限制
+
+- `BUNDLE_TOOL=nuitka` 仍是实验路径，未作为默认交付物
+- 若未安装 `torch_npu`，服务会回退为 CPU / CUDA / NPU 自动探测逻辑中的可用后端
+- 在线训练/策略搜索对数据质量、窗口 CSV 完整性与双类别验证集有要求；空目录或极小样本只能做 smoke test，不能代表完整训练性能
+- 运行时镜像不包含业务源码，但模型权重、日志、配置和挂载数据仍属于敏感资产，需结合文件权限与宿主机安全策略管理
+
+## 源码保护边界
+
+将 Python 程序编译为二进制只能**提高源码获取门槛**，并不能提供绝对防逆向能力：
+- 二进制、符号、字符串、模型结构、协议与运行时行为仍可能被分析
+- 若要进一步提高保护强度，仍需结合最小暴露面、镜像分层控制、访问控制、权重加密、远程密钥管理与宿主机安全加固
+
+## 本地源码运行
+
+如需直接从源码运行：
+
+```bash
+pip install -r requirements.txt -r requirements-ml.txt
 python -m src.main
-
-# 配置证书后 gRPC/HTTP 自动切换到 TLS 1.2/1.3 (ALPN h2)
-TLS_CERTFILE=./certs/server.crt TLS_KEYFILE=./certs/server.key python -m src.main
-# 若偏好 hypercorn CLI 仅跑 HTTP，可传递 --certfile/--keyfile 覆盖
 ```
 
-## API Endpoints
-
-- `POST /sensor-data/{device_id_hash}/{session_id}/{packet_sequence}` - Submit sensor data
-- `GET /health` - Health check with storage statistics
-- `GET /` - Server status
-- Note: HTTP endpoints run only when `PORT` differs from `GRPC_PORT` (single-port mode keeps only gRPC).
-
-## Configuration
-
-Configure via environment variables (or a `.env` file) as needed:
-- `HOST`, `PORT`, `HTTP_ENABLED`, `DATA_STORAGE_PATH`, `LOG_PATH`, `LOG_LEVEL`, `LOG_FORMAT`
-- TLS (optional): `TLS_CERTFILE`, `TLS_KEYFILE`, `TLS_CA_CERTS`, `TLS_KEYFILE_PASSWORD`
-- gRPC: `GRPC_HOST` (default `0.0.0.0`), `GRPC_PORT` (default `8000`), `GRPC_MAX_MESSAGE_SIZE`
-- Concurrency: `GRPC_MAX_CONCURRENT_RPCS`, `AUTH_MAX_CONCURRENT`, `AUTH_MAX_CACHED_MODELS`, `TRAINING_MAX_CONCURRENT`
-- 单端口模式：当 `GRPC_PORT == PORT` 时，HTTP/JSON API 会被自动关闭，仅保留 gRPC；如需同时提供 HTTP，请改用不同的 `PORT`。
-
-## Testing
-
-```bash
-pytest
-```
-
-## Docker Packaging (ARM + Ascend, No CUDA)
-
-### Build Image
-
-- **Using helper script (default: install torch):** `scripts/build_docker.sh [image_name] [tag]`
-- **Manual build (default: install torch):** `docker build -t ca-server:latest .`
-- **Manual build (install torch + torch-npu in image):**
-  ```bash
-  docker build -t ca-server:latest \
-    --build-arg INSTALL_TORCH=1 \
-    --build-arg INSTALL_TORCH_NPU=1 \
-    --build-arg TORCH_VERSION=2.6.0 \
-    --build-arg TORCH_NPU_VERSION=2.6.0.post5 \
-    --build-arg TORCH_EXTRA_INDEX_URL=<your_torch_npu_index> \
-    .
-  ```
-
-### Run Container
-
-- **docker compose（推荐）:** `docker compose up -d --build`
-- **首次部署建议：**
-  ```bash
-  mkdir -p \
-    deploy/data/raw_data \
-    deploy/data/processed_data \
-    deploy/data/inference \
-    deploy/data/models \
-    deploy/data/hmog_preprocessed \
-    deploy/data/ca_train_cached_windows \
-    deploy/data/ca_train_token_caches \
-    deploy/data/results \
-    deploy/data/ascend/kernel_meta \
-    deploy/data/ascend/log \
-    deploy/logs \
-    deploy/certs
-  ```
-
-### Host Path Mapping
-
-`docker-compose.yml` 已将以下路径映射到宿主机（均在项目根目录下）：
-
-- `./deploy/config/ca_config.toml` -> `/app/ca_config.toml`
-- `./deploy/config/server.env` -> `/app/.env`
-- `./deploy/data/raw_data` -> `/app/data_storage/raw_data`
-- `./deploy/data/processed_data` -> `/app/data_storage/processed_data`
-- `./deploy/data/inference` -> `/app/data_storage/inference`
-- `./deploy/data/models` -> `/app/data_storage/models`
-- `./deploy/data/hmog_preprocessed` -> `/app/data_storage/hmog_preprocessed`
-- `./deploy/data/ca_train_cached_windows` -> `/app/ca_train/cached_windows`
-- `./deploy/data/ca_train_token_caches` -> `/app/ca_train/token_caches`
-- `./deploy/data/results` -> `/app/results`
-- `./deploy/data/ascend/kernel_meta` -> `/app/kernel_meta`
-- `./deploy/data/ascend/log` -> `/app/ascend_logs`
-- `./deploy/logs` -> `/app/logs`
-- `./deploy/certs` -> `/app/certs`（可选）
-
-此外会映射宿主机 Ascend 运行时目录（只读）：
-- `/usr/local/Ascend/driver` -> `/usr/local/Ascend/driver`
-- `/usr/local/Ascend/ascend-toolkit` -> `/usr/local/Ascend/ascend-toolkit`
-
-### Verify HTTP/2 / gRPC Support
-
-- Health check (HTTP/1.1, when HTTP enabled): `curl http://localhost:10500/health`
-- HTTP/2 (h2c) probe (when HTTP enabled): `curl --http2-prior-knowledge http://localhost:10500/health`
-- TLS + HTTP/2 probe (if certs provided and HTTP enabled): `curl -vk --http2 https://localhost:10500/health`
-- gRPC (h2c): `grpcurl -plaintext localhost:10500 list com.continuousauth.proto.SensorDataService`
-- gRPC (TLS): `grpcurl -insecure localhost:10500 list com.continuousauth.proto.SensorDataService`
-- gRPC 健康检查 (h2c): `grpcurl -plaintext localhost:10500 grpc.health.v1.Health/Check`
-
-### Configuration Tips
-
-- 主要业务参数建议修改 `deploy/config/server.env`。
-- 预处理/滑窗/认证策略建议修改 `deploy/config/ca_config.toml`。
-- 若启用 TLS，请把证书放到 `deploy/certs` 并在 `deploy/config/server.env` 中启用 `TLS_CERTFILE/TLS_KEYFILE`。
-- 可通过 `ASCEND_VISIBLE_DEVICES` / `ASCEND_RT_VISIBLE_DEVICES` 限定容器使用的 NPU 卡号。
-
-## TLS / HTTP/2 Behavior
-
-- 默认：未提供证书时以 h2c（HTTP/2 over cleartext TCP）运行，适配 gRPC 的降级策略。
-- TLS：同时提供 `TLS_CERTFILE` 与 `TLS_KEYFILE` 时自动开启 TLS 1.2/1.3（可选 `TLS_CA_CERTS`、`TLS_KEYFILE_PASSWORD`）。若文件缺失会记录警告并继续使用 h2c。
-- 仅启用 TLS 1.2/1.3 的密码套件；证书/密钥无法加载或配置不完整时会记录原因并自动回退到 h2c，避免阻塞调试环境。
-- 推荐：使用 `curl --http2-prior-knowledge http://host:port/health` 验证 h2c，或 `curl -vk --http2 https://host:port/health` 验证 TLS。
-- gRPC 与 HTTP 共享同一套证书配置：gRPC 优先 TLS，若未配置证书则自动退回明文 h2c。客户端会先探测 TLS，再自动降级到 h2c。默认端口：gRPC 8000（HTTP 若需要请使用不同端口或显式开启）。
-
-## Data Storage
-
-Data is stored in JSONL format:
-```
-data_storage/
-  └── {device_id_hash}/
-      └── session_{session_id}.jsonl
-```
-
-## Dataset Processing Pipeline
-
-The server now bundles an offline pipeline to turn raw JSONL sessions into aligned datasets, merge HMOG attackers, normalize, and create sliding windows.
-
-Key knobs live in `ca_config.toml` (中文注释，便于后期调整)：
-- raw 数据触发阈值（默认 100MB）与并发进程数（默认 5）
-- 需要生成/训练/认证的窗口列表（默认 0.1–1.0s）
-- 连续拒绝 K 与“允许打断真实用户比例”等认证策略阈值
-
-Run the pipeline:
-```bash
-python -m src.processing.cli            # process all users that have >=100MB of raw sessions
-python -m src.processing.cli --user <device_hash>
-```
-
-What it does:
-- Detect users with ≥100MB raw data, sort sessions by filename timestamp (if present) or mtime, then take the earliest sessions (prefix) whose combined size reaches ~100MB and resample acc/gyr/mag to 100Hz with linear interpolation (uses up to 5 processes).
-- Split per-user data into ~75% train / 12.5% val / 12.5% test, then add HMOG attackers (#1 → val, #2 → test) after column/unit alignment.
-- Compute Z-Score stats from train only, store `scaler.json`, and write normalized splits under `data_storage/processed_data/z-score/<user>/`.
-- Generate sliding-window datasets for 0.1s–1.0s (stride=window/2, no cross-session) using up to 5 processes via `ProcessPoolExecutor`, saving to `data_storage/processed_data/window/{t}/{user}/`.
-
-## Model Training (VQGAN-only)
-
-The reference training code is vendored under `server/ca_train`. The server provides a thin wrapper to train per-window models from the generated window CSVs and store artifacts under `data_storage/models/<user>/`.
-
-```bash
-python -m src.training.cli --user <device_hash> --device auto
-# 仅跑一个窗口尺寸（用于快速 smoke test）：
-python -m src.training.cli --user <device_hash> --device cpu --window-sizes 0.1 --vqgan-epochs 1 --lm-epochs 1
-```
-
-Outputs:
-- Checkpoints: `data_storage/models/<user>/checkpoints/`
-- Per-window logs: `data_storage/models/<user>/logs/ws_<t>/`
-- Aggregated summary: `data_storage/models/<user>/training_summary.json`
-- Best lock policy: `data_storage/models/<user>/best_lock_policy.json`
-
-## Offline Policy Search (No Retraining)
-
-Run an offline grid search over vote policies `(N, M, target_window_frr, w, overlap)` on cached per-window scores:
-
-```bash
-python -m src.policy_search.cli --user <device_hash> --device auto                 # default: vqgan-only
-python -m src.policy_search.cli --user <device_hash> --device auto --auth-method both
-```
-
-Outputs (under `data_storage/models/<user>/policy_search/`):
-- `vqgan-only`: `grid_results_vqgan_only.csv` + `pareto_frontier_vqgan_only.csv` + `best_lock_policy_vqgan_only.json`
-- `vqgan+transformer`: `grid_results.csv` + `pareto_frontier.csv` (and optionally overwrites `best_lock_policy.json`)
-- Per-combo logs (default enabled): `per_combo/<auth_method>/t_<t>/N_<N>_M_<M>.csv` (each file groups different `target_window_frr` candidates).
-
-## Authentication Inference (Offline)
-
-Once `best_lock_policy.json` exists, you can run inference on any window CSV (e.g. the generated `test.csv`) and emit per-window scores/accept/reject decisions:
-
-```bash
-python -m src.authentication.cli \
-  --user <device_hash> \
-  --csv-path data_storage/processed_data/window/0.1/<device_hash>/test.csv \
-  --device auto
-```
-
-Outputs:
-- `data_storage/models/<user>/inference/infer_ws_<t>.csv`
+默认仍以 gRPC 为主；只有在显式设置 `HTTP_ENABLED=true` 且 `PORT != GRPC_PORT` 时才会同时开启 HTTP。
