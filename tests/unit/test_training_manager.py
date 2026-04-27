@@ -1,4 +1,6 @@
 import json
+import sys
+import types
 
 import pytest
 
@@ -32,8 +34,13 @@ async def test_training_manager_triggers_when_threshold_met(tmp_path, monkeypatc
     def fake_run_window_sweep_for_user(user_id) -> None:
         calls.append(("train", user_id))
 
-    monkeypatch.setattr(training_manager, "process_user", fake_process_user)
-    monkeypatch.setattr(training_manager, "run_window_sweep_for_user", fake_run_window_sweep_for_user)
+    fake_pipeline = types.ModuleType("src.processing.pipeline")
+    fake_pipeline.build_config = lambda: object()
+    fake_pipeline.process_user = fake_process_user
+    fake_runner = types.ModuleType("src.training.runner")
+    fake_runner.run_window_sweep_for_user = fake_run_window_sweep_for_user
+    monkeypatch.setitem(sys.modules, "src.processing.pipeline", fake_pipeline)
+    monkeypatch.setitem(sys.modules, "src.training.runner", fake_runner)
 
     manager = training_manager.TrainingManager(max_concurrent=1, check_interval_sec=1)
     await manager.submit_if_ready("user1")

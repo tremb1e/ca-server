@@ -32,6 +32,8 @@ docs
 *.md
 
 node_modules
-dist
+dist/*
+!dist/ca-server/
+!dist/ca-server/**
 build
 *.egg-info

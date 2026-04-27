@@ -23,7 +23,13 @@ def temp_data_dir():
 
 @pytest.fixture
 def client(temp_data_dir, monkeypatch):
-    monkeypatch.setenv("DATA_STORAGE_PATH", str(temp_data_dir))
+    from src.config import settings
+    from src.management.runtime import reset_runtime_context
+
+    monkeypatch.setattr(settings, "data_storage_path", temp_data_dir)
+    monkeypatch.setattr(settings, "processed_data_path", temp_data_dir.parent / "processed_data")
+    monkeypatch.setattr(settings, "inference_storage_path", temp_data_dir.parent / "inference")
+    reset_runtime_context()
     from src.main import app
     return TestClient(app)
 
@@ -104,6 +110,32 @@ class TestSensorDataEndpoint:
         assert response.status_code == 200
         response_data = response.json()
         assert response_data["status"] == "ok"
+
+        runtime = client.get("/health").json()
+        assert runtime["storage_stats"]["total_devices"] == 1
+
+    def test_successful_packet_submission_with_string_identifiers(self, client):
+        device_id_hash = "device-abc"
+        session_id = "session-xyz"
+        packet_seq_no = 1
+
+        encrypted_data, _ = self.prepare_test_packet(
+            device_id_hash, session_id, packet_seq_no, compression="gzip"
+        )
+
+        response = client.post(
+            "/api/v1/sensor-data",
+            content=encrypted_data,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Device-ID-Hash": device_id_hash,
+                "X-Session-ID": session_id,
+                "X-Packet-Sequence": str(packet_seq_no),
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
 
     def test_multiple_packets_submission(self, client):
         device_id_hash = 123456789
@@ -229,6 +261,22 @@ class TestSensorDataEndpoint:
         response_data = response.json()
         assert response_data["status"] == "error"
         assert response_data["reason"] == "decryption_failed"
+
+    def test_unsafe_device_id_rejected(self, client):
+        encrypted_data, _ = self.prepare_test_packet(123, 456, 1, compression="gzip")
+
+        response = client.post(
+            "/api/v1/sensor-data",
+            content=encrypted_data,
+            headers={
+                "X-Device-ID-Hash": "../outside",
+                "X-Session-ID": "456",
+                "X-Packet-Sequence": "1",
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()["reason"] == "invalid_identifier"
 
     def test_invalid_compressed_data(self, client):
         invalid_compressed = b"not compressed"

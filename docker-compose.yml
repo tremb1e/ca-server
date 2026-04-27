@@ -1,41 +1,43 @@
 name: ca-server
 
 x-ca-common-env: &ca-common-env
-  TZ: ${TZ:-Asia/Shanghai}
-  APP_ROOT: /app
-  CA_CONFIG_PATH: /app/ca_config.toml
-  HOST: 0.0.0.0
-  PORT: ${CA_SERVER_HTTP_PORT:-18000}
-  HTTP_ENABLED: ${HTTP_ENABLED:-false}
-  GRPC_HOST: 0.0.0.0
-  GRPC_PORT: ${CA_SERVER_GRPC_PORT:-10500}
-  DATA_STORAGE_PATH: /app/data_storage/raw_data
-  PROCESSED_DATA_PATH: /app/data_storage/processed_data
-  INFERENCE_STORAGE_PATH: /app/data_storage/inference
-  HMOG_DATA_PATH: /app/data_storage/hmog_preprocessed
-  CA_TRAIN_WINDOW_CACHE_DIR: /app/runtime/ca_train/cached_windows
-  CA_TRAIN_TOKEN_CACHE_DIR: /app/runtime/ca_train/token_caches
-  CA_RESULTS_PATH: /app/results
-  LOG_PATH: /app/logs
-
-  ASCEND_VISIBLE_DEVICES: ${ASCEND_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
-  ASCEND_RT_VISIBLE_DEVICES: ${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
-  ASCEND_PROCESS_LOG_PATH: /app/ascend_logs
-  ASCEND_GLOBAL_LOG_LEVEL: ${ASCEND_GLOBAL_LOG_LEVEL:-3}
-  ASCEND_DRIVER_HOME: /usr/local/Ascend/driver
-  ASCEND_INSTALL_INFO: /etc/ascend_install.info
-  ASCEND_TOOLKIT_ROOT: /usr/local/Ascend/ascend-toolkit
-  ASCEND_TOOLKIT_HOME: /usr/local/Ascend/ascend-toolkit/latest
-  ASCEND_AICPU_PATH: /usr/local/Ascend/ascend-toolkit/latest
-  ASCEND_OPP_PATH: /usr/local/Ascend/ascend-toolkit/latest/opp
-  ASCEND_HOME_PATH: /usr/local/Ascend/ascend-toolkit/latest
-  LD_LIBRARY_PATH: /app/bin/_internal:/app/bin/_internal/torch:/app/bin/_internal/torch/lib:/app/bin/_internal/torch_npu:/app/bin/_internal/torch_npu/lib:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver
-  PYTHONPATH: /app:/app/ca_train:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe
-  PYTHONUNBUFFERED: "1"
+  - TZ=${TZ:-Asia/Shanghai}
+  - APP_ROOT=/app
+  - CA_CONFIG_PATH=/app/ca_config.toml
+  - HOST=0.0.0.0
+  - PORT=${CA_SERVER_HTTP_PORT:-18000}
+  - HTTP_ENABLED=${HTTP_ENABLED:-false}
+  - GRPC_HOST=0.0.0.0
+  - GRPC_PORT=${CA_SERVER_GRPC_PORT:-10500}
+  - DATA_STORAGE_PATH=/app/data_storage/raw_data
+  - PROCESSED_DATA_PATH=/app/data_storage/processed_data
+  - INFERENCE_STORAGE_PATH=/app/data_storage/inference
+  - HMOG_DATA_PATH=/app/data_storage/hmog_preprocessed
+  - MANAGEMENT_API_ENABLED
+  - MANAGEMENT_API_KEY
+  - MAX_DECOMPRESSED_SIZE=${MAX_DECOMPRESSED_SIZE:-10485760}
+  - CA_TRAIN_WINDOW_CACHE_DIR=/app/runtime/ca_train/cached_windows
+  - CA_TRAIN_TOKEN_CACHE_DIR=/app/runtime/ca_train/token_caches
+  - CA_RESULTS_PATH=/app/results
+  - LOG_PATH=/app/logs
+  - ASCEND_VISIBLE_DEVICES=${ASCEND_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+  - ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+  - ASCEND_PROCESS_LOG_PATH=/app/ascend_logs
+  - ASCEND_GLOBAL_LOG_LEVEL=${ASCEND_GLOBAL_LOG_LEVEL:-3}
+  - ASCEND_DRIVER_HOME=/usr/local/Ascend/driver
+  - ASCEND_INSTALL_INFO=/etc/ascend_install.info
+  - ASCEND_TOOLKIT_ROOT=/usr/local/Ascend/ascend-toolkit
+  - ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
+  - ASCEND_AICPU_PATH=/usr/local/Ascend/ascend-toolkit/latest
+  - ASCEND_OPP_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp
+  - ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+  - LD_LIBRARY_PATH=/app/bin/_internal:/app/bin/_internal/torch:/app/bin/_internal/torch/lib:/app/bin/_internal/torch_npu:/app/bin/_internal/torch_npu/lib:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver
+  - PYTHONPATH=/app:/app/ca_train:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe
+  - PYTHONUNBUFFERED=1
 
 x-ca-common-volumes: &ca-common-volumes
   - ./deploy/config/ca_config.toml:/app/ca_config.toml:ro
-  - ./deploy/config/server.env:/app/.env:ro
+  - ./deploy/config/${CA_SERVER_ENV_FILE:-server.env.example}:/app/.env:ro
   - ./deploy/data/raw_data:/app/data_storage/raw_data
   - ./deploy/data/processed_data:/app/data_storage/processed_data
   - ./deploy/data/inference:/app/data_storage/inference
@@ -68,6 +70,9 @@ services:
       dockerfile: ${CA_SERVER_DOCKERFILE:-Dockerfile}
       args:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
         INSTALL_TORCH: ${INSTALL_TORCH:-1}
         INSTALL_TORCH_NPU: ${INSTALL_TORCH_NPU:-1}
         TORCH_VERSION: ${TORCH_VERSION:-2.6.0}
@@ -79,8 +84,6 @@ services:
         NUITKA_VERSION: ${NUITKA_VERSION:-2.6.8}
         GRPC_HEALTH_PROBE_VERSION: ${GRPC_HEALTH_PROBE_VERSION:-v0.4.38}
         PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-python:3.12-slim-bookworm}
-    env_file:
-      - ./deploy/config/server.env
     environment: *ca-common-env
     network_mode: host
     volumes: *ca-common-volumes
@@ -110,7 +113,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "/usr/local/bin/grpc_health_probe -addr=127.0.0.1:${GRPC_PORT:-10500} -connect-timeout 5s -rpc-timeout 5s >/dev/null 2>&1 || exit 1",
+          "/usr/local/bin/grpc_health_probe -addr=127.0.0.1:$${GRPC_PORT:-10500} -connect-timeout 5s -rpc-timeout 5s >/dev/null 2>&1 || exit 1",
         ]
       interval: 30s
       timeout: 10s

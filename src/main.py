@@ -48,6 +48,11 @@ if settings.cors_enabled:
 app.include_router(health.router, tags=["health"])
 app.include_router(sensor_data.router, tags=["sensor_data"])
 
+if settings.management_api_enabled:
+    from .management.router import router as management_router
+
+    app.include_router(management_router)
+
 
 def build_hypercorn_config() -> "Config":
     from hypercorn.config import Config
@@ -102,8 +107,13 @@ def run_server() -> None:
     from .grpc_server import create_grpc_server
 
     async def _run_servers() -> None:
-        http_enabled = settings.http_enabled
+        http_enabled = settings.http_enabled or settings.management_api_enabled
         if settings.grpc_port == settings.port and http_enabled:
+            if settings.management_api_enabled:
+                raise RuntimeError(
+                    "MANAGEMENT_API_ENABLED=true requires HTTP on a port different from GRPC_PORT. "
+                    "Set PORT/CA_SERVER_HTTP_PORT and GRPC_PORT/CA_SERVER_GRPC_PORT to different values."
+                )
             logger.warning(
                 "HTTP and gRPC are both configured for port %s; disabling HTTP server to keep single-port gRPC.",
                 settings.port,

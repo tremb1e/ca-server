@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     log_path: Path = Field(default_factory=lambda: app_root() / "logs")
     hmog_data_path: Path = Field(default_factory=lambda: app_root() / "data_storage" / "hmog_preprocessed")
     processing_sampling_rate: int = 100
+    # Deprecated: processing thresholds are read from ca_config.toml.
     processing_min_total_mb: int = 100
     processing_target_mb: int = 100
     hmog_acc_unit: str = "m/s^2"
@@ -47,7 +48,11 @@ class Settings(BaseSettings):
     auth_max_cached_models: int = 16
     auth_session_ttl_sec: int = 600
 
+    management_api_enabled: bool = False
+    management_api_key: Optional[str] = None
+
     max_request_size: int = 10 * 1024 * 1024
+    max_decompressed_size: int = 10 * 1024 * 1024
 
     log_level: str = "INFO"
     log_format: str = "json"

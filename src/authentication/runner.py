@@ -6,15 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-import numpy as np
-import torch
-
 from ..utils.reject_trackers import ConsecutiveRejectTracker, VoteRejectTracker
 from ..utils.runtime import app_root
-from ..utils.accelerator import resolve_torch_device
 from ..utils.ca_train import ensure_ca_train_on_path
+from ..utils.path_safety import safe_child_path, validate_storage_id
 from ..utils.policy_paths import resolve_policy_path
-from .vqgan_inference import VQGANPolicy, load_vqgan, score_windows
 
 
 @dataclass(frozen=True)
@@ -47,10 +43,11 @@ def load_best_policy(
     models_root: Optional[Path] = None,
     policy_path: Optional[Path] = None,
 ) -> AuthRunConfig:
+    user = validate_storage_id(user, field_name="user")
     server_root = _server_root()
     models_root = Path(models_root) if models_root is not None else _default_models_root(server_root)
     if policy_path is None:
-        policy_path = models_root / user / "best_lock_policy.json"
+        policy_path = safe_child_path(models_root, user) / "best_lock_policy.json"
     policy_path = Path(policy_path)
     if not policy_path.exists():
         raise FileNotFoundError(f"Missing policy json for user={user}: {policy_path}")
@@ -107,6 +104,11 @@ def run_auth_inference(
     output_csv: Optional[Path] = None,
     max_windows: Optional[int] = None,
 ) -> Tuple[Path, Dict]:
+    import numpy as np
+
+    from ..utils.accelerator import resolve_torch_device
+    from .vqgan_inference import load_vqgan, score_windows
+
     ensure_ca_train_on_path()
     from hmog_data import iter_windows_from_csv_unlabeled_with_session  # type: ignore
 

@@ -5,11 +5,16 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_NAME=${1:-ca-server}
 IMAGE_TAG=${2:-latest}
 DOCKERFILE_PATH=${CA_SERVER_DOCKERFILE:-Dockerfile}
+DOCKER_BUILD_NETWORK=${DOCKER_BUILD_NETWORK:-}
+DOCKER_BUILD_EXTRA_ARGS=${DOCKER_BUILD_EXTRA_ARGS:-}
 EXPORT_DIR=${EXPORT_DIR:-"${ROOT_DIR}/dist/docker-images"}
 SAFE_IMAGE_NAME="$(printf '%s' "${IMAGE_NAME}" | tr '/:' '__')"
 EXPORT_PATH=${EXPORT_PATH:-"${EXPORT_DIR}/${SAFE_IMAGE_NAME}_${IMAGE_TAG}.tar"}
 
 PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}
+HTTP_PROXY=${HTTP_PROXY:-}
+HTTPS_PROXY=${HTTPS_PROXY:-}
+NO_PROXY=${NO_PROXY:-localhost,127.0.0.1}
 INSTALL_TORCH=${INSTALL_TORCH:-1}
 INSTALL_TORCH_NPU=${INSTALL_TORCH_NPU:-1}
 TORCH_VERSION=${TORCH_VERSION:-2.6.0}
@@ -24,6 +29,11 @@ PYTHON_BASE_IMAGE=${PYTHON_BASE_IMAGE:-python:3.12-slim-bookworm}
 
 mkdir -p "${EXPORT_DIR}"
 
+if [ "$(basename "${DOCKERFILE_PATH}")" = "Dockerfile.prebuilt" ] && [ ! -x "${ROOT_DIR}/dist/ca-server/ca-server" ]; then
+  echo "Dockerfile.prebuilt requires dist/ca-server/ca-server. Run ./scripts/build_frozen_bundle.sh first." >&2
+  exit 1
+fi
+
 if docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" >/dev/null 2>&1; then
   echo "Removing existing image ${IMAGE_NAME}:${IMAGE_TAG}" >&2
   docker image rm -f "${IMAGE_NAME}:${IMAGE_TAG}" >/dev/null
@@ -33,9 +43,26 @@ fi
 
 echo "Building ${IMAGE_NAME}:${IMAGE_TAG} from ${ROOT_DIR} using ${DOCKERFILE_PATH}" >&2
 
-docker build \
+docker_build_cmd=(
+  docker build
+)
+
+if [ -n "${DOCKER_BUILD_NETWORK}" ]; then
+  docker_build_cmd+=(--network "${DOCKER_BUILD_NETWORK}")
+fi
+
+if [ -n "${DOCKER_BUILD_EXTRA_ARGS}" ]; then
+  # shellcheck disable=SC2206
+  extra_args=(${DOCKER_BUILD_EXTRA_ARGS})
+  docker_build_cmd+=("${extra_args[@]}")
+fi
+
+"${docker_build_cmd[@]}" \
   --file "${ROOT_DIR}/${DOCKERFILE_PATH}" \
   --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}" \
+  --build-arg "HTTP_PROXY=${HTTP_PROXY}" \
+  --build-arg "HTTPS_PROXY=${HTTPS_PROXY}" \
+  --build-arg "NO_PROXY=${NO_PROXY}" \
   --build-arg "INSTALL_TORCH=${INSTALL_TORCH}" \
   --build-arg "INSTALL_TORCH_NPU=${INSTALL_TORCH_NPU}" \
   --build-arg "TORCH_VERSION=${TORCH_VERSION}" \

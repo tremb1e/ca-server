@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import shutil
 from src.storage.file_storage import FileStorage
+from src.utils.path_safety import UnsafePathSegmentError
 
 
 class TestFileStorage:
@@ -142,3 +143,12 @@ class TestFileStorage:
 
         assert "device123" in str(path)
         assert "session_session456.jsonl" in str(path)
+
+    @pytest.mark.asyncio
+    async def test_rejects_unsafe_path_segments(self, storage, sample_packet):
+        ok, err = await storage.append_packet("../outside", "session456", sample_packet)
+        assert ok is False
+        assert "unsafe path" in err or "unsafe path characters" in err
+
+        with pytest.raises(UnsafePathSegmentError):
+            storage._get_session_file_path("device123", "a/b")

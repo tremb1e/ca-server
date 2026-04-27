@@ -3,8 +3,8 @@
 
 # **Continuous Authentication - 服务端处理程序功能规格（Lite v1.0）**
 > **版本**：Lite v1.0  
-> **最后更新日期**：2025-09-16  
-> **状态**：功能规格说明书（MVP 最小实现）  
+> **最后更新日期**：2025-09-16
+> **状态**：历史 MVP 功能规格说明书，仅供理解旧版 HTTP 兼容链路；当前主链路和管理 API 以 `README.md` 与 `docs/外部API接口说明.md` 为准。
 > **目标**：与 Android App 完全功能兼容，专注核心数据接收存储链路。
 
 ---
@@ -17,7 +17,7 @@
 
 ## **2. 系统架构（MVP版）**
 ```
-[App端] => HTTPS POST (binary_encrypted_envelope)
+[App端] => HTTP/HTTPS POST (binary_encrypted_envelope，是否启用 TLS 取决于服务端证书配置)
           ↓
 [服务器API入口] (/api/v1/sensor-data)
           ↓
@@ -25,7 +25,7 @@
           ↓
 [数据解密(AES-256-GCM固定密钥)]
           ↓
-[LZ4解压缩]
+[LZ4/GZIP解压缩]
           ↓
 [数据包 JSON 解析 & 校验]
           ↓
@@ -53,7 +53,8 @@
   - `device_id_hash`：目录名
   - `session_id`：子目录名或直接作为文件名一部分
   - `packet_seq_no`：写入时按顺序追加
-  - 上层由 App 保证按 packet_seq_no 顺序发送，服务端检查是否乱序，需要按时间顺序写入文件中
+  - 上层由 App 保证按 packet_seq_no 顺序发送，服务端来包即追加；读取 session 时再按 `packet_seq_no` 排序
+  - `device_id_hash` 和 `session_id` 只能作为单个路径段，不能包含 `/`、`\`、`.`、`..` 或空值
 
 ---
 
@@ -61,8 +62,8 @@
 - **算法**：AES-256-GCM（与 App 端一致）
 - **密钥管理**：
   - MVP 阶段使用 **固定对称密钥**，密钥为“Continuous_Authentication”
-- **解密输入**：二进制包（IV + Ciphertext + GCM Tag）
-- **输出**：UTF-8 JSON 文本
+- **解密输入**：二进制包（IV + GCM Tag + Ciphertext）
+- **输出**：压缩后的 payload，随后由解压模块还原为 UTF-8 JSON 文本
 
 ---
 
@@ -94,7 +95,7 @@
   - 包含 `packet_seq_no` 方便后续排序
 - **文件格式**：
   - **JSON Lines（.jsonl）**：便于流式读取与追加
-  - 原始 JSON 不作额外加工（保留完整字段）
+  - 保留原始 JSON 字段，并追加 `server_received_timestamp`
 
 ---
 
@@ -123,7 +124,7 @@
 #### **请求**
 - **Headers**：
   - `Content-Type: application/octet-stream`
-  - `X-Device-ID-Hash`: String(32+)
+  - `X-Device-ID-Hash`: String（当前兼容链路可使用数字字符串或普通字符串 ID）
   - `X-Session-ID`: String
   - `X-Packet-Sequence`: Integer
 - **Body**：
@@ -132,8 +133,8 @@
 #### **解密后的 JSON 示例**
 ```json
 {
-  "device_id_hash": 123456789,
-  "session_id": 123456789,
+  "device_id_hash": "123456789",
+  "session_id": "123456789",
   "packet_seq_no": 123456789,
   "timestamp_ms": 1643723400000,
   "window_start_ms": 1643723400000,

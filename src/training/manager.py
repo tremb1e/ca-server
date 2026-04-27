@@ -10,8 +10,7 @@ from typing import Optional
 
 from ..ca_config import get_ca_config
 from ..config import settings
-from ..processing.pipeline import build_config, process_user
-from .runner import run_window_sweep_for_user
+from ..utils.path_safety import safe_child_path, validate_storage_id
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,7 @@ class TrainingReadiness:
 
 
 def _state_path(models_root: Path, user_id: str) -> Path:
-    return models_root / user_id / "training_state.json"
+    return safe_child_path(models_root, validate_storage_id(user_id, field_name="user_id")) / "training_state.json"
 
 
 def load_state(models_root: Path, user_id: str) -> TrainingState:
@@ -75,7 +74,7 @@ def save_state(models_root: Path, user_id: str, state: TrainingState) -> None:
 
 
 def _user_total_bytes(raw_root: Path, user_id: str) -> int:
-    user_dir = raw_root / user_id
+    user_dir = safe_child_path(raw_root, validate_storage_id(user_id, field_name="user_id"))
     if not user_dir.exists():
         return 0
     total = 0
@@ -98,6 +97,31 @@ class TrainingManager:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._last_checked: dict[str, float] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+
+    def snapshot_tasks(self) -> dict:
+        tasks = []
+        for user_id, task in self._tasks.items():
+            payload = {
+                "user_id": str(user_id),
+                "done": bool(task.done()),
+                "cancelled": bool(task.cancelled()),
+                "exception": "",
+            }
+            if task.done() and not task.cancelled():
+                try:
+                    exc = task.exception()
+                except Exception as err:  # noqa: BLE001
+                    exc = err
+                if exc:
+                    payload["exception"] = str(exc)
+            tasks.append(payload)
+
+        return {
+            "check_interval_sec": int(self._check_interval_sec),
+            "last_checked": {str(k): float(v) for k, v in self._last_checked.items()},
+            "tasks": tasks,
+            "active_tasks": sum(1 for task in self._tasks.values() if not task.done()),
+        }
 
     def get_readiness(self, user_id: str) -> TrainingReadiness:
         ca_cfg = get_ca_config()
@@ -143,6 +167,9 @@ class TrainingManager:
             save_state(self._models_root, user_id, state)
 
             try:
+                from ..processing.pipeline import build_config, process_user
+                from .runner import run_window_sweep_for_user
+
                 proc_cfg = build_config()
                 await asyncio.to_thread(process_user, user_id, proc_cfg)
                 await asyncio.to_thread(run_window_sweep_for_user, user_id)

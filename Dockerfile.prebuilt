@@ -3,6 +3,16 @@ FROM python:3.11-slim-bookworm AS runtime
 WORKDIR /app
 
 ARG GRPC_HEALTH_PROBE_VERSION=v0.4.38
+ARG HTTP_PROXY=
+ARG HTTPS_PROXY=
+ARG NO_PROXY=localhost,127.0.0.1
+
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    NO_PROXY=${NO_PROXY} \
+    http_proxy=${HTTP_PROXY} \
+    https_proxy=${HTTPS_PROXY} \
+    no_proxy=${NO_PROXY}
 
 # Runtime intentionally consumes the host Ascend driver/toolkit via bind mounts.
 # Do not install Ascend driver packages into the image.
@@ -52,7 +62,7 @@ ENV APP_ROOT=/app \
     PORT=18000 \
     HTTP_ENABLED=false \
     GRPC_HOST=0.0.0.0 \
-    GRPC_PORT=8000 \
+    GRPC_PORT=10500 \
     DATA_STORAGE_PATH=/app/data_storage/raw_data \
     PROCESSED_DATA_PATH=/app/data_storage/processed_data \
     INFERENCE_STORAGE_PATH=/app/data_storage/inference \
@@ -76,7 +86,7 @@ ENV APP_ROOT=/app \
     LD_LIBRARY_PATH=/app/bin/_internal:/app/bin/_internal/torch:/app/bin/_internal/torch/lib:/app/bin/_internal/torch_npu:/app/bin/_internal/torch_npu/lib:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver \
     PYTHONPATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe
 
-EXPOSE 8000 18000
+EXPOSE 10500 18000
 
 ENTRYPOINT ["/usr/local/bin/ca-entrypoint.sh"]
 CMD ["server"]

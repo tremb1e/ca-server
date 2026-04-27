@@ -3,6 +3,8 @@ from pydantic import BaseModel, field_validator
 import logging
 from datetime import datetime
 
+from ..utils.path_safety import UnsafePathSegmentError, validate_storage_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,8 +23,8 @@ class SensorData(BaseModel):
 
 
 class DataPacket(BaseModel):
-    device_id_hash: int
-    session_id: int
+    device_id_hash: str
+    session_id: str
     packet_seq_no: int
     timestamp_ms: int
     window_start_ms: int
@@ -30,6 +32,19 @@ class DataPacket(BaseModel):
     type: str
     foreground_package_name: Optional[str] = None
     sensor_data: list[Dict[str, Any]]
+
+    @field_validator("device_id_hash", "session_id", mode="before")
+    @classmethod
+    def coerce_identifier(cls, v):
+        return str(v)
+
+    @field_validator("device_id_hash", "session_id")
+    @classmethod
+    def validate_identifier(cls, v):
+        try:
+            return validate_storage_id(v)
+        except UnsafePathSegmentError as exc:
+            raise ValueError(str(exc)) from exc
 
     @field_validator("timestamp_ms", "window_start_ms", "window_end_ms")
     @classmethod
@@ -66,12 +81,12 @@ class PacketValidator:
         try:
             packet = DataPacket(**json_data)
 
-            if str(packet.device_id_hash) != device_id_hash:
+            if packet.device_id_hash != device_id_hash:
                 error_msg = f"Device ID hash mismatch: packet={packet.device_id_hash}, header={device_id_hash}"
                 logger.error(error_msg)
                 return False, None, error_msg
 
-            if str(packet.session_id) != session_id:
+            if packet.session_id != session_id:
                 error_msg = f"Session ID mismatch: packet={packet.session_id}, header={session_id}"
                 logger.error(error_msg)
                 return False, None, error_msg

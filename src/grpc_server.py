@@ -16,10 +16,9 @@ from .config import settings
 from .crypto.decryption import AESDecryptor
 from .crypto.decompression import DataDecompressor
 from .crypto.payload_codec import decrypt_then_decompress
-from .authentication.manager import AuthSessionManager
-from .storage.file_storage import FileStorage
-from .training.manager import TrainingManager
+from .management.runtime import RuntimeContext, get_runtime_context
 from .protos import sensor_data_pb2, sensor_data_pb2_grpc
+from .utils.path_safety import UnsafePathSegmentError, validate_storage_id
 from .utils.tls import TLS12_13_CIPHERS, TLSProbeResult, probe_tls_configuration
 
 logger = logging.getLogger(__name__)
@@ -58,32 +57,54 @@ def _message_to_dict(message, include_defaults: bool = False) -> dict:
 
 
 class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
-    def __init__(self) -> None:
+    def __init__(self, runtime_context: Optional[RuntimeContext] = None) -> None:
+        self.runtime_context = runtime_context or get_runtime_context()
         self.decryptor = AESDecryptor(settings.encryption_key)
-        self.decompressor = DataDecompressor()
-        self.storage = FileStorage(settings.data_storage_path)
-        self.training_manager = TrainingManager(
-            max_concurrent=settings.training_max_concurrent,
-            check_interval_sec=settings.training_check_interval_sec,
-        )
-        self.auth_manager = AuthSessionManager(
-            max_cached_models=settings.auth_max_cached_models,
-            session_ttl_sec=settings.auth_session_ttl_sec,
-            max_concurrent_inference=settings.auth_max_concurrent,
-        )
+        self.decompressor = DataDecompressor(max_output_size=settings.max_decompressed_size)
+        self.storage = self.runtime_context.storage
+        self.training_manager = self.runtime_context.training_manager
+        self.auth_manager = self.runtime_context.auth_manager
+        self.metrics = self.runtime_context.metrics
 
     async def StreamSensorData(self, request_iterator, context):
         response_queue: asyncio.Queue = asyncio.Queue()
         pending_inference: set[asyncio.Task] = set()
 
         async def _consume_packets() -> None:
-            async for packet in request_iterator:
-                directive = await self._handle_packet(packet, response_queue, pending_inference)
-                if directive is not None:
-                    await response_queue.put(directive)
-            if pending_inference:
-                await asyncio.gather(*pending_inference, return_exceptions=True)
-            await response_queue.put(None)
+            try:
+                async for packet in request_iterator:
+                    try:
+                        directive = await self._handle_packet(packet, response_queue, pending_inference)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("Unhandled packet processing error: %s", exc)
+                        self.metrics.record_packet(
+                            device_id=str(getattr(packet, "device_id_hash", "") or "unknown_device"),
+                            session_id="default",
+                            packet_id=str(getattr(packet, "packet_id", "")),
+                            packet_seq_no=int(getattr(packet, "packet_seq_no", 0) or 0),
+                            status="internal_error",
+                            storage_ok=False,
+                            error_detail=str(exc),
+                        )
+                        directive = self._ack_directive(packet, success=False, error_code="SERVER_ERROR")
+                    if directive is not None:
+                        await response_queue.put(directive)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("StreamSensorData consumer failed: %s", exc)
+                if hasattr(context, "set_details"):
+                    context.set_details(str(exc))
+                if hasattr(context, "set_code"):
+                    context.set_code(grpc.StatusCode.UNKNOWN)
+            finally:
+                if pending_inference:
+                    results = await asyncio.gather(*pending_inference, return_exceptions=True)
+                    for result in results:
+                        if isinstance(result, Exception):
+                            logger.error(
+                                "Authentication inference task failed",
+                                exc_info=(type(result), result, result.__traceback__),
+                            )
+                await response_queue.put(None)
 
         consumer_task = asyncio.create_task(_consume_packets())
         try:
@@ -108,7 +129,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
             policy_id="default",
             policy_version=settings.version,
             batch_interval_ms=1000,
-            max_payload_size_bytes=settings.max_request_size,
+            max_payload_size_bytes=min(int(settings.max_request_size), int(settings.grpc_max_message_size)),
             upload_rate_limit=50.0,
             compression_algorithm="LZ4",
             batch_size_threshold=50,
@@ -118,6 +139,19 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
     async def StartAuthentication(self, request, context):
         device_id_hash = getattr(request, "device_id_hash", "") or "unknown_device"
         session_id = getattr(request, "session_id", "") or f"auth_{uuid.uuid4().hex}"
+        try:
+            device_id_hash = validate_storage_id(device_id_hash, field_name="device_id_hash")
+            session_id = validate_storage_id(session_id, field_name="session_id")
+        except UnsafePathSegmentError as exc:
+            logger.warning("Auth session rejected due to invalid identifier: %s", exc)
+            return sensor_data_pb2.AuthSessionResponse(
+                accepted=False,
+                session_id=str(session_id),
+                message=f"invalid_identifier: {exc}",
+                model_version="",
+                window_size_sec=0.0,
+                decision_time_sec=0.0,
+            )
         ca_cfg = get_ca_config()
         if self.auth_manager.has_trained_model(device_id_hash):
             accepted, message, policy = self.auth_manager.start_session(device_id_hash, session_id)
@@ -139,7 +173,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
             )
 
         readiness = self.training_manager.get_readiness(device_id_hash)
-        min_bytes = max(readiness.min_bytes, 100 * 1024 * 1024)
+        min_bytes = readiness.min_bytes
         total_mb = readiness.total_bytes / (1024 * 1024)
         min_mb = min_bytes / (1024 * 1024)
         if readiness.total_bytes >= min_bytes:
@@ -174,6 +208,8 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         )
 
     async def ReportMetrics(self, request, context):
+        metric_payload = _message_to_dict(request, include_defaults=True)
+        self.metrics.record_client_metrics(metric_payload)
         logger.info(
             "Metrics received: device=%s, period_ms=%s, uploads_success=%s, uploads_failed=%s",
             getattr(request, "device_id_hash", ""),
@@ -183,13 +219,29 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         )
         return sensor_data_pb2.MetricsResponse(accepted=True, message="ok")
 
+    @staticmethod
+    def _ack_directive(
+        packet: sensor_data_pb2.DataPacket,
+        *,
+        success: bool,
+        error_code: str = "",
+    ) -> sensor_data_pb2.ServerDirective:
+        ack = sensor_data_pb2.Ack(
+            packet_id=str(getattr(packet, "packet_id", "")),
+            creation_server_ts=int(time.time() * 1000),
+            success=bool(success),
+            error_code=str(error_code or ""),
+        )
+        directive = sensor_data_pb2.ServerDirective()
+        directive.ack.CopyFrom(ack)
+        return directive
+
     async def _handle_packet(
         self,
         packet: sensor_data_pb2.DataPacket,
         response_queue: asyncio.Queue,
         pending_inference: set[asyncio.Task],
     ) -> sensor_data_pb2.ServerDirective:
-        received_ms = int(time.time() * 1000)
         device_id_hash = packet.device_id_hash or "unknown_device"
         session_id = "default"
         metadata_dict = None
@@ -197,41 +249,80 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         error_detail: Optional[str] = None
         parsed_batch: Optional[dict] = None
 
+        try:
+            device_id_hash = validate_storage_id(device_id_hash, field_name="device_id_hash")
+        except UnsafePathSegmentError as exc:
+            self.metrics.record_packet(
+                device_id=device_id_hash,
+                session_id=session_id,
+                packet_id=str(packet.packet_id),
+                packet_seq_no=int(packet.packet_seq_no),
+                status="invalid_identifier",
+                storage_ok=False,
+                error_detail=str(exc),
+            )
+            return self._ack_directive(packet, success=False, error_code="INVALID_IDENTIFIER")
+
         if packet.HasField("metadata"):
             metadata_dict = _message_to_dict(packet.metadata, include_defaults=True)
 
         # Strict processing order: decrypt first, then decompress.
         if packet.encrypted_sensor_payload:
-            processed_ok, decompressed_payload, error_reason, processing_err = decrypt_then_decompress(
-                encrypted_payload=packet.encrypted_sensor_payload,
-                decryptor=self.decryptor,
-                decompressor=self.decompressor,
-                compression_hint=(packet.metadata.compression if packet.HasField("metadata") else None),
-            )
-            if processed_ok and decompressed_payload:
-                decryption_status = "decompressed"
-                try:
-                    batch = sensor_data_pb2.SerializedSensorBatch()
-                    batch.ParseFromString(decompressed_payload)
-                    parsed_batch = _message_to_dict(batch, include_defaults=True)
-                    # Ensure axis fields exist even if zero to avoid “missing” impressions
-                    for sample in parsed_batch.get("samples", []):
-                        for axis in ("x", "y", "z"):
-                            sample.setdefault(axis, 0.0)
-                    session_id = batch.session_id or session_id
-                    decryption_status = "parsed_sensor_batch"
-                except Exception as exc:  # noqa: BLE001
-                    decryption_status = "parse_failed"
-                    error_detail = f"parse_batch_failed: {exc}"
-                    logger.warning("Failed to parse SerializedSensorBatch: %s", exc)
+            declared_size = int(packet.metadata.uncompressed_size_bytes) if packet.HasField("metadata") else 0
+            if declared_size > int(settings.max_decompressed_size):
+                decryption_status = "decompress_failed"
+                error_detail = (
+                    f"declared decompressed size {declared_size} exceeds limit "
+                    f"{settings.max_decompressed_size}"
+                )
+                logger.warning("Payload rejected before decompression for packet %s: %s", packet.packet_id, error_detail)
             else:
-                error_detail = processing_err
-                if error_reason == "decompression_failed":
-                    decryption_status = "decompress_failed"
-                    logger.warning("Decompression failed for packet %s: %s", packet.packet_id, processing_err)
+                processed_ok, decompressed_payload, error_reason, processing_err = decrypt_then_decompress(
+                    encrypted_payload=packet.encrypted_sensor_payload,
+                    decryptor=self.decryptor,
+                    decompressor=self.decompressor,
+                    compression_hint=(packet.metadata.compression if packet.HasField("metadata") else None),
+                )
+                if processed_ok and decompressed_payload:
+                    decryption_status = "decompressed"
+                    try:
+                        batch = sensor_data_pb2.SerializedSensorBatch()
+                        batch.ParseFromString(decompressed_payload)
+                        if batch.user_id_hash and batch.user_id_hash != device_id_hash:
+                            parsed_batch = None
+                            decryption_status = "validation_failed"
+                            error_detail = (
+                                f"user_id_hash mismatch: batch={batch.user_id_hash}, "
+                                f"packet={device_id_hash}"
+                            )
+                            logger.warning("Batch user mismatch for packet %s: %s", packet.packet_id, error_detail)
+                        else:
+                            parsed_batch = _message_to_dict(batch, include_defaults=True)
+                            # Ensure axis fields exist even if zero to avoid “missing” impressions
+                            for sample in parsed_batch.get("samples", []):
+                                for axis in ("x", "y", "z"):
+                                    sample.setdefault(axis, 0.0)
+                            session_id = batch.session_id or session_id
+                            try:
+                                session_id = validate_storage_id(session_id, field_name="session_id")
+                                decryption_status = "parsed_sensor_batch"
+                            except UnsafePathSegmentError as exc:
+                                parsed_batch = None
+                                decryption_status = "invalid_identifier"
+                                error_detail = str(exc)
+                                logger.warning("Invalid session id for packet %s: %s", packet.packet_id, exc)
+                    except Exception as exc:  # noqa: BLE001
+                        decryption_status = "parse_failed"
+                        error_detail = f"parse_batch_failed: {exc}"
+                        logger.warning("Failed to parse SerializedSensorBatch: %s", exc)
                 else:
-                    decryption_status = "decrypt_failed"
-                    logger.warning("Decryption failed for packet %s: %s", packet.packet_id, processing_err)
+                    error_detail = processing_err
+                    if error_reason == "decompression_failed":
+                        decryption_status = "decompress_failed"
+                        logger.warning("Decompression failed for packet %s: %s", packet.packet_id, processing_err)
+                    else:
+                        decryption_status = "decrypt_failed"
+                        logger.warning("Decryption failed for packet %s: %s", packet.packet_id, processing_err)
         else:
             error_detail = "no_encrypted_payload"
             logger.warning("Received packet without encrypted payload: %s", packet.packet_id)
@@ -264,8 +355,18 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
 
         if not storage_ok:
             logger.error("Failed to store packet %s: %s", packet.packet_id, storage_err)
-        else:
+        elif parsed_batch:
             asyncio.create_task(self.training_manager.submit_if_ready(device_id_hash))
+
+        self.metrics.record_packet(
+            device_id=device_id_hash,
+            session_id=str(session_id),
+            packet_id=str(packet.packet_id),
+            packet_seq_no=int(packet.packet_seq_no),
+            status="storage_failed" if not storage_ok else str(decryption_status),
+            storage_ok=bool(storage_ok),
+            error_detail=storage_err or error_detail,
+        )
 
         if parsed_batch:
             task = asyncio.create_task(
@@ -279,16 +380,11 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
             pending_inference.add(task)
             task.add_done_callback(lambda t: pending_inference.discard(t))
 
-        ack = sensor_data_pb2.Ack(
-            packet_id=packet.packet_id,
-            creation_server_ts=received_ms,
+        return self._ack_directive(
+            packet,
             success=storage_ok,
             error_code="SERVER_ERROR" if not storage_ok else "",
         )
-
-        directive = sensor_data_pb2.ServerDirective()
-        directive.ack.CopyFrom(ack)
-        return directive
 
     async def _run_auth_inference(
         self,
@@ -299,15 +395,25 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         response_queue: asyncio.Queue,
     ) -> None:
         start_ms = int(time.time() * 1000)
-        payload = await self.auth_manager.handle_packet(
-            user_id=device_id_hash,
-            session_id=session_id,
-            parsed_batch=parsed_batch,
-        )
+        try:
+            payload = await self.auth_manager.handle_packet(
+                user_id=device_id_hash,
+                session_id=session_id,
+                parsed_batch=parsed_batch,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Authentication inference failed: device=%s session=%s error=%s",
+                device_id_hash,
+                session_id,
+                exc,
+            )
+            return
         if payload is None:
             return
         end_ms = int(time.time() * 1000)
         inference_latency_ms = max(0, end_ms - start_ms)
+        self.metrics.record_auth_result(payload, inference_latency_ms=inference_latency_ms)
         result = sensor_data_pb2.AuthResult(
             device_id_hash=str(device_id_hash),
             session_id=str(session_id),
@@ -390,6 +496,7 @@ def _build_server_credentials() -> Tuple[Optional[grpc.ServerCredentials], TLSPr
 
 
 async def create_grpc_server() -> grpc.aio.Server:
+    runtime_context = get_runtime_context()
     server = grpc.aio.server(
         maximum_concurrent_rpcs=int(settings.grpc_max_concurrent_rpcs),
         options=[
@@ -401,7 +508,7 @@ async def create_grpc_server() -> grpc.aio.Server:
             ("grpc.http2.max_pings_without_data", 0),
         ]
     )
-    sensor_data_pb2_grpc.add_SensorDataServiceServicer_to_server(SensorDataService(), server)
+    sensor_data_pb2_grpc.add_SensorDataServiceServicer_to_server(SensorDataService(runtime_context), server)
     # gRPC health service so we can probe the single exposed port.
     health_servicer = health.HealthServicer()
     health_servicer.set("", health_pb2.HealthCheckResponse.SERVING)

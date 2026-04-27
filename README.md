@@ -1,14 +1,14 @@
 # Continuous Authentication Server
 
-持续身份认证服务，默认以 gRPC 为主；只有在 `HTTP_ENABLED=true` 且 `PORT != GRPC_PORT` 时才额外开启 HTTP。
+持续身份认证服务，默认以 gRPC 为主；当 `HTTP_ENABLED=true` 或 `MANAGEMENT_API_ENABLED=true`，且 `PORT != GRPC_PORT` 时额外开启 HTTP。
 
 ## 容器化方案
 
-本仓库已收敛为**方案 A：单镜像、单编译产物、多子命令**：
-- 运行时主进程为编译后的 `ca-server` 二进制，不再使用 `python -m src.main`
-- 预处理、训练、策略搜索、离线认证统一复用同一个二进制子命令
-- `src/training/runner.py` 在冻结运行时会通过 `sys.executable ca-train-vqgan ...` 调起内置训练 helper，不再依赖运行时源码目录
-- 运行时镜像不保留 `/app/src`、`/app/ca_train`、`/app/tests`、`/app/docs`
+本仓库当前保留两条容器构建路径：
+- 默认 `Dockerfile` 是源码型运行镜像，容器内通过 `python -m src.cli` 运行服务和子命令，便于在目标机器上直接构建验证。
+- `Dockerfile.prebuilt` 用于预编译产物 `dist/ca-server/`，适合需要隐藏源码或交付冻结二进制的场景。
+- 预处理、训练、策略搜索、离线认证统一复用 `deploy/entrypoint.sh` 的多子命令入口。
+- `src/training/runner.py` 在冻结运行时会通过 `sys.executable ca-train-vqgan ...` 调起内置训练 helper；源码型镜像则直接使用 `/app/src` 和 `/app/ca_train`。
 
 当前默认打包方案是 **PyInstaller onedir**。
 原因：在 Ascend / `torch` / 可选 `torch_npu` 依赖存在时，PyInstaller 对动态库与 Python 扩展的兼容性更稳；`BUNDLE_TOOL=nuitka` 保留为实验构建路径，但未作为默认发布方案。
@@ -20,6 +20,18 @@
 ```bash
 docker build -t ca-server:latest .
 ```
+
+若构建环境需要通过宿主机 `9999` 端口代理访问外网：
+
+```bash
+docker build \
+  --build-arg HTTP_PROXY=http://host.docker.internal:9999 \
+  --build-arg HTTPS_PROXY=http://host.docker.internal:9999 \
+  --build-arg NO_PROXY=localhost,127.0.0.1 \
+  -t ca-server-api:latest .
+```
+
+在 Linux 上若 `host.docker.internal` 不可用，可改用宿主机网关 IP 或 Docker build 的 `--network=host` 配合 `http://127.0.0.1:9999`。
 
 ### 脚本构建
 
@@ -37,6 +49,9 @@ docker build -t ca-server:latest .
 - `BUNDLE_TOOL=nuitka`：实验路径，若与 `torch` / `torch_npu` / Ascend 动态库不兼容可能失败
 - `INSTALL_TORCH_NPU=1`：在可用私有源或本地 wheel 时安装 `torch_npu`
 - `TORCH_FIND_LINKS` / `TORCH_EXTRA_INDEX_URL`：指定 `torch` / `torch_npu` wheel 来源
+- `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`：传递 Docker 构建阶段代理
+- `DOCKER_BUILD_NETWORK=host`：Linux 本机代理如 `http://127.0.0.1:9999` 场景可用
+- `DOCKER_BUILD_EXTRA_ARGS='--progress=plain'`：向 `docker build` 追加额外参数
 
 说明：
 - `docker compose` 当前默认会以 `INSTALL_TORCH_NPU=1` 构建镜像，避免训练镜像遗漏 `torch_npu`
@@ -53,7 +68,7 @@ docker compose up -d --build
 
 默认端口：
 - gRPC：宿主机 `10500`
-- HTTP：宿主机 `18000`（仅当 `HTTP_ENABLED=true` 时真正监听）
+- HTTP：宿主机 `18000`（仅当 `HTTP_ENABLED=true` 或 `MANAGEMENT_API_ENABLED=true` 时真正监听）
 
 当前 compose 采用 `network_mode: host`。
 原因：在线上“远端 OpenResty -> 域名/VIP -> 本机”链路下，需要让容器监听方式与 `python -m src.main` 直跑一致，避免 Docker bridge/端口映射在特定 VIP 路径上表现不一致。
@@ -68,7 +83,36 @@ docker compose up -d --build
 
 注意：
 - 若 `HTTP_ENABLED=true` 但 `PORT == GRPC_PORT`，程序会自动关闭 HTTP，仅保留 gRPC
-- 默认 compose 已把 `PORT` 与 `GRPC_PORT` 分开设置，是否开启 HTTP 仅取决于 `HTTP_ENABLED`
+- 默认 compose 已把 `PORT` 与 `GRPC_PORT` 分开设置，是否开启 HTTP 取决于 `HTTP_ENABLED` 或 `MANAGEMENT_API_ENABLED`
+
+### 启用管理 API
+
+管理 API 是只读接口，用于外部管理程序查询运行态、训练状态、模型策略、认证结果和客户端指标。默认关闭，启用时必须设置 API key：
+
+```bash
+cp deploy/config/server.env.example deploy/config/server.env
+# 编辑 deploy/config/server.env：MANAGEMENT_API_ENABLED=true，并设置 MANAGEMENT_API_KEY
+CA_SERVER_ENV_FILE=server.env \
+CA_SERVER_HTTP_PORT=18000 \
+docker compose up -d --build
+```
+
+也可以不创建 `server.env`，直接从 shell 传入 `MANAGEMENT_API_ENABLED` / `MANAGEMENT_API_KEY`；未设置时 compose 会挂载只含默认值的 `deploy/config/server.env.example`。
+
+示例：
+
+```bash
+curl -H "X-Management-API-Key: replace-with-a-long-random-token" \
+  http://localhost:18000/api/v1/management/summary
+
+curl -H "X-Management-API-Key: replace-with-a-long-random-token" \
+  http://localhost:18000/api/v1/management/devices/<device_id_hash>/models
+
+curl -H "X-Management-API-Key: replace-with-a-long-random-token" \
+  "http://localhost:18000/api/v1/management/devices/<device_id_hash>/auth/results?limit=100"
+```
+
+设置 `MANAGEMENT_API_ENABLED=true` 时，服务会自动启用 HTTP；若 HTTP 端口与 gRPC 端口相同，启动会失败并提示拆分端口。OpenAPI 由 FastAPI 自动生成，只要 HTTP 服务开启即可访问 `/docs` 或 `/openapi.json`；未启用管理 API 时 schema 不包含管理路由。管理 API 不返回原始传感器样本、密文 payload 或 scaler 明细。
 
 ## 容器内子命令
 
@@ -86,7 +130,7 @@ docker compose run --rm ca-server auth --user <user_id> --csv-path /app/data_sto
 Compose 保留并补全了以下目录映射：
 
 - `deploy/config/ca_config.toml` -> `/app/ca_config.toml`
-- `deploy/config/server.env` -> `/app/.env`
+- `deploy/config/${CA_SERVER_ENV_FILE:-server.env.example}` -> `/app/.env`
 - `deploy/data/raw_data` -> `/app/data_storage/raw_data`
 - `deploy/data/processed_data` -> `/app/data_storage/processed_data`
 - `deploy/data/inference` -> `/app/data_storage/inference`
@@ -136,7 +180,7 @@ docker exec ca-server grpc_health_probe -addr=127.0.0.1:10500
 
 ### HTTP 健康检查
 
-仅在 `HTTP_ENABLED=true` 且 HTTP 使用独立端口时执行：
+仅在 HTTP 服务开启且使用独立端口时执行：
 
 ```bash
 curl --http2-prior-knowledge http://localhost:18000/health
@@ -150,8 +194,8 @@ curl --http2-prior-knowledge http://localhost:18000/health
 - HTTP 模式验收：`curl http://localhost:18000/health`
 - 日志落盘：检查 `deploy/logs`
 - 业务数据落盘：检查 `deploy/data/raw_data`、`deploy/data/inference`、`deploy/data/models`
-- 运行时镜像无源码目录：`docker exec ca-server sh -lc 'test ! -d /app/src && test ! -d /app/ca_train && test ! -d /app/tests && test ! -d /app/docs'`
-- 主进程为编译二进制：`docker exec ca-server ps -o pid,comm,args -p 1`
+- 管理 API 验收：`curl -H "X-Management-API-Key: $MANAGEMENT_API_KEY" http://localhost:18000/api/v1/management/summary`
+- 预编译镜像验收：使用 `Dockerfile.prebuilt` 时再检查 `/app/src`、`/app/ca_train` 不存在，以及主进程为冻结二进制
 
 ## Ascend 依赖说明
 
@@ -173,7 +217,7 @@ Compose 保留了 Ascend 910B2 所需环境变量与只读挂载：
 - `ASCEND_TOOLKIT_HOME`
 - `ASCEND_OPP_PATH`
 - `LD_LIBRARY_PATH`
-- `PYTHONPATH`（仅保留 Ascend Python site-packages，不再注入 `/app` 源码路径）
+- `PYTHONPATH`（源码镜像包含 `/app`、`/app/ca_train` 和 Ascend Python site-packages；预编译镜像只保留 Ascend Python site-packages）
 
 当前约束是：未来运行环境需与本机一致，即宿主机继续提供上述 Ascend 驱动、toolkit、设备节点和工具文件；容器只消费挂载，不在镜像内重复安装驱动/toolkit。
 
@@ -187,7 +231,7 @@ Compose 保留了 Ascend 910B2 所需环境变量与只读挂载：
 - `BUNDLE_TOOL=nuitka` 仍是实验路径，未作为默认交付物
 - 若未安装 `torch_npu`，服务会回退为 CPU / CUDA / NPU 自动探测逻辑中的可用后端
 - 在线训练/策略搜索对数据质量、窗口 CSV 完整性与双类别验证集有要求；空目录或极小样本只能做 smoke test，不能代表完整训练性能
-- 运行时镜像不包含业务源码，但模型权重、日志、配置和挂载数据仍属于敏感资产，需结合文件权限与宿主机安全策略管理
+- 使用 `Dockerfile.prebuilt` 构建的预编译镜像不包含业务源码；模型权重、日志、配置和挂载数据仍属于敏感资产，需结合文件权限与宿主机安全策略管理
 
 ## 源码保护边界
 
@@ -204,4 +248,4 @@ pip install -r requirements.txt -r requirements-ml.txt
 python -m src.main
 ```
 
-默认仍以 gRPC 为主；只有在显式设置 `HTTP_ENABLED=true` 且 `PORT != GRPC_PORT` 时才会同时开启 HTTP。
+默认仍以 gRPC 为主；显式设置 `HTTP_ENABLED=true` 或 `MANAGEMENT_API_ENABLED=true`，且 `PORT != GRPC_PORT` 时会同时开启 HTTP。

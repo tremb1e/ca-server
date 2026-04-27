@@ -81,3 +81,14 @@ class TestDataDecompressor:
         assert error is None
         assert decompressed == original
         assert len(decompressed) == 1000000
+
+    def test_decompress_rejects_output_above_limit(self):
+        original = b"x" * 1024
+        compressed = gzip.compress(original)
+        decompressor = DataDecompressor(max_output_size=100)
+
+        success, decompressed, error = decompressor.decompress(compressed, "gzip")
+
+        assert success is False
+        assert decompressed is None
+        assert "too large" in error.lower() or "exceeds limit" in error.lower()

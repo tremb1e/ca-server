@@ -14,6 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG HTTP_PROXY=
+ARG HTTPS_PROXY=
+ARG NO_PROXY=localhost,127.0.0.1
 ARG INSTALL_TORCH=1
 ARG INSTALL_TORCH_NPU=1
 ARG TORCH_VERSION=2.6.0
@@ -29,6 +32,12 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DEFAULT_TIMEOUT=120 \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
+    HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    NO_PROXY=${NO_PROXY} \
+    http_proxy=${HTTP_PROXY} \
+    https_proxy=${HTTPS_PROXY} \
+    no_proxy=${NO_PROXY} \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     VIRTUAL_ENV=/opt/venv \
@@ -119,7 +128,7 @@ ENV APP_ROOT=/app \
     PORT=18000 \
     HTTP_ENABLED=false \
     GRPC_HOST=0.0.0.0 \
-    GRPC_PORT=8000 \
+    GRPC_PORT=10500 \
     DATA_STORAGE_PATH=/app/data_storage/raw_data \
     PROCESSED_DATA_PATH=/app/data_storage/processed_data \
     INFERENCE_STORAGE_PATH=/app/data_storage/inference \
@@ -143,7 +152,7 @@ ENV PATH=/opt/venv/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/As
 ENV LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver
 ENV PYTHONPATH=/app:/app/ca_train:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe
 
-EXPOSE 8000 18000
+EXPOSE 10500 18000
 
 ENTRYPOINT ["/usr/local/bin/ca-entrypoint.sh"]
 CMD ["server"]

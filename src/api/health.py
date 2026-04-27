@@ -2,19 +2,18 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from datetime import datetime, timezone
 from ..config import settings
-from ..storage.file_storage import FileStorage
+from ..management.runtime import get_runtime_context
 import logging
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-storage = FileStorage(settings.data_storage_path)
-
 
 @router.get("/health")
 async def health_check():
     try:
+        storage = get_runtime_context().storage
         storage_stats = storage.get_storage_stats()
 
         return JSONResponse(

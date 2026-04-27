@@ -5,21 +5,20 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-import pandas as pd
-import torch
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ..ca_config import get_ca_config
 from ..config import settings
-from ..processing.pipeline import _extract_sensor_records, _resample_records, build_config
-from ..processing.scaler import apply_scaler, load_scaler
 from ..storage.inference_storage import InferenceStorage
-from ..utils.accelerator import resolve_torch_device
 from ..utils.reject_trackers import ConsecutiveRejectTracker, VoteRejectTracker
-from .runner import AuthRunConfig, load_best_policy
-from .vqgan_inference import VQGANPolicy, load_vqgan, score_windows, windowize_dataframe
+
+if TYPE_CHECKING:
+    import torch
+
+    from .runner import AuthRunConfig
+    from .vqgan_inference import VQGANPolicy
 
 
 @dataclass
@@ -42,7 +41,8 @@ class AuthResultPayload:
 class AuthSessionState:
     user_id: str
     session_id: str
-    policy: VQGANPolicy
+    policy: "VQGANPolicy"
+    created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
     tail_records: Dict[str, List[Dict[str, Any]]] = field(default_factory=lambda: {"acc": [], "gyr": [], "mag": []})
     window_index: int = 0
@@ -55,10 +55,13 @@ class VQGANModelCache:
     def __init__(self, *, max_models: int = 4, device: Optional[str] = None) -> None:
         self._max_models = int(max_models)
         self._device = device or "auto"
-        self._cache: Dict[str, torch.nn.Module] = {}
+        self._cache: Dict[str, "torch.nn.Module"] = {}
         self._order: List[str] = []
 
-    def get(self, policy: VQGANPolicy) -> torch.nn.Module:
+    def get(self, policy: "VQGANPolicy") -> "torch.nn.Module":
+        from ..utils.accelerator import resolve_torch_device
+        from .vqgan_inference import load_vqgan
+
         key = f"{policy.user}::{policy.vqgan_checkpoint}"
         if key in self._cache:
             self._touch(key)
@@ -79,6 +82,14 @@ class VQGANModelCache:
             self._order.remove(key)
         self._order.append(key)
 
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "max_models": int(self._max_models),
+            "loaded_count": int(len(self._cache)),
+            "device": str(self._device),
+            "keys": list(self._order),
+        }
+
 
 class AuthSessionManager:
     def __init__(
@@ -87,11 +98,13 @@ class AuthSessionManager:
         max_cached_models: int = 4,
         session_ttl_sec: int = 600,
         max_concurrent_inference: Optional[int] = None,
+        models_root: Optional[Path] = None,
     ) -> None:
         self._sessions: Dict[str, AuthSessionState] = {}
-        self._processing_cfg = build_config()
+        self._processing_cfg = None
         self._inference_storage = InferenceStorage(settings.inference_storage_path)
         self._model_cache = VQGANModelCache(max_models=max_cached_models)
+        self._models_root = Path(models_root) if models_root is not None else Path(settings.data_storage_path).parent / "models"
         self._session_ttl_sec = int(session_ttl_sec)
         if max_concurrent_inference is None:
             max_concurrent_inference = min(8, os.cpu_count() or 1)
@@ -100,7 +113,13 @@ class AuthSessionManager:
             max_concurrent_inference = 1
         self._inference_semaphore = asyncio.Semaphore(max_concurrent_inference)
 
-    def _policy_from_config(self, cfg: AuthRunConfig) -> VQGANPolicy:
+    @staticmethod
+    def _session_key(user_id: str, session_id: str) -> str:
+        return f"{user_id}\x1f{session_id}"
+
+    def _policy_from_config(self, cfg: "AuthRunConfig") -> "VQGANPolicy":
+        from .vqgan_inference import VQGANPolicy
+
         ca_cfg = get_ca_config()
         vote_window_size = int(cfg.vote_window_size)
         vote_min_rejects = int(cfg.vote_min_rejects)
@@ -142,8 +161,10 @@ class AuthSessionManager:
             self._sessions.pop(key, None)
 
     def has_trained_model(self, user_id: str) -> bool:
+        from .runner import load_best_policy
+
         try:
-            cfg = load_best_policy(user_id)
+            cfg = load_best_policy(user_id, models_root=self._models_root)
         except Exception:
             return False
         if not cfg.vqgan_checkpoint.exists():
@@ -152,10 +173,12 @@ class AuthSessionManager:
             return False
         return True
 
-    def start_session(self, user_id: str, session_id: str) -> Tuple[bool, str, Optional[VQGANPolicy]]:
+    def start_session(self, user_id: str, session_id: str) -> Tuple[bool, str, Optional["VQGANPolicy"]]:
         self._prune_sessions()
+        from .runner import load_best_policy
+
         try:
-            cfg = load_best_policy(user_id)
+            cfg = load_best_policy(user_id, models_root=self._models_root)
         except Exception as exc:
             return False, f"model_not_ready: {exc}", None
 
@@ -163,8 +186,66 @@ class AuthSessionManager:
         state = AuthSessionState(user_id=user_id, session_id=session_id, policy=policy)
         state.consecutive_rejects = ConsecutiveRejectTracker()
         state.vote_rejects = VoteRejectTracker()
-        self._sessions[user_id] = state
+        self._sessions[self._session_key(user_id, session_id)] = state
         return True, "ok", policy
+
+    @staticmethod
+    def _iso_from_epoch(value: float) -> str:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+
+    @staticmethod
+    def _policy_snapshot(policy: "VQGANPolicy") -> Dict[str, Any]:
+        return {
+            "user": str(policy.user),
+            "window_size": float(policy.window_size),
+            "overlap": float(policy.overlap),
+            "target_width": int(policy.target_width),
+            "threshold": float(policy.threshold),
+            "k_rejects": int(policy.k_rejects),
+            "vote_window_size": int(policy.vote_window_size),
+            "vote_min_rejects": int(policy.vote_min_rejects),
+            "model_version": str(policy.model_version),
+            "vqgan_checkpoint": str(policy.vqgan_checkpoint),
+            "vqgan_config": str(policy.vqgan_config),
+        }
+
+    def snapshot_sessions(self) -> List[Dict[str, Any]]:
+        self._prune_sessions()
+        sessions: List[Dict[str, Any]] = []
+        for state in self._sessions.values():
+            consecutive = state.consecutive_rejects
+            vote = state.vote_rejects
+            sessions.append(
+                {
+                    "user_id": str(state.user_id),
+                    "session_id": str(state.session_id),
+                    "created_at": self._iso_from_epoch(state.created_at),
+                    "last_activity": self._iso_from_epoch(state.last_activity),
+                    "idle_seconds": max(0.0, float(time.time() - state.last_activity)),
+                    "window_index": int(state.window_index),
+                    "tail_records": {k: len(v) for k, v in state.tail_records.items()},
+                    "policy": self._policy_snapshot(state.policy),
+                    "consecutive_rejects": {
+                        "windows": int(getattr(consecutive, "windows", 0) or 0),
+                        "rejects": int(getattr(consecutive, "rejects", 0) or 0),
+                        "consecutive_rejects": int(getattr(consecutive, "consecutive_rejects", 0) or 0),
+                        "interrupts": int(getattr(consecutive, "interrupts", 0) or 0),
+                        "first_interrupt_window": getattr(consecutive, "first_interrupt_window", None),
+                    },
+                    "vote_rejects": {
+                        "windows": int(getattr(vote, "windows", 0) or 0),
+                        "rejects": int(getattr(vote, "rejects", 0) or 0),
+                        "interrupts": int(getattr(vote, "interrupts", 0) or 0),
+                        "first_interrupt_window": getattr(vote, "first_interrupt_window", None),
+                        "recent_windows": int(getattr(vote, "recent_windows", 0) or 0),
+                        "recent_rejects": int(getattr(vote, "recent_rejects", 0) or 0),
+                    },
+                }
+            )
+        return sessions
+
+    def snapshot_model_cache(self) -> Dict[str, Any]:
+        return self._model_cache.snapshot()
 
     async def handle_packet(
         self,
@@ -174,13 +255,20 @@ class AuthSessionManager:
         parsed_batch: Dict[str, Any],
     ) -> Optional[AuthResultPayload]:
         self._prune_sessions()
-        state = self._sessions.get(user_id)
-        if state is None or state.session_id != session_id:
+        state = self._sessions.get(self._session_key(user_id, session_id))
+        if state is None:
             return None
 
         state.last_activity = time.time()
 
         async with state.lock:
+            from ..processing.pipeline import _extract_sensor_records, _resample_records, build_config
+            from ..processing.scaler import apply_scaler, load_scaler
+            from .vqgan_inference import score_windows, windowize_dataframe
+
+            if self._processing_cfg is None:
+                self._processing_cfg = build_config()
+
             await self._inference_storage.append_raw_packet(user_id, session_id, parsed_batch)
 
             packets = [{"sensor_batch": parsed_batch}]

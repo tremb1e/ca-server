@@ -43,9 +43,23 @@ class TestPacketValidator:
         assert success is True
         assert error is None
         assert isinstance(packet, DataPacket)
-        assert packet.device_id_hash == 123456789
-        assert packet.session_id == 987654321
+        assert packet.device_id_hash == "123456789"
+        assert packet.session_id == "987654321"
         assert packet.packet_seq_no == 1
+
+    def test_validate_string_identifiers(self, validator, valid_packet_data):
+        valid_packet_data["device_id_hash"] = "device-abc"
+        valid_packet_data["session_id"] = "session-xyz"
+
+        success, packet, error = validator.validate(
+            valid_packet_data, "device-abc", "session-xyz", 1
+        )
+
+        assert success is True
+        assert error is None
+        assert packet is not None
+        assert packet.device_id_hash == "device-abc"
+        assert packet.session_id == "session-xyz"
 
     def test_validate_device_id_mismatch(self, validator, valid_packet_data):
         device_id_hash = "999999999"

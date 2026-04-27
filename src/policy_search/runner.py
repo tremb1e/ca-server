@@ -13,7 +13,6 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..ca_config import CAConfig, get_ca_config
-from ..utils.accelerator import autocast_context, normalize_device, resolve_torch_device
 from ..utils.ca_train import ensure_ca_train_on_path
 from ..utils.policy_paths import serialize_policy_path
 from ..utils.runtime import app_root
@@ -239,6 +238,7 @@ def _score_split_vqgan_transformer_inprocess(
 
     import torch  # local import to keep policy_search import light
 
+    from ..utils.accelerator import autocast_context, resolve_torch_device
     from hmog_token_auth_inference import load_lm, load_vqgan
     from hmog_data import iter_windows_from_csv_unlabeled_with_session
     from hmog_tokenizer import encode_windows_to_tokens
@@ -326,6 +326,7 @@ def _score_split_vqgan_only_inprocess(
 
     import torch  # local import to keep policy_search import light
 
+    from ..utils.accelerator import autocast_context, resolve_torch_device
     from hmog_token_auth_inference import load_vqgan
     from hmog_data import iter_windows_from_csv_unlabeled_with_session
 
@@ -477,6 +478,8 @@ def run_policy_grid_search(
     Returns a dict of output paths.
     """
     ca_cfg = ca_cfg or get_ca_config()
+    from ..utils.accelerator import normalize_device
+
     server_root = _server_root()
     dataset_root = Path(dataset_root) if dataset_root is not None else _default_dataset_root(server_root)
     models_root = Path(models_root) if models_root is not None else _default_models_root(server_root)

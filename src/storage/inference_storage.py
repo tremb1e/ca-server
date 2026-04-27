@@ -8,6 +8,8 @@ from typing import Any, Dict, Optional, Tuple
 import aiofiles
 import logging
 
+from ..utils.path_safety import safe_child_path, validate_storage_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,7 +20,9 @@ class InferenceStorage:
         logger.info("InferenceStorage initialized at %s", self.base_path)
 
     def _get_session_dir(self, device_id_hash: str, session_id: str) -> Path:
-        session_dir = self.base_path / device_id_hash / session_id
+        device_id_hash = validate_storage_id(device_id_hash, field_name="device_id_hash")
+        session_id = validate_storage_id(session_id, field_name="session_id")
+        session_dir = safe_child_path(self.base_path, device_id_hash, session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
         return session_dir
 

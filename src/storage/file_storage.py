@@ -6,6 +6,8 @@ import aiofiles
 import logging
 from datetime import datetime, timezone
 
+from ..utils.path_safety import safe_child_path, validate_storage_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,7 +18,9 @@ class FileStorage:
         logger.info(f"FileStorage initialized with base path: {self.base_path}")
 
     def _get_session_file_path(self, device_id_hash: str, session_id: str) -> Path:
-        device_dir = self.base_path / device_id_hash
+        device_id_hash = validate_storage_id(device_id_hash, field_name="device_id_hash")
+        session_id = validate_storage_id(session_id, field_name="session_id")
+        device_dir = safe_child_path(self.base_path, device_id_hash)
         device_dir.mkdir(parents=True, exist_ok=True)
         return device_dir / f"session_{session_id}.jsonl"
 
