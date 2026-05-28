@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train VQGAN-only models from server window datasets")
-    parser.add_argument("--user", required=True, help="Target user/device hash (subject ID) to train.")
+    parser.add_argument("--user", required=True, help="Target device_id_hash to train.")
     parser.add_argument(
         "--device",
         default="auto",

@@ -82,7 +82,7 @@ async def get_models(device_id: str):
 @router.get("/devices/{device_id}/auth/sessions", response_model=AuthSessionsResponse)
 async def get_auth_sessions(device_id: str):
     device_id = _device_id(device_id)
-    sessions = [s for s in get_runtime_context().auth_manager.snapshot_sessions() if s.get("user_id") == device_id]
+    sessions = [s for s in get_runtime_context().auth_manager.snapshot_sessions() if s.get("device_id_hash") == device_id]
     return {"device_id_hash": device_id, "sessions": sessions, "total": len(sessions)}
 
 

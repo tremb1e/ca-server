@@ -217,7 +217,7 @@ class AuthSessionManager:
             vote = state.vote_rejects
             sessions.append(
                 {
-                    "user_id": str(state.user_id),
+                    "device_id_hash": str(state.user_id),
                     "session_id": str(state.session_id),
                     "created_at": self._iso_from_epoch(state.created_at),
                     "last_activity": self._iso_from_epoch(state.last_activity),

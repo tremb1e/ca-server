@@ -119,10 +119,10 @@ curl -H "X-Management-API-Key: replace-with-a-long-random-token" \
 容器入口脚本 `deploy/entrypoint.sh` 已做命令分发：
 
 ```bash
-docker compose run --rm ca-server training --user <user_id> --device cpu
-docker compose run --rm ca-server processing --user <user_id>
-docker compose run --rm ca-server policy-search --user <user_id> --device cpu
-docker compose run --rm ca-server auth --user <user_id> --csv-path /app/data_storage/processed_data/window/0.2/<user_id>/test.csv --device cpu
+docker compose run --rm ca-server training --user <device_id_hash> --device cpu
+docker compose run --rm ca-server processing --user <device_id_hash>
+docker compose run --rm ca-server policy-search --user <device_id_hash> --device cpu
+docker compose run --rm ca-server auth --user <device_id_hash> --csv-path /app/data_storage/processed_data/window/0.2/<device_id_hash>/test.csv --device cpu
 ```
 
 ## 宿主机目录映射

@@ -190,7 +190,7 @@ def training_status(device_id: str, ctx: RuntimeContext) -> Dict[str, Any]:
     state = load_state(ctx.models_root, device_id)
     task_snapshot = None
     for task in ctx.training_manager.snapshot_tasks().get("tasks", []):
-        if task.get("user_id") == device_id:
+        if task.get("device_id_hash") == device_id:
             task_snapshot = task
             break
     return {
@@ -293,7 +293,7 @@ def device_list_item(device_id: str, ctx: RuntimeContext) -> Dict[str, Any]:
 
 
 def device_detail(device_id: str, ctx: RuntimeContext) -> Dict[str, Any]:
-    sessions = [s for s in ctx.auth_manager.snapshot_sessions() if s.get("user_id") == device_id]
+    sessions = [s for s in ctx.auth_manager.snapshot_sessions() if s.get("device_id_hash") == device_id]
     return {
         "device_id_hash": str(device_id),
         "raw": raw_summary(device_id),

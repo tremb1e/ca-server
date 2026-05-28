@@ -288,29 +288,20 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
                     try:
                         batch = sensor_data_pb2.SerializedSensorBatch()
                         batch.ParseFromString(decompressed_payload)
-                        if batch.user_id_hash and batch.user_id_hash != device_id_hash:
+                        parsed_batch = _message_to_dict(batch, include_defaults=True)
+                        # Ensure axis fields exist even if zero to avoid "missing" impressions.
+                        for sample in parsed_batch.get("samples", []):
+                            for axis in ("x", "y", "z"):
+                                sample.setdefault(axis, 0.0)
+                        session_id = batch.session_id or session_id
+                        try:
+                            session_id = validate_storage_id(session_id, field_name="session_id")
+                            decryption_status = "parsed_sensor_batch"
+                        except UnsafePathSegmentError as exc:
                             parsed_batch = None
-                            decryption_status = "validation_failed"
-                            error_detail = (
-                                f"user_id_hash mismatch: batch={batch.user_id_hash}, "
-                                f"packet={device_id_hash}"
-                            )
-                            logger.warning("Batch user mismatch for packet %s: %s", packet.packet_id, error_detail)
-                        else:
-                            parsed_batch = _message_to_dict(batch, include_defaults=True)
-                            # Ensure axis fields exist even if zero to avoid “missing” impressions
-                            for sample in parsed_batch.get("samples", []):
-                                for axis in ("x", "y", "z"):
-                                    sample.setdefault(axis, 0.0)
-                            session_id = batch.session_id or session_id
-                            try:
-                                session_id = validate_storage_id(session_id, field_name="session_id")
-                                decryption_status = "parsed_sensor_batch"
-                            except UnsafePathSegmentError as exc:
-                                parsed_batch = None
-                                decryption_status = "invalid_identifier"
-                                error_detail = str(exc)
-                                logger.warning("Invalid session id for packet %s: %s", packet.packet_id, exc)
+                            decryption_status = "invalid_identifier"
+                            error_detail = str(exc)
+                            logger.warning("Invalid session id for packet %s: %s", packet.packet_id, exc)
                     except Exception as exc:  # noqa: BLE001
                         decryption_status = "parse_failed"
                         error_detail = f"parse_batch_failed: {exc}"

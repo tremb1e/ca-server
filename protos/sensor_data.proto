@@ -39,7 +39,6 @@ message Metadata {
 
 message SerializedSensorBatch {
     repeated SensorSample samples = 1;
-    string user_id_hash = 2;               // HMAC(key_id, user_id) - 非明文
     string session_id = 3;
 }
 

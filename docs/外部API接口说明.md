@@ -416,7 +416,7 @@ GET /api/v1/management/devices/{device_id}/auth/sessions
 | 字段 | 说明 |
 | --- | --- |
 | `sessions[].session_id` | 认证 session ID |
-| `sessions[].user_id` | 设备/用户索引 ID |
+| `sessions[].device_id_hash` | 设备哈希 ID |
 | `sessions[].created_at` | 会话创建时间 |
 | `sessions[].last_activity` | 最近收到数据时间 |
 | `sessions[].idle_seconds` | 空闲秒数 |
@@ -745,10 +745,9 @@ payload 解密解压后应为 `SerializedSensorBatch` protobuf：
 | 字段 | 说明 |
 | --- | --- |
 | `samples` | 传感器样本列表 |
-| `user_id_hash` | 用户哈希 ID；当前在线流程主要按 `device_id_hash` 运行 |
 | `session_id` | 业务 session ID |
 
-当前实现要求 `SerializedSensorBatch.user_id_hash` 为空或与外层 `DataPacket.device_id_hash` 一致；不一致时 raw 记录会落盘，但状态为 `validation_failed`，不会进入在线认证。
+当前在线训练/认证路径以外层 `DataPacket.device_id_hash` 作为设备主索引；payload 内部只包含样本和 session。
 
 服务端响应 `ServerDirective`：
 
@@ -887,7 +886,7 @@ results[].accept == false 或 results[].interrupt == true
 ### 5.4 兼容性说明
 
 - 设备 ID 当前以 `device_id_hash` 为主索引；
-- `user_id_hash` 存在于 protobuf 中；当前在线训练/认证路径主要按设备 ID 管理，并要求 batch 中的 `user_id_hash` 为空或与设备 ID 一致；
+- `SerializedSensorBatch` 只保留样本和 session，在线训练/认证路径按设备 ID 管理；
 - gRPC `Ack.success` 当前表示 raw 文件是否写入成功，不等价于“已成功训练/推理”；
 - `encrypted_dek`、`dek_key_id`、`sha256` 当前会保存或透传部分信息，但主流程仍使用固定对称密钥解密，没有完整实现信封加密和哈希校验；
 - 管理 API 读取运行时内存态和文件系统状态。服务重启后，活跃认证会话内存态会清空，但历史 `results.jsonl` 仍可查询。

@@ -40,7 +40,7 @@ class TrainingReadiness:
 
 
 def _state_path(models_root: Path, user_id: str) -> Path:
-    return safe_child_path(models_root, validate_storage_id(user_id, field_name="user_id")) / "training_state.json"
+    return safe_child_path(models_root, validate_storage_id(user_id, field_name="device_id_hash")) / "training_state.json"
 
 
 def load_state(models_root: Path, user_id: str) -> TrainingState:
@@ -74,7 +74,7 @@ def save_state(models_root: Path, user_id: str, state: TrainingState) -> None:
 
 
 def _user_total_bytes(raw_root: Path, user_id: str) -> int:
-    user_dir = safe_child_path(raw_root, validate_storage_id(user_id, field_name="user_id"))
+    user_dir = safe_child_path(raw_root, validate_storage_id(user_id, field_name="device_id_hash"))
     if not user_dir.exists():
         return 0
     total = 0
@@ -102,7 +102,7 @@ class TrainingManager:
         tasks = []
         for user_id, task in self._tasks.items():
             payload = {
-                "user_id": str(user_id),
+                "device_id_hash": str(user_id),
                 "done": bool(task.done()),
                 "cancelled": bool(task.cancelled()),
                 "exception": "",

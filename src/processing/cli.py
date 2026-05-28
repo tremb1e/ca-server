@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run dataset processing pipeline")
-    parser.add_argument("--user", help="Process a single user ID (device hash). When omitted, all users are processed.")
+    parser.add_argument("--user", help="Process a single device_id_hash. When omitted, all devices are processed.")
     return parser.parse_args()
 
 

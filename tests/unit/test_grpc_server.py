@@ -89,10 +89,9 @@ async def test_stream_packet_rejects_declared_decompressed_size_above_limit(tmp_
 
 
 @pytest.mark.asyncio
-async def test_stream_packet_rejects_batch_user_mismatch(tmp_path):
+async def test_stream_packet_uses_device_hash_as_batch_id(tmp_path):
     service = _service(tmp_path)
     batch = sensor_data_pb2.SerializedSensorBatch(
-        user_id_hash="other-device",
         session_id="auth-session",
         samples=[
             sensor_data_pb2.SensorSample(
@@ -122,5 +121,7 @@ async def test_stream_packet_rejects_batch_user_mismatch(tmp_path):
 
     assert directive.ack.success is True
     stored = service.storage.records[0]["packet_data"]
-    assert stored["decryption_status"] == "validation_failed"
-    assert "sensor_batch" not in stored
+    assert stored["decryption_status"] == "parsed_sensor_batch"
+    assert set(stored["sensor_batch"]) == {"samples", "session_id"}
+    assert service.storage.records[0]["device_id_hash"] == "device-a"
+    assert service.storage.records[0]["session_id"] == "auth-session"
