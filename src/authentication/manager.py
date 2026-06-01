@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from ..ca_config import get_ca_config
 from ..config import settings
 from ..storage.inference_storage import InferenceStorage
-from ..utils.reject_trackers import ConsecutiveRejectTracker, VoteRejectTracker
+from ..utils.reject_trackers import ConsecutiveRejectTracker, EMAScoreTracker, VoteRejectTracker
 
 if TYPE_CHECKING:
     import torch
@@ -49,6 +49,7 @@ class AuthSessionState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     consecutive_rejects: Any = None
     vote_rejects: Any = None
+    ema_rejects: Any = None
 
 
 class VQGANModelCache:
@@ -121,22 +122,27 @@ class AuthSessionManager:
         from .vqgan_inference import VQGANPolicy
 
         ca_cfg = get_ca_config()
-        vote_window_size = int(cfg.vote_window_size)
-        vote_min_rejects = int(cfg.vote_min_rejects)
-        if ca_cfg.auth.vote_window_size > 0 and ca_cfg.auth.vote_min_rejects > 0:
+        vote_window_size = int(cfg.vote_window_size or 0)
+        vote_min_rejects = int(cfg.vote_min_rejects or 0)
+        decision_strategy = str(cfg.decision_strategy or cfg.interrupt_rule or ca_cfg.auth.decision_strategy).strip().lower()
+        if decision_strategy == "vote" and (vote_window_size <= 0 or vote_min_rejects <= 0):
             vote_window_size = int(ca_cfg.auth.vote_window_size)
             vote_min_rejects = int(ca_cfg.auth.vote_min_rejects)
+        ema_alpha = float(cfg.ema_alpha or ca_cfg.auth.ema_alpha)
         return VQGANPolicy(
             user=cfg.user,
             window_size=cfg.window_size,
             overlap=cfg.overlap,
             target_width=cfg.target_width,
             threshold=cfg.threshold,
+            interrupt_rule=cfg.interrupt_rule,
+            decision_strategy=decision_strategy,
             k_rejects=cfg.k_rejects,
             vqgan_checkpoint=cfg.vqgan_checkpoint,
             vqgan_config=cfg.vqgan_config,
             vote_window_size=vote_window_size,
             vote_min_rejects=vote_min_rejects,
+            ema_alpha=ema_alpha,
             model_version=cfg.model_version or cfg.vqgan_checkpoint.name,
         )
 
@@ -171,6 +177,24 @@ class AuthSessionManager:
             return False
         if cfg.vqgan_config and not cfg.vqgan_config.exists():
             return False
+        scaler_path = Path(settings.processed_data_path) / "z-score" / user_id / "scaler.json"
+        if not scaler_path.exists() or not scaler_path.is_file():
+            return False
+        try:
+            import json
+
+            json.loads(scaler_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if cfg.vqgan_config:
+            try:
+                import json
+
+                model_cfg = json.loads(cfg.vqgan_config.read_text(encoding="utf-8"))
+                if int(model_cfg.get("input_height", 9)) != 9:
+                    return False
+            except Exception:
+                return False
         return True
 
     def start_session(self, user_id: str, session_id: str) -> Tuple[bool, str, Optional["VQGANPolicy"]]:
@@ -186,6 +210,7 @@ class AuthSessionManager:
         state = AuthSessionState(user_id=user_id, session_id=session_id, policy=policy)
         state.consecutive_rejects = ConsecutiveRejectTracker()
         state.vote_rejects = VoteRejectTracker()
+        state.ema_rejects = EMAScoreTracker()
         self._sessions[self._session_key(user_id, session_id)] = state
         return True, "ok", policy
 
@@ -202,8 +227,11 @@ class AuthSessionManager:
             "target_width": int(policy.target_width),
             "threshold": float(policy.threshold),
             "k_rejects": int(policy.k_rejects),
+            "interrupt_rule": str(policy.interrupt_rule),
+            "decision_strategy": str(policy.decision_strategy),
             "vote_window_size": int(policy.vote_window_size),
             "vote_min_rejects": int(policy.vote_min_rejects),
+            "ema_alpha": float(policy.ema_alpha),
             "model_version": str(policy.model_version),
             "vqgan_checkpoint": str(policy.vqgan_checkpoint),
             "vqgan_config": str(policy.vqgan_config),
@@ -215,6 +243,7 @@ class AuthSessionManager:
         for state in self._sessions.values():
             consecutive = state.consecutive_rejects
             vote = state.vote_rejects
+            ema = state.ema_rejects
             sessions.append(
                 {
                     "device_id_hash": str(state.user_id),
@@ -239,6 +268,12 @@ class AuthSessionManager:
                         "first_interrupt_window": getattr(vote, "first_interrupt_window", None),
                         "recent_windows": int(getattr(vote, "recent_windows", 0) or 0),
                         "recent_rejects": int(getattr(vote, "recent_rejects", 0) or 0),
+                    },
+                    "ema_rejects": {
+                        "windows": int(getattr(ema, "windows", 0) or 0),
+                        "interrupts": int(getattr(ema, "interrupts", 0) or 0),
+                        "first_interrupt_window": getattr(ema, "first_interrupt_window", None),
+                        "ema_score": getattr(ema, "ema_score", None),
                     },
                 }
             )
@@ -324,9 +359,27 @@ class AuthSessionManager:
                 decision_score = normalized_score
                 decision_threshold = float(state.policy.threshold)
                 decision_message = ""
+                ema_score: Optional[float] = None
                 vote_recent_windows = 0
                 vote_recent_rejects = 0
-                if state.policy.vote_window_size > 0 and state.policy.vote_min_rejects > 0:
+                decision_strategy = str(state.policy.decision_strategy or state.policy.interrupt_rule).strip().lower()
+                if decision_strategy == "ema":
+                    interrupt = state.ema_rejects.update(
+                        raw_score,
+                        alpha=float(state.policy.ema_alpha),
+                        threshold=float(state.policy.threshold),
+                        reset_on_interrupt=False,
+                    )
+                    ema_score = None if state.ema_rejects.ema_score is None else float(state.ema_rejects.ema_score)
+                    decision_accept = not bool(interrupt)
+                    decision_score = float(1.0 / (1.0 + math.exp(-float(ema_score or raw_score))))
+                    decision_threshold = float(1.0 / (1.0 + math.exp(-float(state.policy.threshold))))
+                    decision_message = (
+                        f"EMA={ema_score:.6f}, alpha={state.policy.ema_alpha:.3f}, threshold={state.policy.threshold:.6f}"
+                        if ema_score is not None
+                        else ""
+                    )
+                elif state.policy.vote_window_size > 0 and state.policy.vote_min_rejects > 0:
                     state.vote_rejects.update(
                         rejected=not accept,
                         window_size=int(state.policy.vote_window_size),
@@ -361,6 +414,7 @@ class AuthSessionManager:
                         k=int(state.policy.k_rejects),
                         reset_on_interrupt=True,
                     )
+                    decision_accept = not bool(interrupt)
 
                 await self._inference_storage.append_result(
                     user_id,
@@ -369,9 +423,16 @@ class AuthSessionManager:
                         "window_id": window_id,
                         "score": raw_score,
                         "threshold": float(state.policy.threshold),
-                        "accept": accept,
+                        "raw_accept": accept,
+                        "decision_accept": decision_accept,
+                        "accept": decision_accept,
                         "interrupt": bool(interrupt),
                         "normalized_score": normalized_score,
+                        "decision_strategy": decision_strategy,
+                        "decision_score": decision_score,
+                        "decision_threshold": decision_threshold,
+                        "ema_score": ema_score,
+                        "ema_alpha": float(state.policy.ema_alpha),
                         "k_rejects": int(state.policy.k_rejects),
                         "vote_recent_windows": vote_recent_windows,
                         "vote_recent_rejects": vote_recent_rejects,

@@ -42,7 +42,7 @@ class Settings(BaseSettings):
 
     encryption_key: str = "Continuous_Authentication"
 
-    training_max_concurrent: int = 1
+    training_max_concurrent: int = 8
     training_check_interval_sec: int = 30
     auth_max_concurrent: int = 16
     auth_max_cached_models: int = 16

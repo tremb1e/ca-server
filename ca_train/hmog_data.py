@@ -23,8 +23,8 @@ from torch.utils.data import Dataset
 #   window_points = round(window_size_sec * 100Hz)
 # and windows do NOT cross sessions.
 #
-# For VQGAN we build samples shaped as (1, 12, T):
-#   9 raw axes + 3 magnitudes (acc/gyr/mag).
+# For VQGAN we build samples shaped as (1, 9, T):
+#   9 raw axes (acc/gyr/mag x/y/z). Magnitude rows are intentionally omitted.
 # =============================================================================
 
 logger = logging.getLogger(__name__)
@@ -45,20 +45,7 @@ AXIS_COLUMNS = (
     "mag_z",
 )
 
-SENSOR_ORDER = (
-    "acc_x",
-    "acc_y",
-    "acc_z",
-    "acc_magnitude",
-    "gyr_x",
-    "gyr_y",
-    "gyr_z",
-    "gyr_magnitude",
-    "mag_x",
-    "mag_y",
-    "mag_z",
-    "mag_magnitude",
-)
+SENSOR_ORDER = AXIS_COLUMNS
 
 
 def format_window_dir_name(window_size: float) -> str:
@@ -159,7 +146,7 @@ def _iter_windows_from_csv(
     keep_all_subjects: bool,
 ) -> Iterator[Tuple[np.ndarray, int]]:
     """
-    Yield (window, label) where window is float32 shaped (1, 12, target_width).
+    Yield (window, label) where window is float32 shaped (1, 9, target_width).
 
     Window boundaries are determined by `window_id` (produced by the server pipeline).
     We also validate that all rows in a window share the same `subject` to avoid
@@ -198,7 +185,7 @@ def _iter_windows_from_csv(
         current_subject: Optional[str] = None
         skip_window = False
         filled = 0
-        window_raw = np.empty((12, window_points), dtype=np.float32)
+        window_raw = np.empty((9, window_points), dtype=np.float32)
 
         def _flush_current() -> Optional[Tuple[np.ndarray, int]]:
             nonlocal filled
@@ -269,15 +256,12 @@ def _iter_windows_from_csv(
             window_raw[0, filled] = acc_x
             window_raw[1, filled] = acc_y
             window_raw[2, filled] = acc_z
-            window_raw[3, filled] = float(np.sqrt(acc_x * acc_x + acc_y * acc_y + acc_z * acc_z))
-            window_raw[4, filled] = gyr_x
-            window_raw[5, filled] = gyr_y
-            window_raw[6, filled] = gyr_z
-            window_raw[7, filled] = float(np.sqrt(gyr_x * gyr_x + gyr_y * gyr_y + gyr_z * gyr_z))
-            window_raw[8, filled] = mag_x
-            window_raw[9, filled] = mag_y
-            window_raw[10, filled] = mag_z
-            window_raw[11, filled] = float(np.sqrt(mag_x * mag_x + mag_y * mag_y + mag_z * mag_z))
+            window_raw[3, filled] = gyr_x
+            window_raw[4, filled] = gyr_y
+            window_raw[5, filled] = gyr_z
+            window_raw[6, filled] = mag_x
+            window_raw[7, filled] = mag_y
+            window_raw[8, filled] = mag_z
             filled += 1
 
 
@@ -291,7 +275,7 @@ def iter_windows_from_csv_unlabeled(
     Iterate windows from a server-formatted CSV without assigning labels.
 
     Yields: (window_id, subject, window) where:
-      - window is float32 shaped (1, 12, target_width)
+      - window is float32 shaped (1, 9, target_width)
 
     Notes:
       - Window boundaries are determined by `window_id`.
@@ -329,7 +313,7 @@ def iter_windows_from_csv_unlabeled(
         current_subject: Optional[str] = None
         skip_window = False
         filled = 0
-        window_raw = np.empty((12, window_points), dtype=np.float32)
+        window_raw = np.empty((9, window_points), dtype=np.float32)
 
         def _flush_current() -> Optional[Tuple[str, str, np.ndarray]]:
             nonlocal filled
@@ -397,15 +381,12 @@ def iter_windows_from_csv_unlabeled(
             window_raw[0, filled] = acc_x
             window_raw[1, filled] = acc_y
             window_raw[2, filled] = acc_z
-            window_raw[3, filled] = float(np.sqrt(acc_x * acc_x + acc_y * acc_y + acc_z * acc_z))
-            window_raw[4, filled] = gyr_x
-            window_raw[5, filled] = gyr_y
-            window_raw[6, filled] = gyr_z
-            window_raw[7, filled] = float(np.sqrt(gyr_x * gyr_x + gyr_y * gyr_y + gyr_z * gyr_z))
-            window_raw[8, filled] = mag_x
-            window_raw[9, filled] = mag_y
-            window_raw[10, filled] = mag_z
-            window_raw[11, filled] = float(np.sqrt(mag_x * mag_x + mag_y * mag_y + mag_z * mag_z))
+            window_raw[3, filled] = gyr_x
+            window_raw[4, filled] = gyr_y
+            window_raw[5, filled] = gyr_z
+            window_raw[6, filled] = mag_x
+            window_raw[7, filled] = mag_y
+            window_raw[8, filled] = mag_z
             filled += 1
 
 
@@ -508,7 +489,7 @@ def _load_split_windows(
             neg_windows = [neg_windows[i] for i in idx]
 
     if not pos_windows and not neg_windows:
-        empty_x = np.empty((0, 1, 12, target_width), dtype=np.float32)
+        empty_x = np.empty((0, 1, 9, target_width), dtype=np.float32)
         empty_y = np.empty((0,), dtype=np.int64)
         return empty_x, empty_y
 
@@ -534,7 +515,7 @@ def iter_windows_from_csv_unlabeled_with_session(
     Iterate windows from a server-formatted CSV without assigning labels, keeping session metadata.
 
     Yields: (window_id, subject, session, window) where:
-      - window is float32 shaped (1, 12, target_width)
+      - window is float32 shaped (1, 9, target_width)
 
     Notes:
       - Window boundaries are determined by `window_id`.
@@ -574,7 +555,7 @@ def iter_windows_from_csv_unlabeled_with_session(
         current_session: Optional[str] = None
         skip_window = False
         filled = 0
-        window_raw = np.empty((12, window_points), dtype=np.float32)
+        window_raw = np.empty((9, window_points), dtype=np.float32)
 
         def _flush_current() -> Optional[Tuple[str, str, str, np.ndarray]]:
             nonlocal filled
@@ -648,15 +629,12 @@ def iter_windows_from_csv_unlabeled_with_session(
             window_raw[0, filled] = acc_x
             window_raw[1, filled] = acc_y
             window_raw[2, filled] = acc_z
-            window_raw[3, filled] = float(np.sqrt(acc_x * acc_x + acc_y * acc_y + acc_z * acc_z))
-            window_raw[4, filled] = gyr_x
-            window_raw[5, filled] = gyr_y
-            window_raw[6, filled] = gyr_z
-            window_raw[7, filled] = float(np.sqrt(gyr_x * gyr_x + gyr_y * gyr_y + gyr_z * gyr_z))
-            window_raw[8, filled] = mag_x
-            window_raw[9, filled] = mag_y
-            window_raw[10, filled] = mag_z
-            window_raw[11, filled] = float(np.sqrt(mag_x * mag_x + mag_y * mag_y + mag_z * mag_z))
+            window_raw[3, filled] = gyr_x
+            window_raw[4, filled] = gyr_y
+            window_raw[5, filled] = gyr_z
+            window_raw[6, filled] = mag_x
+            window_raw[7, filled] = mag_y
+            window_raw[8, filled] = mag_z
             filled += 1
 
 

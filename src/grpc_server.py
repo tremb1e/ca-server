@@ -236,6 +236,16 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         directive.ack.CopyFrom(ack)
         return directive
 
+    @staticmethod
+    def _packet_error_code(decryption_status: str) -> str:
+        if decryption_status == "invalid_identifier":
+            return "INVALID_IDENTIFIER"
+        if decryption_status == "decrypt_failed":
+            return "DECRYPTION_FAILED"
+        if decryption_status in {"decompress_failed", "parse_failed", "no_encrypted_payload"}:
+            return "INVALID_FORMAT"
+        return "INVALID_FORMAT"
+
     async def _handle_packet(
         self,
         packet: sensor_data_pb2.DataPacket,
@@ -315,6 +325,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
                         decryption_status = "decrypt_failed"
                         logger.warning("Decryption failed for packet %s: %s", packet.packet_id, processing_err)
         else:
+            decryption_status = "no_encrypted_payload"
             error_detail = "no_encrypted_payload"
             logger.warning("Received packet without encrypted payload: %s", packet.packet_id)
 
@@ -371,11 +382,15 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
             pending_inference.add(task)
             task.add_done_callback(lambda t: pending_inference.discard(t))
 
-        return self._ack_directive(
-            packet,
-            success=storage_ok,
-            error_code="SERVER_ERROR" if not storage_ok else "",
-        )
+        if not storage_ok:
+            return self._ack_directive(packet, success=False, error_code="SERVER_ERROR")
+        if not parsed_batch:
+            return self._ack_directive(
+                packet,
+                success=False,
+                error_code=self._packet_error_code(decryption_status),
+            )
+        return self._ack_directive(packet, success=True)
 
     async def _run_auth_inference(
         self,

@@ -38,10 +38,12 @@ def main() -> None:
     )
     logger.info("Inference done: %s", out_csv)
     logger.info(
-        "Policy: window=%.1f threshold=%.6f rule=%s vote=(%d,%d) k_rejects=%d",
+        "Policy: window=%.1f threshold=%.6f strategy=%s rule=%s ema_alpha=%.3f vote=(%d,%d) k_rejects=%d",
         meta["window"],
         meta["threshold"],
+        meta.get("decision_strategy", ""),
         meta.get("interrupt_rule", ""),
+        float(meta.get("ema_alpha", 0.0)),
         int(meta.get("vote_window_size", 0)),
         int(meta.get("vote_min_rejects", 0)),
         int(meta.get("k_rejects", 0)),

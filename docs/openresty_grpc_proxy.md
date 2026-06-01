@@ -10,6 +10,8 @@
 - 容器化部署并不会把 gRPC 协议改成别的协议。当前推荐 compose 方案使用 `network_mode: host`，容器内 gRPC 直接监听宿主机 `10500`，以对齐 `python3 -m src.main` 的直跑网络形态。
 - OpenResty / Nginx 默认 `client_max_body_size` 往往只有 `1m`；而本服务 gRPC 端默认允许 `4MiB` 单消息。若 App 单个 `DataPacket` 超过 1MiB，小于 4MiB，会出现“直连可用，反代失败”的典型现象。
 - `SensorDataService/StreamSensorData` 是双向流式 RPC，代理层还需要足够长的 `grpc_read_timeout` / `grpc_send_timeout`，否则空闲一段时间后会被提前断流。
+- Android app 的默认公网配置为 `https://ca.macrz.com:443`。443 必须使用可信证书，且证书 SAN 必须包含 app 中配置的域名；TLS/主机名/真实 gRPC RPC 任一失败时 app 不会在 443 回退到明文 h2c，也不会自动改到 `10500`。App 会把 `https` 且端口为空或 `80` 的输入归一为 `443`，避免把 gRPC 请求发到只返回 301 的 80 端口。如果配置成 `https://<后端域名>:10500`，而 10500 实际只提供 h2c，app 会在非 443 兼容入口的原端口失败后降级到明文并在传输状态中显示 `HTTP 明文（TLS不可用/失败）`。
+- 80 端口只保留 ACME 与 `301 https://$host$request_uri`，不加载 gRPC 代理片段；移动端 gRPC 客户端应直接连接 443，不能依赖 HTTP 301 跳转。
 
 ## 文件位置
 
@@ -28,6 +30,7 @@
 ## 验证命令
 
 - 语法检查：`openresty -t` 或 `nginx -t`
+- TLS 检查：`openssl s_client -connect ca.macrz.com:443 -servername ca.macrz.com -verify_hostname ca.macrz.com -alpn h2 -brief`
 - gRPC 健康检查：使用 TLS 客户端调用 `grpc.health.v1.Health/Check`
 - 流式校验：调用 `com.continuousauth.proto.SensorDataService/StreamSensorData`
 
@@ -41,6 +44,10 @@
   - 结果：小请求能过，大一点的数据包失败；OpenResty 日志常见 `413` 或 `client intended to send too large body`。
 - `grpc_read_timeout` / `grpc_send_timeout` 太短
   - 结果：`StreamSensorData` 建连后先正常，空闲一段时间或上传较慢时被代理层断开。
+- 443 证书与 app 配置域名不匹配
+  - 结果：`openssl -verify_hostname`、Android gRPC、Python gRPC 都会拒绝连接；不能通过关闭校验或回退明文修复，应更换 SAN 覆盖配置域名的证书或改用证书匹配的域名。
+- app 配到 `https://ty.macrz.com:10500`
+  - 结果：当前 10500 真服务按 h2c 运行，不是公网 TLS 入口；客户端会出现 TLS 握手失败或 gRPC `UNAVAILABLE`。移动端应使用 `https://ca.macrz.com:443`。
 - 后端走 Docker bridge/端口映射，而上游是经域名/VIP 回源到本机
   - 结果：宿主机直跑可用，但容器化后可能只在本机/内网地址可用，经 VIP 路径回源异常；这类场景优先改用 `network_mode: host`。
 - OpenResty 自己也跑在容器里，却把上游写成 `127.0.0.1:10500`
@@ -49,14 +56,23 @@
 ## 建议排查顺序
 
 1. 先直连宿主机端口验证后端本身：`grpcurl -plaintext 127.0.0.1:10500 grpc.health.v1.Health/Check`
-2. 再经过 OpenResty 验证：`grpcurl -insecure <your-domain>:443 grpc.health.v1.Health/Check`
-3. 查看 OpenResty 错误日志，重点看：
+2. 再验证 443 证书与 ALPN：`openssl s_client -connect <your-domain>:443 -servername <your-domain> -verify_hostname <your-domain> -alpn h2 -brief`
+3. 经过 OpenResty 验证：`grpcurl <your-domain>:443 grpc.health.v1.Health/Check`；只有临时定位证书问题时才使用 `-insecure`
+4. 查看 OpenResty 错误日志，重点看：
    - `client intended to send too large body`
    - `upstream sent no valid HTTP/2 connection preface`
    - `upstream timed out`
    - `upstream prematurely closed connection`
-4. 确认当前服务端模式：
+5. 确认当前服务端模式：
    - 当前推荐 compose 使用 `network_mode: host`，容器内 gRPC 直接监听宿主机 `10500`
    - 容器内 gRPC 默认是 h2c，而不是 TLS，除非显式配置了 `TLS_CERTFILE` / `TLS_KEYFILE`
 
 本次仓库内联调按上面这套方式完成：OpenResty 对外使用 `443/TLS+h2`，上游回源到本项目默认的 `127.0.0.1:10500(h2c)`。
+
+## 2026-06-01 验证记录
+
+- `ca.macrz.com:443` 可协商 TLS 1.3，证书 `CN=*.macrz.com` 覆盖 `ca.macrz.com`，严格主机名校验 OK。
+- Python gRPC TLS 客户端调用 `ca.macrz.com:443` 的 `grpc.health.v1.Health/Check` 返回 `SERVING`，调用 `SensorDataService/SendHeartbeat` 正常返回 `client_timestamp_echo`。
+- Python gRPC TLS 客户端构造一条 `SerializedSensorBatch -> LZ4 -> AES-256-GCM` 的测试 `DataPacket`，经 `StreamSensorData` 上传后返回 `Ack(success=true)`，证明 443 反代链路可以承载真实加密数据包。
+- `ty.macrz.com:10500` 当前 TLS 握手失败，Python gRPC TLS 与 h2c 均返回 `UNAVAILABLE` / `Socket closed`；该地址不能作为 app 公网入口。
+- 80 端口普通 HTTP 请求返回 301 到 `https://ca.macrz.com/`；gRPC 客户端应直接使用 443。

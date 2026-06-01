@@ -16,15 +16,22 @@ from .utils.runtime import app_root
 
 @dataclass(frozen=True)
 class ProcessingConfig:
-    min_total_mb: int = 100
-    target_total_mb: int = 100
+    min_total_mb: int = 300
+    target_total_mb: int = 300
+    train_ratio: float = 0.75
+    val_ratio: float = 0.125
+    test_ratio: float = 0.125
     workers: int = 5
+    process_user_workers: int = 5
     # HMOG 攻击者用户选择（按目录名排序）：
     # - val 使用第 1~10 个用户
     # - test 使用第 11~20 个用户
     # 说明：实际选择逻辑在 processing.pipeline 中固定按上述区间切分。
     hmog_val_subject_count: int = 10
     hmog_test_subject_count: int = 10
+    hmog_min_subject_count: int = 10
+    hmog_session_count: int = 24
+    hmog_balance_ratio: float = 1.0
     # HMOG 攻击者数据体量控制。
     # 默认 0=不截断（由 session 1~6 规则控制总体规模）。
     # - max_rows_per_subject: 单个 HMOG 用户最多读取多少行（跨 train/val/test 三个 CSV 合计）。
@@ -48,11 +55,30 @@ class WindowConfig:
 class AuthConfig:
     max_decision_time_sec: float = 2.0
     k_rejects_mode: Literal["by_window"] = "by_window"
+    decision_strategy: Literal["ema", "vote", "k"] = "ema"
     # 投票规则：最近连续 N 个窗口中，若 reject>=M，则判定为恶意并触发打断。
     vote_window_size: int = 7
     vote_min_rejects: int = 6
+    ema_alpha: float = 0.25
+    ema_alpha_candidates: List[float] = None  # type: ignore[assignment]
     # 允许少量真实用户“窗口”误打断的上限（0~1）。
     target_window_frr: float = 0.10
+    max_genuine_first_interrupt_p: Optional[float] = None
+    policy_search_auth_method: Literal["vqgan-only", "vqgan+transformer"] = "vqgan-only"
+
+    def __post_init__(self) -> None:
+        if self.ema_alpha_candidates is None:
+            object.__setattr__(self, "ema_alpha_candidates", [0.10, 0.20, 0.30, 0.40, 0.50])
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    max_epochs: int = 50
+    early_stop_patience: int = 3
+    batch_size: int = 128
+    max_parallel_train: int = 8
+    device: str = "auto"
+    run_policy_search: bool = True
 
 
 @dataclass(frozen=True)
@@ -60,6 +86,7 @@ class CAConfig:
     processing: ProcessingConfig = ProcessingConfig()
     windows: WindowConfig = WindowConfig()
     auth: AuthConfig = AuthConfig()
+    training: TrainingConfig = TrainingConfig()
 
     def k_rejects_for_window(self, window_size_sec: float) -> int:
         """Compute consecutive rejects K for a given window size.
@@ -96,13 +123,21 @@ def load_ca_config(path: Optional[Path] = None) -> CAConfig:
     proc_raw = raw.get("processing", {}) or {}
     win_raw = raw.get("windows", {}) or {}
     auth_raw = raw.get("auth", {}) or {}
+    training_raw = raw.get("training", {}) or {}
 
     processing = ProcessingConfig(
         min_total_mb=int(proc_raw.get("min_total_mb", ProcessingConfig.min_total_mb)),
         target_total_mb=int(proc_raw.get("target_total_mb", ProcessingConfig.target_total_mb)),
+        train_ratio=float(proc_raw.get("train_ratio", ProcessingConfig.train_ratio)),
+        val_ratio=float(proc_raw.get("val_ratio", ProcessingConfig.val_ratio)),
+        test_ratio=float(proc_raw.get("test_ratio", ProcessingConfig.test_ratio)),
         workers=int(proc_raw.get("workers", ProcessingConfig.workers)),
+        process_user_workers=int(proc_raw.get("process_user_workers", proc_raw.get("workers", ProcessingConfig.process_user_workers))),
         hmog_val_subject_count=int(proc_raw.get("hmog_val_subject_count", ProcessingConfig.hmog_val_subject_count)),
         hmog_test_subject_count=int(proc_raw.get("hmog_test_subject_count", ProcessingConfig.hmog_test_subject_count)),
+        hmog_min_subject_count=int(proc_raw.get("hmog_min_subject_count", ProcessingConfig.hmog_min_subject_count)),
+        hmog_session_count=int(proc_raw.get("hmog_session_count", ProcessingConfig.hmog_session_count)),
+        hmog_balance_ratio=float(proc_raw.get("hmog_balance_ratio", ProcessingConfig.hmog_balance_ratio)),
         hmog_max_rows_per_subject=int(proc_raw.get("hmog_max_rows_per_subject", ProcessingConfig.hmog_max_rows_per_subject)),
         hmog_max_rows_total=int(proc_raw.get("hmog_max_rows_total", ProcessingConfig.hmog_max_rows_total)),
     )
@@ -122,15 +157,43 @@ def load_ca_config(path: Optional[Path] = None) -> CAConfig:
         # Backward-compatible fallback
         target_window_frr_raw = auth_raw.get("target_session_frr", AuthConfig.target_window_frr)
 
+    decision_strategy = str(auth_raw.get("decision_strategy", AuthConfig.decision_strategy)).strip().lower()
+    if decision_strategy not in {"ema", "vote", "k"}:
+        decision_strategy = AuthConfig.decision_strategy
+
+    ema_alpha_candidates_raw = auth_raw.get("ema_alpha_candidates", None)
+    ema_alpha_candidates = None
+    if ema_alpha_candidates_raw is not None:
+        ema_alpha_candidates = [float(x) for x in ema_alpha_candidates_raw]
+
+    max_genuine_raw = auth_raw.get("max_genuine_first_interrupt_p", None)
+    policy_search_auth_method = str(auth_raw.get("policy_search_auth_method", AuthConfig.policy_search_auth_method)).strip().lower()
+    if policy_search_auth_method not in {"vqgan-only", "vqgan+transformer"}:
+        policy_search_auth_method = AuthConfig.policy_search_auth_method
+
     auth = AuthConfig(
         max_decision_time_sec=float(auth_raw.get("max_decision_time_sec", AuthConfig.max_decision_time_sec)),
         k_rejects_mode=str(auth_raw.get("k_rejects_mode", AuthConfig.k_rejects_mode)),  # type: ignore[arg-type]
+        decision_strategy=decision_strategy,  # type: ignore[arg-type]
         vote_window_size=int(auth_raw.get("vote_window_size", AuthConfig.vote_window_size)),
         vote_min_rejects=int(auth_raw.get("vote_min_rejects", AuthConfig.vote_min_rejects)),
+        ema_alpha=float(auth_raw.get("ema_alpha", AuthConfig.ema_alpha)),
+        ema_alpha_candidates=ema_alpha_candidates,  # type: ignore[arg-type]
         target_window_frr=float(target_window_frr_raw),
+        max_genuine_first_interrupt_p=None if max_genuine_raw is None else float(max_genuine_raw),
+        policy_search_auth_method=policy_search_auth_method,  # type: ignore[arg-type]
     )
 
-    return CAConfig(processing=processing, windows=windows, auth=auth)
+    training = TrainingConfig(
+        max_epochs=int(training_raw.get("max_epochs", TrainingConfig.max_epochs)),
+        early_stop_patience=int(training_raw.get("early_stop_patience", TrainingConfig.early_stop_patience)),
+        batch_size=int(training_raw.get("batch_size", TrainingConfig.batch_size)),
+        max_parallel_train=int(training_raw.get("max_parallel_train", TrainingConfig.max_parallel_train)),
+        device=str(training_raw.get("device", TrainingConfig.device)),
+        run_policy_search=bool(training_raw.get("run_policy_search", TrainingConfig.run_policy_search)),
+    )
+
+    return CAConfig(processing=processing, windows=windows, auth=auth, training=training)
 
 
 _CACHED: Optional[CAConfig] = None

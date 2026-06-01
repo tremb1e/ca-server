@@ -613,6 +613,7 @@ def load_token_cache(
     expected_vqgan_ckpt_mtime_ns: int,
     expected_vqgan_ckpt_size: int,
     expected_num_codebook_vectors: int,
+    expected_input_height: int,
     expected_target_width: int,
     expected_seed: int,
     expected_num_windows: int,
@@ -631,6 +632,9 @@ def load_token_cache(
             if int(cached_size) != int(expected_vqgan_ckpt_size):
                 return None
             if int(data["num_codebook_vectors"].item()) != int(expected_num_codebook_vectors):
+                return None
+            cached_input_height = int(data["input_height"].item()) if "input_height" in data else -1
+            if int(cached_input_height) != int(expected_input_height):
                 return None
             if int(data["target_width"].item()) != int(expected_target_width):
                 return None
@@ -658,6 +662,7 @@ def save_token_cache(
     vqgan_ckpt_mtime_ns: int,
     vqgan_ckpt_size: int,
     num_codebook_vectors: int,
+    input_height: int,
     target_width: int,
     seed: int,
 ) -> None:
@@ -670,6 +675,7 @@ def save_token_cache(
         vqgan_ckpt_mtime_ns=int(vqgan_ckpt_mtime_ns),
         vqgan_ckpt_size=int(vqgan_ckpt_size),
         num_codebook_vectors=int(num_codebook_vectors),
+        input_height=int(input_height),
         target_width=int(target_width),
         seed=int(seed),
         num_windows=int(tokens.shape[0]),
@@ -766,9 +772,9 @@ def run_single_window(
             seed=args.seed,
             max_train_windows=args.max_train_per_user,
         )
-        val_x = np.empty((0, 1, 12, target_width), dtype=np.float32)
+        val_x = np.empty((0, 1, 9, target_width), dtype=np.float32)
         val_y = np.empty((0,), dtype=np.int64)
-        test_x = np.empty((0, 1, 12, target_width), dtype=np.float32)
+        test_x = np.empty((0, 1, 9, target_width), dtype=np.float32)
         test_y = np.empty((0,), dtype=np.int64)
     else:
         train_x, train_y, val_x, val_y, test_x, test_y = prepare_user_datasets(
@@ -825,7 +831,7 @@ def run_single_window(
         train_x = train_x[idx]
         train_y = train_y[idx]
 
-    args.input_height = int(train_x.shape[2]) if train_x.size else 12
+    args.input_height = int(train_x.shape[2]) if train_x.size else 9
     args.input_width = int(train_x.shape[3]) if train_x.size else int(target_width)
     args.use_nonlocal = not getattr(args, "no_nonlocal", False)
 
@@ -1038,6 +1044,7 @@ def run_single_window(
         expected_vqgan_ckpt_mtime_ns=expected_vqgan_ckpt_mtime_ns,
         expected_vqgan_ckpt_size=expected_vqgan_ckpt_size,
         expected_num_codebook_vectors=args.num_codebook_vectors,
+        expected_input_height=int(args.input_height),
         expected_target_width=target_width,
         expected_seed=args.seed,
         expected_num_windows=int(train_x.shape[0]),
@@ -1059,6 +1066,7 @@ def run_single_window(
             vqgan_ckpt_mtime_ns=expected_vqgan_ckpt_mtime_ns,
             vqgan_ckpt_size=expected_vqgan_ckpt_size,
             num_codebook_vectors=args.num_codebook_vectors,
+            input_height=int(args.input_height),
             target_width=target_width,
             seed=args.seed,
         )
@@ -1080,6 +1088,7 @@ def run_single_window(
             expected_vqgan_ckpt_mtime_ns=expected_vqgan_ckpt_mtime_ns,
             expected_vqgan_ckpt_size=expected_vqgan_ckpt_size,
             expected_num_codebook_vectors=args.num_codebook_vectors,
+            expected_input_height=int(args.input_height),
             expected_target_width=target_width,
             expected_seed=args.seed,
             expected_num_windows=int(val_x.shape[0]),
@@ -1101,6 +1110,7 @@ def run_single_window(
                 vqgan_ckpt_mtime_ns=expected_vqgan_ckpt_mtime_ns,
                 vqgan_ckpt_size=expected_vqgan_ckpt_size,
                 num_codebook_vectors=args.num_codebook_vectors,
+                input_height=int(args.input_height),
                 target_width=target_width,
                 seed=args.seed,
             )
@@ -1114,6 +1124,7 @@ def run_single_window(
             expected_vqgan_ckpt_mtime_ns=expected_vqgan_ckpt_mtime_ns,
             expected_vqgan_ckpt_size=expected_vqgan_ckpt_size,
             expected_num_codebook_vectors=args.num_codebook_vectors,
+            expected_input_height=int(args.input_height),
             expected_target_width=target_width,
             expected_seed=args.seed,
             expected_num_windows=int(test_x.shape[0]),
@@ -1135,6 +1146,7 @@ def run_single_window(
                 vqgan_ckpt_mtime_ns=expected_vqgan_ckpt_mtime_ns,
                 vqgan_ckpt_size=expected_vqgan_ckpt_size,
                 num_codebook_vectors=args.num_codebook_vectors,
+                input_height=int(args.input_height),
                 target_width=target_width,
                 seed=args.seed,
             )
@@ -1590,7 +1602,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-metric", choices=["mse", "l1"], default="mse")
     parser.add_argument("--input-noise-std", type=float, default=0.0)
     parser.add_argument("--grad-clip-norm", type=float, default=0.0)
-    parser.add_argument("--vqgan-epochs", type=int, default=1, help="VQGAN 最大训练 epoch 数（会受 --early-stop-patience 影响提前停止）")
+    parser.add_argument("--vqgan-epochs", type=int, default=50, help="VQGAN 最大训练 epoch 数（会受 --early-stop-patience 影响提前停止）")
     parser.add_argument("--vqgan-val-interval", type=int, default=0)
     parser.add_argument("--vqgan-lr", type=float, default=2.5e-4)
     parser.add_argument("--vqgan-weight-decay", type=float, default=0.0)
@@ -1603,7 +1615,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-batch-size", type=int, default=512)
 
     # Token LM config
-    parser.add_argument("--lm-epochs", type=int, default=3, help="LM 最大训练 epoch 数（会受 --early-stop-patience 影响提前停止）")
+    parser.add_argument("--lm-epochs", type=int, default=50, help="LM 最大训练 epoch 数（会受 --early-stop-patience 影响提前停止）")
     parser.add_argument("--lm-batch-size", type=int, default=256)
     parser.add_argument("--lm-eval-batch-size", type=int, default=2048)
     parser.add_argument("--lm-lr", type=float, default=3e-4)

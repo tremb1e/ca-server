@@ -14,7 +14,7 @@ class Decoder(nn.Module):
         ]
         use_nonlocal = bool(getattr(args, "use_nonlocal", True))
 
-        # Expected input "image" size for sensor windows: (1, H=12, W=target_width).
+        # Expected input "image" size for sensor windows: (1, H=9, W=target_width).
         # The encoder downsamples with:
         #   1) stride (2,2)  : H -> H1, W -> W1
         #   2) stride (1,2)  : H1 stays, W1 -> W2
@@ -22,7 +22,7 @@ class Decoder(nn.Module):
         #
         # We compute matching upsample targets dynamically so the same VQGAN can
         # be used with different `target_width` values.
-        input_height = int(getattr(args, "input_height", 12))
+        input_height = int(getattr(args, "input_height", 9))
         input_width = int(getattr(args, "input_width", 50))
 
         def _downsample_w(width: int) -> int:
@@ -43,7 +43,7 @@ class Decoder(nn.Module):
         ]
         attn_resolutions = []
         num_res_blocks = 2
-        resolution = 6
+        resolution = height_1
 
         in_channels = channels[0]
         layers = [

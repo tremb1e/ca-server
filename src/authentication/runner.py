@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from ..utils.reject_trackers import ConsecutiveRejectTracker, VoteRejectTracker
+from ..utils.reject_trackers import ConsecutiveRejectTracker, EMAScoreTracker, VoteRejectTracker
 from ..utils.runtime import app_root
 from ..utils.ca_train import ensure_ca_train_on_path
 from ..utils.path_safety import safe_child_path, validate_storage_id
@@ -21,9 +21,11 @@ class AuthRunConfig:
     overlap: float
     threshold: float
     interrupt_rule: str
+    decision_strategy: str
     k_rejects: int
     vote_window_size: int
     vote_min_rejects: int
+    ema_alpha: float
     vqgan_checkpoint: Path
     vqgan_config: Path
     model_version: str = ""
@@ -60,6 +62,7 @@ def load_best_policy(
     vote_window_size = int(policy.get("vote_window_size", 0))
     vote_min_rejects = int(policy.get("vote_min_rejects", 0))
     interrupt_rule = str(policy.get("interrupt_rule", "") or "")
+    decision_strategy = str(policy.get("decision_strategy", interrupt_rule) or interrupt_rule).strip().lower()
     if not interrupt_rule:
         if vote_window_size > 0 and vote_min_rejects > 0:
             interrupt_rule = "vote"
@@ -67,6 +70,8 @@ def load_best_policy(
             interrupt_rule = "k"
         else:
             interrupt_rule = "none"
+    if not decision_strategy:
+        decision_strategy = interrupt_rule
 
     vqgan_checkpoint = resolve_policy_path(
         policy.get("vqgan_checkpoint"),
@@ -87,9 +92,11 @@ def load_best_policy(
         overlap=float(policy.get("overlap", 0.5)),
         threshold=float(policy.get("threshold", 0.0)),
         interrupt_rule=interrupt_rule,
+        decision_strategy=decision_strategy,
         k_rejects=k_rejects,
         vote_window_size=vote_window_size,
         vote_min_rejects=vote_min_rejects,
+        ema_alpha=float(policy.get("ema_alpha", 0.25)),
         vqgan_checkpoint=vqgan_checkpoint,
         vqgan_config=vqgan_config,
         model_version=str(policy.get("model_version", "")),
@@ -130,6 +137,7 @@ def run_auth_inference(
     vqgan = load_vqgan(policy.vqgan_checkpoint, device=torch_device, config_path=policy.vqgan_config)
 
     k_tracker = ConsecutiveRejectTracker()
+    ema_tracker = EMAScoreTracker()
     vote_tracker = VoteRejectTracker()
     current_session_key: Optional[str] = None
 
@@ -141,6 +149,10 @@ def run_auth_inference(
                 "subject",
                 "session",
                 "score",
+                "ema_score",
+                "decision_strategy",
+                "raw_accept",
+                "decision_accept",
                 "accept",
                 "interrupt",
                 "consecutive_rejects",
@@ -169,29 +181,44 @@ def run_auth_inference(
                     current_session_key = session_key
                 elif current_session_key != session_key:
                     k_tracker.reset()
+                    ema_tracker.reset()
                     vote_tracker.reset()
                     current_session_key = session_key
 
-                accept = bool(float(score) >= float(policy.threshold))
+                raw_accept = bool(float(score) >= float(policy.threshold))
+                decision_accept = raw_accept
                 interrupt = False
                 consecutive_rejects = 0
+                ema_score = ""
                 vote_recent_windows = 0
                 vote_recent_rejects = 0
-                if policy.vote_window_size > 0 and policy.vote_min_rejects > 0:
+                decision_strategy = str(policy.decision_strategy or policy.interrupt_rule).strip().lower()
+                if decision_strategy == "ema":
+                    interrupt = ema_tracker.update(
+                        float(score),
+                        alpha=float(policy.ema_alpha),
+                        threshold=float(policy.threshold),
+                        reset_on_interrupt=False,
+                    )
+                    decision_accept = not bool(interrupt)
+                    ema_score = f"{float(ema_tracker.ema_score or 0.0):.6f}"
+                elif policy.vote_window_size > 0 and policy.vote_min_rejects > 0:
                     interrupt = vote_tracker.update(
-                        rejected=not accept,
+                        rejected=not raw_accept,
                         window_size=int(policy.vote_window_size),
                         min_rejects=int(policy.vote_min_rejects),
                         reset_on_interrupt=True,
                     )
+                    decision_accept = not bool(interrupt)
                     vote_recent_windows = int(vote_tracker.recent_windows)
                     vote_recent_rejects = int(vote_tracker.recent_rejects)
                 elif policy.k_rejects > 0:
                     interrupt = k_tracker.update(
-                        rejected=not accept,
+                        rejected=not raw_accept,
                         k=int(policy.k_rejects),
                         reset_on_interrupt=True,
                     )
+                    decision_accept = not bool(interrupt)
                     consecutive_rejects = int(k_tracker.consecutive_rejects)
 
                 writer.writerow(
@@ -200,7 +227,11 @@ def run_auth_inference(
                         meta["subject"],
                         meta["session"],
                         f"{float(score):.6f}",
-                        int(accept),
+                        ema_score,
+                        decision_strategy,
+                        int(raw_accept),
+                        int(decision_accept),
+                        int(decision_accept),
                         int(interrupt),
                         consecutive_rejects,
                         vote_recent_windows,
@@ -237,9 +268,11 @@ def run_auth_inference(
         "target_width": int(policy.target_width),
         "threshold": float(policy.threshold),
         "interrupt_rule": str(policy.interrupt_rule),
+        "decision_strategy": str(policy.decision_strategy),
         "k_rejects": int(policy.k_rejects),
         "vote_window_size": int(policy.vote_window_size),
         "vote_min_rejects": int(policy.vote_min_rejects),
+        "ema_alpha": float(policy.ema_alpha),
         "vqgan_checkpoint": str(policy.vqgan_checkpoint),
         "vqgan_config": str(policy.vqgan_config),
         "input_csv": str(csv_path),

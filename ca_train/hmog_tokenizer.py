@@ -36,7 +36,7 @@ def encode_windows_to_tokens(
 
     Args:
         vqgan: Trained VQGAN model.
-        windows: (N, 1, 12, T) float32 numpy array.
+        windows: (N, 1, 9, T) float32 numpy array.
         batch_size: encoding batch size.
         device: torch device.
         use_amp: autocast on/off.

@@ -4,25 +4,34 @@
 # - 采用 TOML（支持中文注释），由 server 侧代码在运行时读取。
 
 [processing]
-# 触发预处理的阈值：当单个用户（一个设备ID目录）下的 raw session 文件总量达到该值（MB）才开始处理。
-# 对应需求中的“100MB”。
-min_total_mb = 100
+# 触发预处理/训练的数据阈值：当单个用户（一个设备ID目录）下的 raw session 文件总量达到该值（MB）才开始处理。
+# 默认 300MB。若把该阈值记为 100x，则下面的 split ratio 会把训练/验证/测试动态分成 75x/12.5x/12.5x。
+min_total_mb = 300
 
 # 选择用于处理的数据量目标：将 session 按时间顺序（文件名时间戳或 mtime 升序）排序，
 # 再从最早的 session 开始累加，优先凑够该目标值（MB）后停止（得到前 x 个 session）。
-# 对应需求中的“取优先满足100M数据的前 x 个 session 文件”。
-target_total_mb = 100
+# 对应需求中的“取优先满足阈值数据的前 x 个 session 文件”。
+target_total_mb = 300
+
+# 用户真实数据的时间顺序切分比例。阈值为 100x 时，对应 train=75x、val=12.5x、test=12.5x。
+train_ratio = 0.75
+val_ratio = 0.125
+test_ratio = 0.125
 
 # 数据预处理并发进程数（session 重采样、滑窗生成均受此限制）。
-# 需求要求使用 5 个进程；后期如需调参可修改此值。
+# 后期如需调参可修改此值；在 process_all_users 多用户处理时会按用户级并发自动分配给子任务。
 workers = 5
+process_user_workers = 5
 
 # HMOG 攻击者用户选择（按 HMOG 目录名排序后的顺序）：
-# - val：使用第 1~10 个 HMOG 用户作为恶意用户数据
-# - test：使用第 11~20 个 HMOG 用户作为恶意用户数据
-# 说明：具体 rank 区间在 processing.pipeline 中固定为上述规则。
-hmog_val_subject_count = 10
-hmog_test_subject_count = 10
+# - val：使用从前往后的第 1~x 个 HMOG 用户，x 至少为 10
+# - test：使用从后往前的第 1~x 个 HMOG 用户，x 至少为 10
+# 每个 HMOG 用户以 24 个 session 作为候选来源；实际写入时会按真实用户 val/test 体量做 1:1 平衡截取。
+hmog_val_subject_count = 20
+hmog_test_subject_count = 20
+hmog_min_subject_count = 10
+hmog_session_count = 24
+hmog_balance_ratio = 1.0
 
 # HMOG 攻击者数据体量控制（非常关键）：
 # HMOG 原始 CSV 单用户可达数百 MB；如果不做上限，会导致 val/test 达到千万级行数，
@@ -52,7 +61,13 @@ sampling_rate_hz = 100
 [auth]
 # 认证策略目标：期望在该时间内完成首次打断决策（秒）。
 # 当前需求：T=2s。
-max_decision_time_sec = 2.0
+max_decision_time_sec = 20.0
+
+# 认证决策策略：
+# - "ema"：默认策略，对 VQGAN 分数做指数滑动平均后与 policy_search 选出的阈值比较，降低短时抖动造成的 FRR。
+# - "vote"：保留 y-of-x 投票机制，即最近 N 窗中 reject>=M 触发。
+# - "k"：兼容旧的连续 K 次拒绝策略。
+decision_strategy = "ema"
 
 # 判定策略（投票规则）：
 # 最近连续 N 个窗口中，若 reject>=M，则判定为恶意用户并触发打断（如锁屏等）。
@@ -60,6 +75,10 @@ max_decision_time_sec = 2.0
 # 当前策略：连续 7 个窗口内，若至少 6 个窗口为恶意，则判定为恶意并触发打断。
 vote_window_size = 7
 vote_min_rejects = 6
+
+# EMA 默认值和 policy_search 候选值。最终每个用户会在验证集上搜索并写入 models/<user>/best_lock_policy.json。
+ema_alpha = 0.25
+ema_alpha_candidates = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
 
 # （兼容保留）“连续拒绝 K 次”策略的 K 计算方式：
 # - "by_window": K = ceil(max_decision_time_sec / stride_sec)
@@ -75,3 +94,26 @@ k_rejects_mode = "by_window"
 # 因此把窗口级误打断率（FRR）上限收紧到 0.05。
 # 注意：这里的 FRR 以“窗口”为粒度统计，并会排除每个 session 末尾 (N-1) 个窗口（无法组成完整 N 窗投票窗口）。
 target_window_frr = 0.05
+
+# 限制真实用户会话在 max_decision_time_sec 内被误打断的概率；不填时沿用 target_window_frr。
+# max_genuine_first_interrupt_p = 0.005
+
+# 上线链路当前执行 VQGAN-only 分数，因此 policy_search 默认也使用 VQGAN-only，避免离线/线上策略不一致。
+policy_search_auth_method = "vqgan-only"
+
+[training]
+# 模型最大训练轮数。实际训练会受 early_stop_patience 控制提前停止。
+max_epochs = 50
+
+# 早停：验证集性能连续 3 次不提升则停止。
+early_stop_patience = 3
+
+# 默认训练批量大小和设备。device=auto 时优先 NPU，其次 CUDA，最后 CPU。
+batch_size = 128
+device = "auto"
+
+# 华为 Kunpeng 920 + Ascend 910B 8 卡环境下，训练任务按用户/窗口多进程分配到多张 NPU。
+max_parallel_train = 8
+
+# 训练完成后自动运行 policy_search，用验证集选择该用户阈值和策略并写入 models/<user>/best_lock_policy.json。
+run_policy_search = true

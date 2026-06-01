@@ -87,6 +87,8 @@ def main() -> None:
     cfg = GridSearchConfig(
         window_sizes=list(args.window_sizes) if args.window_sizes else list(ca_cfg.windows.sizes),
         overlap=float(args.overlap) if args.overlap is not None else float(ca_cfg.windows.overlap),
+        decision_strategies=[str(ca_cfg.auth.decision_strategy), "ema", "vote"],
+        ema_alpha_candidates=list(ca_cfg.auth.ema_alpha_candidates or [ca_cfg.auth.ema_alpha]),
         vote_window_sizes=vote_window_sizes,
         vote_min_rejects_ratio_range=vote_min_rejects_ratio_range,
         vote_min_rejects_range_by_n=vote_min_rejects_range_by_n,

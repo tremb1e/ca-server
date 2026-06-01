@@ -38,7 +38,7 @@ class TrainVQGAN:
         '''
         self.discriminator = Discriminator(args).to(device=args.device)
         self.discriminator = torch.nn.DataParallel(self.discriminator, device_ids=[0,1])
-        #print("the layer is:", summary(self.discriminator, (1,12,50)))
+        #print("the layer is:", summary(self.discriminator, (1,9,50)))
         #exit(-1)
         self.discriminator.apply(weights_init)
         self.perceptual_loss = LPIPS().eval().to(device=args.device)

@@ -2,8 +2,9 @@ import json
 import logging
 import os
 import re
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -45,15 +46,9 @@ FEATURE_COLUMNS = [
 # batches to avoid unbounded memory growth.
 WINDOW_BATCH_ROWS = 500_000
 
-# HMOG attacker selection policy (ranked by subject directory name ascending):
-# - val:  rank 1-10
-# - test: rank 11-20
-HMOG_VAL_RANK_RANGE = (1, 10)
-HMOG_TEST_RANK_RANGE = (11, 20)
-
 # HMOG attacker session policy:
-# - keep only session 1-6 for each selected attacker subject.
-HMOG_ATTACKER_SESSION_RANGE = (1, 6)
+# - keep session 1-24 for each selected attacker subject.
+HMOG_ATTACKER_SESSION_START = 1
 _HMOG_SESSION_INDEX_RE = re.compile(r"(?:^|_session_)(\d+)$")
 
 
@@ -69,10 +64,17 @@ class ProcessingConfig:
     window_overlap: float
     min_total_bytes: int
     target_total_bytes: int
+    train_ratio: float
+    val_ratio: float
+    test_ratio: float
     workers: int
     window_workers: int
+    process_user_workers: int
     hmog_val_subject_count: int
     hmog_test_subject_count: int
+    hmog_min_subject_count: int
+    hmog_session_count: int
+    hmog_balance_ratio: float
     hmog_max_rows_per_subject: Optional[int]
     hmog_max_rows_total: Optional[int]
     acc_unit: str = "m/s^2"
@@ -144,6 +146,15 @@ def build_config() -> ProcessingConfig:
     hmog_test_subject_count = _positive_int(
         int(os.environ.get("PROCESSING_HMOG_TEST_SUBJECT_COUNT", ca_cfg.processing.hmog_test_subject_count))
     )
+    hmog_min_subject_count = _positive_int(
+        int(os.environ.get("PROCESSING_HMOG_MIN_SUBJECT_COUNT", ca_cfg.processing.hmog_min_subject_count))
+    )
+    hmog_session_count = max(1, int(os.environ.get("PROCESSING_HMOG_SESSION_COUNT", ca_cfg.processing.hmog_session_count)))
+    hmog_balance_ratio = float(os.environ.get("PROCESSING_HMOG_BALANCE_RATIO", ca_cfg.processing.hmog_balance_ratio))
+    process_user_workers = min(
+        max(1, int(os.environ.get("PROCESSING_USER_WORKERS", ca_cfg.processing.process_user_workers))),
+        cpu_count,
+    )
     return ProcessingConfig(
         raw_root=raw_root,
         processed_root=processed_root,
@@ -155,10 +166,17 @@ def build_config() -> ProcessingConfig:
         window_overlap=float(ca_cfg.windows.overlap),
         min_total_bytes=to_bytes(min_total_mb),
         target_total_bytes=to_bytes(target_total_mb),
+        train_ratio=float(ca_cfg.processing.train_ratio),
+        val_ratio=float(ca_cfg.processing.val_ratio),
+        test_ratio=float(ca_cfg.processing.test_ratio),
         workers=workers,
         window_workers=workers,
+        process_user_workers=process_user_workers,
         hmog_val_subject_count=hmog_val_subject_count,
         hmog_test_subject_count=hmog_test_subject_count,
+        hmog_min_subject_count=hmog_min_subject_count,
+        hmog_session_count=hmog_session_count,
+        hmog_balance_ratio=hmog_balance_ratio,
         hmog_max_rows_per_subject=hmog_max_rows_per_subject,
         hmog_max_rows_total=hmog_max_rows_total,
         acc_unit=getattr(settings, "hmog_acc_unit", "m/s^2"),
@@ -406,7 +424,7 @@ def _assemble_user_dataframe(user_id: str, session_files: Sequence[Path], cfg: P
     return combined
 
 
-def _split_by_ratio(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+def _split_by_ratio(df: pd.DataFrame, cfg: Optional[ProcessingConfig] = None) -> Dict[str, pd.DataFrame]:
     """Split a user's time-series into train/val/test by time length.
 
     Requirement: split by the user's total time length (≈ row count after 100Hz
@@ -430,8 +448,17 @@ def _split_by_ratio(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         empty = df.iloc[0:0].copy()
         return {"train": df.reset_index(drop=True), "val": empty, "test": empty}
 
-    train_end = int(total * 0.75)
-    val_end = int(total * 0.875)  # 75% + 12.5%
+    train_ratio = 0.75 if cfg is None else float(cfg.train_ratio)
+    val_ratio = 0.125 if cfg is None else float(cfg.val_ratio)
+    test_ratio = 0.125 if cfg is None else float(cfg.test_ratio)
+    ratio_sum = train_ratio + val_ratio + test_ratio
+    if ratio_sum <= 0:
+        raise ValueError("train/val/test ratios must sum to a positive value")
+    train_ratio /= ratio_sum
+    val_ratio /= ratio_sum
+
+    train_end = int(total * train_ratio)
+    val_end = int(total * (train_ratio + val_ratio))
 
     # Ensure each split has at least one row when possible.
     train_end = max(1, min(train_end, total - 2))
@@ -489,73 +516,169 @@ def _filter_hmog_sessions(df: pd.DataFrame, *, session_range: Optional[Tuple[int
     return df.loc[keep].copy()
 
 
+def _empty_hmog_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=["subject", "session", "timestamp"] + FEATURE_COLUMNS)
+
+
+def _load_hmog_subject(
+    subject_id: str,
+    cfg: ProcessingConfig,
+    *,
+    session_range: Optional[Tuple[int, int]],
+    row_limit: Optional[int],
+) -> pd.DataFrame:
+    subject_dir = cfg.hmog_root / str(subject_id)
+    if not subject_dir.exists():
+        return _empty_hmog_frame()
+
+    frames: List[pd.DataFrame] = []
+    rows = 0
+    chunk_size = 200_000
+    for split in ("train", "val", "test"):
+        if row_limit is not None and rows >= int(row_limit):
+            break
+        path = subject_dir / f"{subject_id}_{split}.csv"
+        if not path.exists():
+            continue
+        try:
+            for chunk in pd.read_csv(path, chunksize=chunk_size):
+                df = _coerce_hmog_schema(chunk)
+                df = _convert_units(df, cfg)
+                df = _filter_hmog_sessions(df, session_range=session_range)
+                if df.empty:
+                    continue
+                if row_limit is not None:
+                    remain = max(int(row_limit) - rows, 0)
+                    if remain <= 0:
+                        break
+                    df = df.iloc[:remain].copy()
+                frames.append(df)
+                rows += int(len(df))
+                if row_limit is not None and rows >= int(row_limit):
+                    break
+        except Exception as exc:
+            logger.warning("Skip HMOG %s (%s): %s", subject_id, path.name, exc)
+            continue
+
+    if not frames:
+        return _empty_hmog_frame()
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.sort_values(["subject", "session", "timestamp"]).reset_index(drop=True)
+    return out
+
+
+def _balanced_hmog_concat(
+    subject_ids: Sequence[str],
+    frames_by_subject: Dict[str, pd.DataFrame],
+    *,
+    target_rows: Optional[int],
+) -> pd.DataFrame:
+    if target_rows is None:
+        frames = [frames_by_subject[sid] for sid in subject_ids if not frames_by_subject.get(sid, _empty_hmog_frame()).empty]
+        if not frames:
+            return _empty_hmog_frame()
+        return pd.concat(frames, ignore_index=True)
+
+    target = max(0, int(target_rows))
+    if target <= 0:
+        return _empty_hmog_frame()
+    subjects = [str(sid) for sid in subject_ids if not frames_by_subject.get(str(sid), _empty_hmog_frame()).empty]
+    if not subjects:
+        return _empty_hmog_frame()
+
+    base = target // len(subjects)
+    remainder = target % len(subjects)
+    selected: List[pd.DataFrame] = []
+    consumed: Dict[str, int] = {}
+
+    for idx, sid in enumerate(subjects):
+        quota = base + (1 if idx < remainder else 0)
+        quota = max(1, int(quota)) if target >= len(subjects) else int(quota)
+        df = frames_by_subject[sid]
+        take = min(int(quota), len(df))
+        consumed[sid] = take
+        if take > 0:
+            selected.append(df.iloc[:take].copy())
+
+    selected_rows = sum(len(df) for df in selected)
+    remaining = target - selected_rows
+    if remaining > 0:
+        for sid in subjects:
+            if remaining <= 0:
+                break
+            df = frames_by_subject[sid]
+            start = int(consumed.get(sid, 0))
+            if start >= len(df):
+                continue
+            take = min(remaining, len(df) - start)
+            selected.append(df.iloc[start : start + take].copy())
+            remaining -= take
+
+    if not selected:
+        return _empty_hmog_frame()
+    return pd.concat(selected, ignore_index=True).sort_values(["subject", "session", "timestamp"]).reset_index(drop=True)
+
+
 def _load_hmog_attackers(
     subject_ids: Sequence[str],
     cfg: ProcessingConfig,
     *,
     session_range: Optional[Tuple[int, int]] = None,
+    target_rows: Optional[int] = None,
 ) -> pd.DataFrame:
-    frames: List[pd.DataFrame] = []
-    total_rows = 0
-    max_total = cfg.hmog_max_rows_total
-    max_per_subject = cfg.hmog_max_rows_per_subject
-    for subject_id in subject_ids:
-        if max_total is not None and total_rows >= max_total:
-            break
-        subject_dir = cfg.hmog_root / subject_id
-        if not subject_dir.exists():
-            continue
-        subject_rows = 0
-        for split in ("train", "val", "test"):
-            if max_total is not None and total_rows >= max_total:
-                break
-            if max_per_subject is not None and subject_rows >= max_per_subject:
-                break
-            path = subject_dir / f"{subject_id}_{split}.csv"
-            if not path.exists():
-                continue
-            try:
-                nrows: Optional[int] = None
-                if session_range is None:
-                    if max_per_subject is not None:
-                        nrows = max(int(max_per_subject - subject_rows), 0)
-                    if max_total is not None:
-                        remaining_total = max(int(max_total - total_rows), 0)
-                        nrows = remaining_total if nrows is None else min(nrows, remaining_total)
-                    if nrows is not None and nrows <= 0:
-                        continue
-                df = pd.read_csv(path, nrows=nrows)
-                df = _coerce_hmog_schema(df)
-                df = _convert_units(df, cfg)
-                df = _filter_hmog_sessions(df, session_range=session_range)
-                if df.empty:
-                    continue
+    subject_ids = [str(s) for s in subject_ids]
+    if not subject_ids:
+        return _empty_hmog_frame()
 
-                if max_per_subject is not None:
-                    remain_subject = max(int(max_per_subject - subject_rows), 0)
-                    if remain_subject <= 0:
-                        continue
-                    df = df.iloc[:remain_subject].copy()
-                if max_total is not None:
-                    remain_total = max(int(max_total - total_rows), 0)
-                    if remain_total <= 0:
-                        continue
-                    df = df.iloc[:remain_total].copy()
-                if df.empty:
-                    continue
+    effective_target: Optional[int] = None
+    if target_rows is not None:
+        effective_target = max(0, int(round(float(target_rows) * float(cfg.hmog_balance_ratio))))
+    if cfg.hmog_max_rows_total is not None:
+        effective_target = (
+            min(int(effective_target), int(cfg.hmog_max_rows_total))
+            if effective_target is not None
+            else int(cfg.hmog_max_rows_total)
+        )
 
-                frames.append(df)
-                subject_rows += int(len(df))
-                total_rows += int(len(df))
-            except Exception as exc:
-                logger.warning("Skip HMOG %s (%s): %s", subject_id, path.name, exc)
-                continue
+    per_subject_limit: Optional[int] = cfg.hmog_max_rows_per_subject
+    if effective_target is not None and subject_ids:
+        balanced_limit = int(np.ceil(max(int(effective_target), 1) / max(len(subject_ids), 1))) + 1
+        per_subject_limit = balanced_limit if per_subject_limit is None else min(int(per_subject_limit), balanced_limit)
 
-    if not frames:
-        return pd.DataFrame(columns=["subject", "session", "timestamp"] + FEATURE_COLUMNS)
+    max_workers = min(max(1, int(cfg.workers)), len(subject_ids))
+    frames_by_subject: Dict[str, pd.DataFrame] = {}
+    if max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    _load_hmog_subject,
+                    subject_id,
+                    cfg,
+                    session_range=session_range,
+                    row_limit=per_subject_limit,
+                ): subject_id
+                for subject_id in subject_ids
+            }
+            for future in as_completed(future_map):
+                subject_id = future_map[future]
+                try:
+                    frames_by_subject[subject_id] = future.result()
+                except Exception as exc:
+                    logger.warning("Skip HMOG subject=%s: %s", subject_id, exc)
+                    frames_by_subject[subject_id] = _empty_hmog_frame()
+    else:
+        for subject_id in subject_ids:
+            frames_by_subject[subject_id] = _load_hmog_subject(
+                subject_id,
+                cfg,
+                session_range=session_range,
+                row_limit=per_subject_limit,
+            )
 
-    attackers = pd.concat(frames, ignore_index=True)
-    attackers = attackers.sort_values(["subject", "session", "timestamp"])
+    attackers = _balanced_hmog_concat(subject_ids, frames_by_subject, target_rows=effective_target)
+    if attackers.empty:
+        return _empty_hmog_frame()
     return attackers
 
 
@@ -847,18 +970,36 @@ def _slice_hmog_subjects_by_rank(hmog_subjects: Sequence[str], rank_range: Tuple
 
 
 def _select_hmog_attacker_ids(hmog_subjects: Sequence[str]) -> Tuple[List[str], List[str]]:
-    val_ids = _slice_hmog_subjects_by_rank(hmog_subjects, HMOG_VAL_RANK_RANGE)
-    test_ids = _slice_hmog_subjects_by_rank(hmog_subjects, HMOG_TEST_RANK_RANGE)
+    val_ids = _slice_hmog_subjects_by_rank(hmog_subjects, (1, 10))
+    test_ids = list(hmog_subjects[-10:])
     return val_ids, test_ids
 
 
-def _ensure_hmog_sessions_covered(
+def _hmog_session_range(cfg: ProcessingConfig) -> Tuple[int, int]:
+    return (HMOG_ATTACKER_SESSION_START, int(cfg.hmog_session_count))
+
+
+def _select_hmog_attacker_ids_for_config(hmog_subjects: Sequence[str], cfg: ProcessingConfig) -> Tuple[List[str], List[str]]:
+    """Select HMOG attackers using the configured front/back subject policy."""
+    subjects = [str(s) for s in hmog_subjects]
+    val_count = max(int(cfg.hmog_val_subject_count), int(cfg.hmog_min_subject_count))
+    test_count = max(int(cfg.hmog_test_subject_count), int(cfg.hmog_min_subject_count))
+    val_ids = list(subjects[:val_count])
+    test_ids = list(subjects[-test_count:]) if test_count > 0 else []
+    return val_ids, test_ids
+
+
+def _log_hmog_session_coverage(
     attackers_df: pd.DataFrame,
     *,
     split_name: str,
     subject_ids: Sequence[str],
     session_range: Tuple[int, int],
 ) -> None:
+    """Log HMOG source session coverage without rejecting balanced/truncated data."""
+    if attackers_df.empty:
+        logger.warning("HMOG %s attackers are empty; expected subjects=%s", split_name, list(subject_ids))
+        return
     start, end = int(session_range[0]), int(session_range[1])
     expected = set(range(start, end + 1))
     subjects = attackers_df["subject"].astype(str)
@@ -866,13 +1007,18 @@ def _ensure_hmog_sessions_covered(
     for subject_id in subject_ids:
         mask = subjects == str(subject_id)
         if not bool(mask.any()):
-            raise ValueError(f"Missing HMOG attacker subject={subject_id} in {split_name} split.")
+            logger.warning("Missing HMOG attacker subject=%s in %s split.", subject_id, split_name)
+            continue
         present = {int(x) for x in session_idx[mask].dropna().tolist()}
         missing = sorted(expected - present)
         if missing:
-            raise ValueError(
-                f"HMOG attacker subject={subject_id} in {split_name} split missing required sessions {missing} "
-                f"(required={start}-{end})."
+            logger.info(
+                "HMOG attacker subject=%s in %s split uses %d/%d configured sessions; missing=%s",
+                subject_id,
+                split_name,
+                len(present),
+                len(expected),
+                missing,
             )
 
 
@@ -893,37 +1039,56 @@ def process_user(user_id: str, cfg: Optional[ProcessingConfig] = None) -> None:
         logger.warning("No processed data for user %s", user_id)
         return
 
-    splits = _split_by_ratio(user_df)
+    splits = _split_by_ratio(user_df, cfg)
     if splits["train"].empty:
         logger.warning("User %s training split is empty, skipping", user_id)
         return
 
     hmog_subjects = _list_hmog_subjects(cfg)
-    attacker_val_ids, attacker_test_ids = _select_hmog_attacker_ids(hmog_subjects)
-    required_max_rank = max(HMOG_VAL_RANK_RANGE[1], HMOG_TEST_RANK_RANGE[1])
-    if len(hmog_subjects) < required_max_rank:
+    attacker_val_ids, attacker_test_ids = _select_hmog_attacker_ids_for_config(hmog_subjects, cfg)
+    required_subjects = max(
+        max(int(cfg.hmog_val_subject_count), int(cfg.hmog_min_subject_count)),
+        max(int(cfg.hmog_test_subject_count), int(cfg.hmog_min_subject_count)),
+    )
+    if len(hmog_subjects) < required_subjects:
         logger.warning(
-            "HMOG subject dirs=%d < required rank %d; val_ids=%s test_ids=%s",
+            "HMOG subject dirs=%d < configured minimum %d; val_ids=%s test_ids=%s",
             len(hmog_subjects),
-            required_max_rank,
+            required_subjects,
             attacker_val_ids,
             attacker_test_ids,
         )
-    val_attackers = _load_hmog_attackers(attacker_val_ids, cfg, session_range=HMOG_ATTACKER_SESSION_RANGE)
-    test_attackers = _load_hmog_attackers(attacker_test_ids, cfg, session_range=HMOG_ATTACKER_SESSION_RANGE)
-    logger.info(
-        "Loaded HMOG attackers (selected: val_rank=%s ids=%s; test_rank=%s ids=%s; session_range=%s; caps: per_subject=%s rows, total=%s rows): val=%d rows (%d subjects), test=%d rows (%d subjects)",
-        HMOG_VAL_RANK_RANGE,
+    hmog_session_range = _hmog_session_range(cfg)
+    val_real_rows = int(len(splits["val"]))
+    test_real_rows = int(len(splits["test"]))
+    val_attackers = _load_hmog_attackers(
         attacker_val_ids,
-        HMOG_TEST_RANK_RANGE,
+        cfg,
+        session_range=hmog_session_range,
+        target_rows=val_real_rows,
+    )
+    test_attackers = _load_hmog_attackers(
         attacker_test_ids,
-        HMOG_ATTACKER_SESSION_RANGE,
+        cfg,
+        session_range=hmog_session_range,
+        target_rows=test_real_rows,
+    )
+    logger.info(
+        "Loaded HMOG attackers (selected: val_front_count=%d ids=%s; test_back_count=%d ids=%s; session_range=%s; balance_ratio=%.3f; caps: per_subject=%s rows, total=%s rows): val real/hmog=%d/%d ratio=%.3f, test real/hmog=%d/%d ratio=%.3f",
+        len(attacker_val_ids),
+        attacker_val_ids,
+        len(attacker_test_ids),
+        attacker_test_ids,
+        hmog_session_range,
+        float(cfg.hmog_balance_ratio),
         "unlimited" if cfg.hmog_max_rows_per_subject is None else int(cfg.hmog_max_rows_per_subject),
         "unlimited" if cfg.hmog_max_rows_total is None else int(cfg.hmog_max_rows_total),
+        val_real_rows,
         len(val_attackers),
-        len(attacker_val_ids),
+        (len(val_attackers) / val_real_rows) if val_real_rows > 0 else 0.0,
+        test_real_rows,
         len(test_attackers),
-        len(attacker_test_ids),
+        (len(test_attackers) / test_real_rows) if test_real_rows > 0 else 0.0,
     )
 
     if attacker_val_ids and val_attackers.empty:
@@ -935,18 +1100,18 @@ def process_user(user_id: str, cfg: Optional[ProcessingConfig] = None) -> None:
             f"No HMOG attacker rows loaded for test split (hmog_root={cfg.hmog_root}, test_ids={attacker_test_ids})."
         )
     if not val_attackers.empty:
-        _ensure_hmog_sessions_covered(
+        _log_hmog_session_coverage(
             val_attackers,
             split_name="val",
             subject_ids=attacker_val_ids,
-            session_range=HMOG_ATTACKER_SESSION_RANGE,
+            session_range=hmog_session_range,
         )
     if not test_attackers.empty:
-        _ensure_hmog_sessions_covered(
+        _log_hmog_session_coverage(
             test_attackers,
             split_name="test",
             subject_ids=attacker_test_ids,
-            session_range=HMOG_ATTACKER_SESSION_RANGE,
+            session_range=hmog_session_range,
         )
 
     splits["val"] = pd.concat([splits["val"], val_attackers], ignore_index=True)
@@ -971,8 +1136,44 @@ def process_all_users(cfg: Optional[ProcessingConfig] = None) -> None:
     if not cfg.raw_root.exists():
         logger.warning("Raw data root %s does not exist", cfg.raw_root)
         return
-    for user_dir in sorted([p for p in cfg.raw_root.iterdir() if p.is_dir()]):
-        process_user(user_dir.name, cfg)
+    user_ids = [p.name for p in sorted([p for p in cfg.raw_root.iterdir() if p.is_dir()])]
+    if not user_ids:
+        logger.info("No user directories found under %s", cfg.raw_root)
+        return
+
+    max_workers = min(max(1, int(cfg.process_user_workers)), len(user_ids))
+    if max_workers <= 1:
+        for user_id in user_ids:
+            process_user(user_id, cfg)
+        return
+
+    child_cfg = replace(
+        cfg,
+        workers=max(1, int(cfg.workers) // max_workers),
+        window_workers=max(1, int(cfg.window_workers) // max_workers),
+    )
+    logger.info(
+        "Processing %d users with %d processes (child workers=%d, window_workers=%d)",
+        len(user_ids),
+        max_workers,
+        child_cfg.workers,
+        child_cfg.window_workers,
+    )
+
+    failures: Dict[str, str] = {}
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(process_user, user_id, child_cfg): user_id for user_id in user_ids}
+        for future in as_completed(future_map):
+            user_id = future_map[future]
+            try:
+                future.result()
+            except Exception as exc:
+                logger.exception("Processing failed for user %s", user_id)
+                failures[user_id] = str(exc)
+
+    if failures:
+        details = "; ".join(f"{user_id}: {error}" for user_id, error in failures.items())
+        raise RuntimeError(f"Failed to process {len(failures)} user(s): {details}")
 
 
 def _list_hmog_subjects(cfg: ProcessingConfig) -> List[str]:

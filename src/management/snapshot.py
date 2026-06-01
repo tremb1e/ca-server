@@ -231,13 +231,17 @@ def model_info(device_id: str) -> Dict[str, Any]:
             "overlap": float(cfg.overlap),
             "threshold": float(cfg.threshold),
             "interrupt_rule": str(cfg.interrupt_rule),
+            "decision_strategy": str(cfg.decision_strategy),
             "k_rejects": int(cfg.k_rejects),
             "vote_window_size": int(cfg.vote_window_size),
             "vote_min_rejects": int(cfg.vote_min_rejects),
+            "ema_alpha": float(cfg.ema_alpha),
             "model_version": str(cfg.model_version or cfg.vqgan_checkpoint.name),
             "vqgan_checkpoint": str(cfg.vqgan_checkpoint),
             "vqgan_config": str(cfg.vqgan_config),
         }
+        scaler_path = Path(settings.processed_data_path) / "z-score" / device_id / "scaler.json"
+        files["scaler"] = _file_info(scaler_path)
         raw_policy = _safe_json(policy_path, {})
         raw_user_policy = raw_policy.get(device_id, {}) if isinstance(raw_policy, dict) else {}
         if isinstance(raw_user_policy, dict) and raw_user_policy.get("lm_checkpoint"):
@@ -264,7 +268,16 @@ def model_info(device_id: str) -> Dict[str, Any]:
         },
     }
 
-    ready = bool(policy_payload and files.get("vqgan_checkpoint", {}).get("exists") and files.get("vqgan_config", {}).get("exists"))
+    model_cfg = _safe_json(Path(str((policy_payload or {}).get("vqgan_config", ""))), {}) if policy_payload else {}
+    scaler_payload = _safe_json(Path(settings.processed_data_path) / "z-score" / device_id / "scaler.json", None)
+    ready = bool(
+        policy_payload
+        and files.get("vqgan_checkpoint", {}).get("exists")
+        and files.get("vqgan_config", {}).get("exists")
+        and files.get("scaler", {}).get("exists")
+        and scaler_payload is not None
+        and int(model_cfg.get("input_height", 9) if isinstance(model_cfg, dict) else 0) == 9
+    )
     return {
         "device_id_hash": str(device_id),
         "ready": ready,

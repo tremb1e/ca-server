@@ -97,6 +97,25 @@ class TrainingManager:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._last_checked: dict[str, float] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self._device_cursor = 0
+
+    def _pick_training_device(self) -> str:
+        ca_cfg = get_ca_config()
+        training_cfg = getattr(ca_cfg, "training", None)
+        configured = str(getattr(training_cfg, "device", "auto") or "auto")
+        max_devices = int(getattr(training_cfg, "max_parallel_train", 0) or 0)
+        try:
+            from ..utils.accelerator import device_pool
+
+            pool = device_pool(configured, max_devices=max_devices)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unable to build training device pool from %s: %s", configured, exc)
+            pool = ["cpu"]
+        if not pool:
+            pool = ["cpu"]
+        chosen = str(pool[self._device_cursor % len(pool)])
+        self._device_cursor += 1
+        return chosen
 
     def snapshot_tasks(self) -> dict:
         tasks = []
@@ -171,8 +190,10 @@ class TrainingManager:
                 from .runner import run_window_sweep_for_user
 
                 proc_cfg = build_config()
+                train_device = self._pick_training_device()
+                logger.info("Training device selected: user=%s device=%s", user_id, train_device)
                 await asyncio.to_thread(process_user, user_id, proc_cfg)
-                await asyncio.to_thread(run_window_sweep_for_user, user_id)
+                await asyncio.to_thread(run_window_sweep_for_user, user_id, device=train_device)
                 state.status = "completed"
                 state.last_trained_bytes = int(raw_total)
                 state.updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

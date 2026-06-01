@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Window sizes (sec) to train. Defaults to ca_config.toml [windows].sizes.",
     )
-    parser.add_argument("--vqgan-epochs", type=int, default=10, help="Epochs to train the VQGAN model.")
+    parser.add_argument("--vqgan-epochs", type=int, default=50, help="Epochs to train the VQGAN model.")
     parser.add_argument("--batch-size", type=int, default=None, help="Optional override for CA-train --batch-size.")
     parser.add_argument("--max-train-per-user", type=int, default=None, help="Optional cap for --max-train-per-user (CPU smoke tests).")
     parser.add_argument("--max-negative-per-split", type=int, default=None, help="Optional override for --max-negative-per-split.")

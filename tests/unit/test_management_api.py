@@ -48,7 +48,7 @@ def _seed_device(tmp_path, monkeypatch, device_id: str = "device123") -> str:
     ckpt.parent.mkdir(parents=True, exist_ok=True)
     ckpt.write_bytes(b"model-bytes")
     cfg.write_text(
-        json.dumps({"base_channels": 96, "latent_dim": 256, "input_height": 12, "input_width": 20}),
+        json.dumps({"base_channels": 96, "latent_dim": 256, "input_height": 9, "input_width": 20}),
         encoding="utf-8",
     )
     (user_dir / "best_lock_policy.json").write_text(
@@ -136,6 +136,18 @@ def test_management_models_and_auth_results(tmp_path, monkeypatch) -> None:
     results = client.get(f"/api/v1/management/devices/{device_id}/auth/results?limit=1", headers=headers).json()
     assert results["total"] == 1
     assert results["results"][0]["window_id"] == 2
+
+
+def test_management_model_not_ready_without_scaler(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    device_id = _seed_device(tmp_path, monkeypatch)
+    (settings.processed_data_path / "z-score" / device_id / "scaler.json").unlink()
+
+    headers = {"X-Management-API-Key": "secret-token"}
+    model = client.get(f"/api/v1/management/devices/{device_id}/models", headers=headers).json()
+
+    assert model["ready"] is False
+    assert model["files"]["scaler"]["exists"] is False
 
 
 def test_management_openapi_has_api_key_scheme(tmp_path, monkeypatch) -> None:

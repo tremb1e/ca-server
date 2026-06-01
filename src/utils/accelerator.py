@@ -136,7 +136,54 @@ def normalize_device(device: Optional[str]) -> str:
 
 def resolve_torch_device(device: Optional[str]) -> torch.device:
     normalized = normalize_device(device)
-    return torch.device(normalized)
+    torch_device = torch.device(normalized)
+    set_current_device(torch_device)
+    return torch_device
+
+
+def set_current_device(device: torch.device) -> None:
+    if device.type == "npu":
+        try_import_torch_npu()
+        npu_mod = getattr(torch, "npu", None)
+        if npu_mod is not None and hasattr(npu_mod, "set_device"):
+            npu_mod.set_device(device)
+    elif device.type == "cuda":
+        torch.cuda.set_device(device)
+
+
+def device_count(backend: str) -> int:
+    kind = str(backend or "").strip().lower()
+    if kind == "npu":
+        if not _npu_available():
+            return 0
+        npu_mod = getattr(torch, "npu", None)
+        count_fn = getattr(npu_mod, "device_count", None) if npu_mod is not None else None
+        return int(count_fn()) if callable(count_fn) else 0
+    if kind == "cuda":
+        if not _cuda_available():
+            return 0
+        return int(torch.cuda.device_count())
+    return 0
+
+
+def device_pool(device: Optional[str], *, max_devices: Optional[int] = None) -> list[str]:
+    text = str(device or "auto").strip().lower()
+    kind, idx = _parse_device_spec(device)
+    if kind == "cpu":
+        return ["cpu"]
+    if kind in {"npu", "cuda"} and idx is not None and ":" in text:
+        normalized = normalize_device(f"{kind}:{idx}")
+        return [normalized]
+
+    normalized = normalize_device(device)
+    if normalized == "cpu":
+        return ["cpu"]
+    backend = normalized.split(":", 1)[0]
+    count = device_count(backend)
+    if count <= 0:
+        return [normalized]
+    limit = count if max_devices is None or int(max_devices) <= 0 else min(count, int(max_devices))
+    return [f"{backend}:{i}" for i in range(int(limit))]
 
 
 @contextlib.contextmanager

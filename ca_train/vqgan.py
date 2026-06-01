@@ -12,7 +12,7 @@ class VQGAN(nn.Module):
         # so CPU fallback / multi-GPU setups work reliably.
         self.encoder = Encoder(args)
         #self.encoder = torch.nn.DataParallel(self.encoder, device_ids=[0,1])
-        #print("the layer is:", summary(self.encoder, (1,12,50)))
+        #print("the layer is:", summary(self.encoder, (1,9,50)))
         #exit(-1)
         
         self.decoder = Decoder(args)

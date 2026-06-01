@@ -80,3 +80,37 @@ def test_prompt_vote_min_rejects_ranges_match_spec() -> None:
     assert PROMPT_VOTE_MIN_REJECTS_RANGE_BY_N[10] == (6, 8)
     assert PROMPT_VOTE_MIN_REJECTS_RANGE_BY_N[16] == (9, 13)
     assert PROMPT_VOTE_MIN_REJECTS_RANGE_BY_N[20] == (11, 16)
+
+
+def test_ema_scores_reset_per_session() -> None:
+    from src.policy_search.runner import _ema_scores_by_session
+
+    session_ids = np.array([0, 0, 0, 1, 1], dtype=np.int32)
+    scores = np.array([1.0, 0.0, 0.0, 10.0, 0.0], dtype=np.float32)
+
+    ema = _ema_scores_by_session(session_ids, scores, alpha=0.5)
+
+    assert np.allclose(ema, np.array([1.0, 0.5, 0.25, 10.0, 5.0], dtype=np.float32))
+
+
+def test_ema_threshold_selection_respects_target_frr() -> None:
+    from src.policy_search.runner import (
+        _compute_ema_window_metrics_from_arrays,
+        _select_threshold_by_ema_window_frr_from_arrays,
+    )
+
+    session_ids = np.array([0, 0, 1, 1], dtype=np.int32)
+    labels = np.array([1, 1, 0, 0], dtype=np.int8)
+    scores = np.array([0.9, 0.8, 0.2, 0.1], dtype=np.float32)
+
+    threshold, metrics = _select_threshold_by_ema_window_frr_from_arrays(
+        session_ids,
+        labels,
+        scores,
+        target_window_frr=0.0,
+    )
+    checked = _compute_ema_window_metrics_from_arrays(session_ids, labels, scores, threshold=threshold)
+
+    assert metrics["frr"] == 0.0
+    assert checked["frr"] == 0.0
+    assert threshold <= 0.800001

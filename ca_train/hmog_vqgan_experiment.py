@@ -236,6 +236,9 @@ def save_text_log(text_path: Path, payload: Dict) -> None:
         f"\tthreshold={payload.get('metrics',{}).get('threshold',0):.6f}"
         f"\tpos_err_mean={payload.get('metrics',{}).get('pos_error_mean',0):.6f}"
         f"\tneg_err_mean={payload.get('metrics',{}).get('neg_error_mean',0):.6f}"
+        f"\tloss={float(payload.get('loss', 0) or 0):.6f}"
+        f"\trec_loss={float(payload.get('rec_loss', 0) or 0):.6f}"
+        f"\tq_loss={float(payload.get('q_loss', 0) or 0):.6f}"
         f"\tlatency={payload.get('latency',0):.6f}"
     )
     with text_path.open("a") as f:
@@ -386,7 +389,7 @@ def train_single_window(
         args.input_height = int(train_x.shape[2])
         args.input_width = int(train_x.shape[3])
     else:
-        args.input_height = 12
+        args.input_height = 9
         args.input_width = int(args.target_width) if args.target_width > 0 else int(round(window_size * 100))
 
     # VQGAN blocks read `use_nonlocal`; CLI exposes `--no-nonlocal` for convenience.
@@ -404,10 +407,20 @@ def train_single_window(
         weight_decay=float(getattr(args, "weight_decay", 0.0) or 0.0),
     )
     scaler = make_grad_scaler(device, enabled=bool(args.use_amp))
+    early_stop_patience = int(getattr(args, "early_stop_patience", 3) or 0)
+    best_auc = float("-inf")
+    best_epoch = 0
+    best_state: Optional[Dict[str, torch.Tensor]] = None
+    no_improve = 0
+    trained_epochs = 0
 
     for epoch in range(epochs):
         model.train()
         pbar = tqdm(train_loader, desc=f"User {user_id} | ws {window_size:.1f} | epoch {epoch+1}/{epochs}")
+        loss_sum = 0.0
+        rec_sum = 0.0
+        q_sum = 0.0
+        batch_count = 0
         for batch, _ in pbar:
             optimizer.zero_grad(set_to_none=True)
             loss, rec_loss, q_loss = reconstruction_step(
@@ -425,13 +438,43 @@ def train_single_window(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip_norm))
             scaler.step(optimizer)
             scaler.update()
+            batch_count += 1
+            loss_sum += float(loss.detach().item())
+            rec_sum += float(rec_loss.detach().item())
+            q_sum += float(q_loss.detach().item())
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
                 rec=f"{rec_loss.item():.4f}",
                 q=f"{q_loss.item():.4f}",
             )
+        trained_epochs = int(epoch + 1)
 
-        if (epoch + 1) % args.val_interval == 0:
+        train_payload = {
+            "stage": "train",
+            "user": user_id,
+            "window": window_size,
+            "epoch": epoch + 1,
+            "loss": loss_sum / max(batch_count, 1),
+            "rec_loss": rec_sum / max(batch_count, 1),
+            "q_loss": q_sum / max(batch_count, 1),
+            "batches": batch_count,
+        }
+        save_jsonl(json_log_path, train_payload)
+        save_text_log(text_log_path, train_payload)
+        logging.info(
+            "[TRAIN] user=%s ws=%.1f epoch=%d/%d loss=%.6f rec=%.6f q=%.6f batches=%d",
+            user_id,
+            window_size,
+            epoch + 1,
+            epochs,
+            train_payload["loss"],
+            train_payload["rec_loss"],
+            train_payload["q_loss"],
+            batch_count,
+        )
+
+        should_validate = (epoch + 1) % args.val_interval == 0 or early_stop_patience > 0
+        if should_validate:
             val_metrics, val_latency = evaluate_model(
                 model, val_loader, device, args.use_amp, score_metric=args.score_metric
             )
@@ -446,6 +489,39 @@ def train_single_window(
             save_jsonl(json_log_path, payload)
             save_text_log(text_log_path, payload)
             logging.info(f"[VAL] user={user_id} ws={window_size:.1f} epoch={epoch+1} metrics={val_metrics} latency={val_latency:.6f}")
+            if early_stop_patience > 0:
+                auc = float(val_metrics.get("auc", 0.0) or 0.0)
+                if auc > best_auc + 1e-6:
+                    best_auc = auc
+                    best_epoch = int(epoch + 1)
+                    model_to_snapshot = model.module if isinstance(model, nn.DataParallel) else model
+                    best_state = {k: v.detach().cpu().clone() for k, v in model_to_snapshot.state_dict().items()}
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                if no_improve >= early_stop_patience:
+                    logging.info(
+                        "[EARLY-STOP] user=%s ws=%.1f stop_epoch=%d best_epoch=%d best_auc=%.6f patience=%d",
+                        user_id,
+                        window_size,
+                        epoch + 1,
+                        best_epoch,
+                        best_auc,
+                        early_stop_patience,
+                    )
+                    break
+
+    if best_state is not None:
+        model_to_restore = model.module if isinstance(model, nn.DataParallel) else model
+        model_to_restore.load_state_dict({k: v.to(device=device) for k, v in best_state.items()})
+        logging.info(
+            "[EARLY-STOP] user=%s ws=%.1f restored best_epoch=%d best_auc=%.6f trained_epochs=%d",
+            user_id,
+            window_size,
+            best_epoch,
+            best_auc,
+            trained_epochs,
+        )
 
     # Final evaluation: fix the decision threshold on val, then report test FAR/FRR at that threshold.
     val_metrics, val_latency = evaluate_model(model, val_loader, device, args.use_amp, score_metric=args.score_metric)
@@ -484,6 +560,9 @@ def train_single_window(
         "val_latency": val_latency,
         "test_latency": test_latency,
         "checkpoint": str(ckpt_path),
+        "trained_epochs": int(trained_epochs),
+        "best_epoch": int(best_epoch or trained_epochs),
+        "early_stop_patience": int(early_stop_patience),
     }
 
 
@@ -763,8 +842,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-noise-std", type=float, default=0.0, help="训练时输入噪声标准差（0 关闭）")
     parser.add_argument("--grad-clip-norm", type=float, default=0.0, help="梯度裁剪阈值（0 关闭）")
     parser.add_argument("--score-metric", choices=["mse", "l1"], default="mse", help="评估打分使用的重建误差类型")
-    parser.add_argument("--sweep-epochs", type=int, default=1)
-    parser.add_argument("--final-epochs", type=int, default=5)
+    parser.add_argument("--sweep-epochs", type=int, default=50)
+    parser.add_argument("--final-epochs", type=int, default=50)
+    parser.add_argument("--early-stop-patience", type=int, default=3, help="验证集 AUC 连续 N 次不提升则早停；0 关闭")
     parser.add_argument("--val-interval", type=int, default=1)
     parser.add_argument("--prep-workers", type=int, default=40, help="窗口生成的进程数，充分利用 CPU")
     parser.add_argument("--sos-token", type=int, default=0)

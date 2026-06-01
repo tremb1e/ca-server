@@ -106,3 +106,35 @@ class VoteRejectTracker:
         self.first_interrupt_window = None
         self._recent.clear()
         self._recent_rejects = 0
+
+
+@dataclass
+class EMAScoreTracker:
+    windows: int = 0
+    interrupts: int = 0
+    first_interrupt_window: Optional[int] = None
+    ema_score: Optional[float] = None
+
+    def update(self, score: float, *, alpha: float, threshold: float, reset_on_interrupt: bool) -> bool:
+        self.windows += 1
+        alpha_f = min(1.0, max(0.0, float(alpha)))
+        score_f = float(score)
+        if self.ema_score is None:
+            self.ema_score = score_f
+        else:
+            self.ema_score = alpha_f * score_f + (1.0 - alpha_f) * float(self.ema_score)
+
+        interrupted = bool(float(self.ema_score) < float(threshold))
+        if interrupted:
+            self.interrupts += 1
+            if self.first_interrupt_window is None:
+                self.first_interrupt_window = self.windows
+            if reset_on_interrupt:
+                self.ema_score = None
+        return interrupted
+
+    def reset(self) -> None:
+        self.windows = 0
+        self.interrupts = 0
+        self.first_interrupt_window = None
+        self.ema_score = None

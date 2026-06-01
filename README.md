@@ -125,6 +125,19 @@ docker compose run --rm ca-server policy-search --user <device_id_hash> --device
 docker compose run --rm ca-server auth --user <device_id_hash> --csv-path /app/data_storage/processed_data/window/0.2/<device_id_hash>/test.csv --device cpu
 ```
 
+## 当前认证链路关键参数
+
+主要阈值集中在 `ca_config.toml` 和 `deploy/config/ca_config.toml`：
+
+- 数据触发阈值默认 `300MB`。若记为 `100x`，预处理会按 `train=75x`、`val=12.5x`、`test=12.5x` 动态切分。
+- HMOG 只填充 `val/test`，默认让真实用户与 HMOG 攻击者数据量约为 `1:1`；val 使用排序靠前 HMOG 用户，test 使用排序靠后 HMOG 用户，每侧至少 10 个用户。
+- VQGAN 输入已统一为 `(batch, 1, 9, T)`，不再使用 3 个模长通道；旧 12 轴模型会被就绪检查拒绝，必须重训。
+- 训练默认最多 50 epoch，验证集性能连续 3 次不提升早停；训练完成后默认运行 `policy_search`。
+- `policy_search` 会把用户最终阈值、EMA 参数和投票参数写入 `/app/data_storage/models/<user>/best_lock_policy.json`，线上推理直接消费该文件。
+- 默认认证决策为 `EMA`；原 y-of-x 投票机制仍可通过配置或用户策略选择。
+- 模型就绪检查同时要求 policy、checkpoint、config 和 `processed_data/z-score/<user>/scaler.json` 完整可读。
+- 在 Ascend 910B 8 卡机器上，`device=auto` 会优先使用 NPU，训练管理器会把并行用户任务分配到可见 NPU 设备池。
+
 ## 宿主机目录映射
 
 Compose 保留并补全了以下目录映射：
@@ -177,6 +190,19 @@ grpcurl -plaintext localhost:10500 grpc.health.v1.Health/Check
 ```bash
 docker exec ca-server grpc_health_probe -addr=127.0.0.1:10500
 ```
+
+### OpenResty 443 验收
+
+如果通过 OpenResty 暴露 `https://<domain>:443` 给 Android app，先确认外部证书与 app 配置域名匹配，并且 ALPN 能协商 `h2`：
+
+```bash
+openssl s_client -connect <domain>:443 \
+  -servername <domain> \
+  -verify_hostname <domain> \
+  -alpn h2 -brief </dev/null
+```
+
+通过后再用 TLS gRPC 客户端检查 443；不要用 `-insecure` 作为正式验收条件。后端默认 `10500` 是 h2c，OpenResty 回源应使用 `grpc://127.0.0.1:10500`，详见 `docs/openresty_grpc_proxy.md`。Android app 的公网入口应配置为 `https://ca.macrz.com:443`；80 只返回 301，gRPC 客户端不依赖跳转，当前 app 会把 `https` + 80 归一化为 443。
 
 ### HTTP 健康检查
 

@@ -57,7 +57,7 @@ def _vqgan_config(target_width: int, *, base_channels: int, latent_dim: int, cod
         "num_codebook_vectors": int(codebook_vectors),
         "beta": float(beta),
         "image_channels": 1,
-        "input_height": 12,
+        "input_height": 9,
         "input_width": int(target_width),
         "use_nonlocal": True,
     }
@@ -149,10 +149,12 @@ def _write_vqgan_policy(
         "overlap": float(overlap),
         "target_width": int(target_width),
         "threshold": float(threshold),
-        "interrupt_rule": "k",
+        "interrupt_rule": "ema",
+        "decision_strategy": "ema",
         "k_rejects": int(k_rejects),
         "vote_window_size": 0,
         "vote_min_rejects": 0,
+        "ema_alpha": float(get_ca_config().auth.ema_alpha),
         "auth_method": "vqgan-only",
         "vqgan_checkpoint": serialize_policy_path(vqgan_checkpoint, relative_to=policy_path.parent),
         "vqgan_config": serialize_policy_path(vqgan_config, relative_to=policy_path.parent),
@@ -167,7 +169,7 @@ def run_window_sweep_for_user(
     *,
     device: str = "auto",
     window_sizes: Optional[Sequence[float]] = None,
-    vqgan_epochs: int = 10,
+    vqgan_epochs: Optional[int] = None,
     batch_size: Optional[int] = None,
     max_train_per_user: Optional[int] = None,
     max_negative_per_split: Optional[int] = None,
@@ -192,6 +194,10 @@ def run_window_sweep_for_user(
     window_sizes = list(window_sizes) if window_sizes is not None else list(ca_cfg.windows.sizes)
     if not window_sizes:
         raise ValueError("No window sizes configured.")
+    training_cfg = getattr(ca_cfg, "training", None)
+    if vqgan_epochs is None:
+        vqgan_epochs = int(getattr(training_cfg, "max_epochs", 50))
+    effective_batch_size = int(batch_size) if batch_size is not None else int(getattr(training_cfg, "batch_size", 128))
 
     user_output_dir = models_root / user_id
     user_output_dir.mkdir(parents=True, exist_ok=True)
@@ -239,7 +245,7 @@ def run_window_sweep_for_user(
                 "--device",
                 str(resolved_device),
                 "--batch-size",
-                str(int(batch_size) if batch_size is not None else 128),
+                str(effective_batch_size),
                 "--num-workers",
                 str(int(num_workers)),
                 "--cpu-threads",
@@ -248,6 +254,10 @@ def run_window_sweep_for_user(
                 str(int(vqgan_epochs)),
                 "--final-epochs",
                 str(int(vqgan_epochs)),
+                "--early-stop-patience",
+                str(int(getattr(training_cfg, "early_stop_patience", 3))),
+                "--max-parallel-train",
+                str(int(getattr(training_cfg, "max_parallel_train", 8))),
                 "--output-dir",
                 str(user_output_dir),
                 "--log-dir",
@@ -314,5 +324,22 @@ def run_window_sweep_for_user(
                 summary=summary,
             )
         )
+
+    if bool(getattr(training_cfg, "run_policy_search", True)) and results:
+        try:
+            from ..policy_search.runner import run_policy_grid_search
+
+            run_policy_grid_search(
+                str(user_id),
+                device=str(resolved_device),
+                auth_method=str(getattr(ca_cfg.auth, "policy_search_auth_method", "vqgan-only")),
+                ca_cfg=ca_cfg,
+                dataset_root=dataset_path,
+                models_root=models_root,
+                write_best_policy=True,
+            )
+            logger.info("Policy search completed for user=%s", user_id)
+        except Exception as exc:
+            logger.warning("Policy search failed for user=%s; keeping training fallback policy: %s", user_id, exc)
 
     return results

@@ -32,11 +32,14 @@ class VQGANPolicy:
     overlap: float
     target_width: int
     threshold: float
+    interrupt_rule: str
+    decision_strategy: str
     k_rejects: int
     vqgan_checkpoint: Path
     vqgan_config: Path
     vote_window_size: int = 0
     vote_min_rejects: int = 0
+    ema_alpha: float = 0.25
     model_version: str = ""
 
 
@@ -60,6 +63,8 @@ def load_vqgan(checkpoint: Path, *, device: torch.device, config_path: Path) -> 
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(cfg, dict):
         raise ValueError(f"Unexpected VQGAN config format: {config_path}")
+    if int(cfg.get("input_height", 9)) != 9:
+        raise ValueError(f"VQGAN config {config_path} uses input_height={cfg.get('input_height')}; retrain with 9-axis input.")
     args = argparse.Namespace(**cfg)
     args.use_nonlocal = bool(cfg.get("use_nonlocal", True))
     model = VQGAN(args).to(device)
@@ -102,7 +107,7 @@ def windowize_dataframe(
     target_width: int,
 ) -> Tuple[List[int], np.ndarray]:
     if df.empty:
-        return [], np.empty((0, 1, 12, target_width), dtype=np.float32)
+        return [], np.empty((0, 1, 9, target_width), dtype=np.float32)
 
     window_points = max(1, int(round(window_size_sec * sampling_rate_hz)))
     step_points = max(1, int(round(window_points * (1.0 - float(overlap)))))
@@ -113,28 +118,7 @@ def windowize_dataframe(
     window_id = 0
     for start in range(0, len(values) - window_points + 1, step_points):
         window_slice = values[start : start + window_points]
-        acc = window_slice[:, 0:3]
-        gyr = window_slice[:, 3:6]
-        mag = window_slice[:, 6:9]
-        acc_mag = np.linalg.norm(acc, axis=1)
-        gyr_mag = np.linalg.norm(gyr, axis=1)
-        mag_mag = np.linalg.norm(mag, axis=1)
-        window_raw = np.vstack(
-            [
-                acc[:, 0],
-                acc[:, 1],
-                acc[:, 2],
-                acc_mag,
-                gyr[:, 0],
-                gyr[:, 1],
-                gyr[:, 2],
-                gyr_mag,
-                mag[:, 0],
-                mag[:, 1],
-                mag[:, 2],
-                mag_mag,
-            ]
-        ).astype(np.float32, copy=False)
+        window_raw = window_slice.T.astype(np.float32, copy=True)
         if window_raw.shape[1] != target_width:
             window_raw = _resample_time_axis(window_raw, target_width)
         windows.append(window_raw[np.newaxis, :, :])
@@ -142,6 +126,6 @@ def windowize_dataframe(
         window_id += 1
 
     if not windows:
-        return [], np.empty((0, 1, 12, target_width), dtype=np.float32)
+        return [], np.empty((0, 1, 9, target_width), dtype=np.float32)
 
     return window_ids, np.stack(windows, axis=0).astype(np.float32, copy=False)

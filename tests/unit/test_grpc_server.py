@@ -83,7 +83,8 @@ async def test_stream_packet_rejects_declared_decompressed_size_above_limit(tmp_
 
     directive = await service._handle_packet(packet, response_queue=None, pending_inference=set())
 
-    assert directive.ack.success is True
+    assert directive.ack.success is False
+    assert directive.ack.error_code == "INVALID_FORMAT"
     assert service.storage.records[0]["packet_data"]["decryption_status"] == "decompress_failed"
     assert "encrypted_sensor_payload_b64" in service.storage.records[0]["packet_data"]
 

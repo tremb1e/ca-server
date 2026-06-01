@@ -1,110 +1,173 @@
-HMOG VQGAN 训练文档
+# HMOG / Server Window VQGAN 训练与认证说明
 
-环境准备
-- 激活环境：`conda activate tremb1e`（已包含 CUDA）。
-- 项目目录：`/data/code/CA-Model`
-- 数据目录：`/data/code/ca/refer/ContinAuth/src/data/processed/Z-score_hmog_data_with_magnitude`，包含用户 100669、151985、171538、180679、186676 的 train/val/test CSV。
+本文档描述当前服务端代码的训练、策略搜索和离线认证流程。旧版 HMOG 实验文档中“五个固定 HMOG 用户、12 轴输入、CUDA-only”的说明已经过期；当前主链路以服务端生成的 window CSV 为输入，VQGAN 输入统一为 9 轴。
 
-核心脚本
-- `hmog_vqgan_experiment.py`：加载五个用户数据，按 13 个窗口长度（0.1–2.0 秒，50% 重叠）扫参，记录验证 AUC 最佳窗口并可选复训。
-- 主要默认参数（可用命令行覆盖）：
-  - `--batch-size 128`
-  - `--num-workers 22`、`--cpu-threads 44`（充分使用 22 核 44 线程）
-  - `--learning-rate 2.5e-4`、`--latent-dim 256`、`--num-codebook-vectors 512`
-  - `--use-amp`：默认开启混合精度；多卡自动 DataParallel（除非 `--no-data-parallel`）。
-  - 日志 & Checkpoint：`--log-dir results/experiment_logs`，`--output-dir results`
+## 数据来源
 
-运行示例
-```bash
-conda activate tremb1e
-cd /data/code/CA-Model
-# 全部 5 个用户，13 个窗口，每个窗口 1 epoch 扫参，最佳窗口再训 5 轮
-python hmog_vqgan_experiment.py --use-amp --sweep-epochs 1 --final-epochs 5
-# 只跑某些用户与窗口
-python hmog_vqgan_experiment.py --users 100669 151985 --window-sizes 0.5 1.0 2.0 --sweep-epochs 2 --final-epochs 6
+服务端预处理输出目录：
+
+```text
+<processed_data>/window/<window_size>/<user>/{train,val,test}.csv
+<processed_data>/z-score/<user>/scaler.json
 ```
 
-日志与结果
-- 人类可读日志：`results/experiment_logs/hmog_metrics.txt`（包含 stage/user/window/epoch、AUC、FAR、FRR、EER、F1、阈值、推理延迟，全部小数制）。
-- 机器可读：`results/experiment_logs/hmog_metrics.jsonl`。
-- 训练日志：`results/experiment_logs/hmog_vqgan.log`（Python logging 输出）。
-- 最优窗口摘要：`results/experiment_logs/best_windows.json`。
-- 最优权重：`results/checkpoints/vqgan_user_<uid>_ws_<window>.pt`。
+其中：
 
-调参提示
-- FAR/FRR/EER 计算在 `compute_metrics` 中通过 ROC 求阈值；若需降低 FAR，可在该函数对 `eer_threshold` 做平移或改用固定阈值策略。
-- 推理延迟 `latency` 为单样本平均耗时（秒），从 `evaluate_model` 里获得。
+- `train.csv` 只包含真实用户数据。
+- `val.csv` / `test.csv` 包含真实用户数据和 HMOG 攻击者数据。
+- HMOG 填充默认按真实用户 val/test 数据量做约 1:1 平衡。
+- val 使用按目录名排序后从前往后的 HMOG 用户，test 使用从后往前的 HMOG 用户，默认每侧至少 10 个用户、每个用户候选 24 个 session。
 
-数据与形状
-- 输入窗口形状：`(batch, 1, 12, 50)`，包含 12 个传感器通道，时间轴重采样到 50。
-- 量化后 token 网格：`6x6`（36 token），匹配 codebook 大小 512，便于 Transformer 使用。
+## 输入形状
 
-常见问题
-- 单卡运行：自动退回 CPU/GPU 可用设备，但速度会下降。
-- 若 DataLoader 报内存不足，可降低 `--batch-size` 或 `--max-negative-per-split`。
+当前 VQGAN 输入为：
 
----
-
-VQGAN->Token->Transformer(LM) 持续认证（server window 数据）
-
-数据目录
-- server 端已生成滑窗：`/data/code/server/data_storage/processed_data/window/<t>/<target_user>/{train,val,test}.csv`
-- `train.csv` 仅包含真实用户；`val/test.csv` 含真实用户 + 冒充者（`subject==target_user` 为正类）。
-
-核心脚本
-- `hmog_vqgan_token_transformer_experiment.py`：先训练/加载 VQGAN（用于离散化 codebook），再训练/加载 Token-LM（Transformer/GPT）并用 NLL 做认证打分，支持 0.1–1.0 窗口扫参。
-- `hmog_token_auth_inference.py`：加载已训练的 VQGAN + Token-LM，对任意同格式 CSV 做连续认证推理（输出每个 window 的 score/accept）。
-
-运行示例（cuda1）
-```bash
-conda activate tremb1e
-cd /data/code/server/ca_train
-
-# 0.1~1.0 窗口扫参（示例：可用性优先，连续拒绝5次才打断）
-python hmog_vqgan_token_transformer_experiment.py \
-  --device cuda:1 \
-  --users GzT_pGKIknsqGuvpvpLThmXMU1gKx1Bur4n_iSFdhIU= \
-  --window-sizes 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 \
-  --target-width 50 \
-  --vqgan-epochs 1 --lm-epochs 1 \
-  --max-negative-per-split 5000 --max-eval-per-split 10000 \
-  --reuse-vqgan --reuse-lm \
-  --k-rejects 5 --threshold-strategy k_session_frr --target-session-frr 0.0 \
-  --log-dir results/experiment_logs/window_sweep_cuda1
+```text
+(batch, 1, 9, T)
 ```
 
-推理示例
-```bash
-python hmog_token_auth_inference.py \
-  --device cuda:1 \
-  --csv-path /data/code/server/data_storage/processed_data/window/0.8/GzT_pGKIknsqGuvpvpLThmXMU1gKx1Bur4n_iSFdhIU=/test.csv \
-  --window-size 0.8 --target-width 50 \
-  --vqgan-checkpoint results/checkpoints/vqgan_user_GzT_pGKIknsqGuvpvpLThmXMU1gKx1Bur4n_iSFdhIU=_ws_0.8.pt \
-  --lm-checkpoint results/checkpoints/token_gpt_user_GzT_pGKIknsqGuvpvpLThmXMU1gKx1Bur4n_iSFdhIU=_ws_0.8.pt \
-  --threshold <VAL_THRESHOLD> \
-  --k-rejects 5
+9 个通道为：
+
+```text
+acc_x, acc_y, acc_z,
+gyr_x, gyr_y, gyr_z,
+mag_x, mag_y, mag_z
 ```
 
-阈值选择说明
-- `hmog_vqgan_token_transformer_experiment.py` 在 `lm-val` 上选阈值，并固定到 `lm-test` 报告 FAR/FRR/F1（AUC/EER 为阈值无关指标）。
-- 指标文件里的阶段名：
-  - `vqgan-*(val/test)`：仅用 VQGAN 重建误差做异常分数（`score=-MSE` 或 `-L1`），属于 baseline。
-  - `lm-*(val/test)`：VQGAN 将窗口离散化为 codebook token 后，用 Transformer(自回归 LM) 的 `score=-NLL(tokens)` 做认证分数（主方案）。
-  - `lmseq-*(val/test)`：当设置 `--k-rejects > 0` 时额外输出的“序列/会话级”指标：按时间顺序逐窗口打分，并用“连续拒绝 K 次才打断”规则统计 `session_frr/session_far/session_tpr` 等。
-- 如出现 AUC 很好但 F1 很低，通常是阈值过松导致 FAR 偏高（类别不平衡时 F1 对 FP 很敏感）。
-- 当前实现里 `label=1` 表示真实用户（genuine），因此日志里的 `F1/precision/recall` 默认是在“接受真实用户”这个正类上计算；同时也会输出 `impostor_f1`（把“拒绝冒充者”视为正类）方便对照。
-- 可切换阈值策略：
-  - `--threshold-strategy eer`：默认，按 EER 选阈值。
-  - `--threshold-strategy f1`：在 val 上选使 F1 最大的阈值。
-  - `--threshold-strategy far --target-far 0.05`：在 val 上选满足 FAR≤target 的阈值并尽量提高 TPR（更贴近认证场景的“固定 FAR 工作点”）。
-  - `--threshold-strategy frr --target-frr 0.001`：在 val 上选满足 FRR≤target 的阈值并尽量降低 FAR（更偏可用性，减少误报打断）。
-    - 注意：当 val 正样本窗口数较少时，过小的 `target-frr` 会等价于“val 上 FRR=0”，阈值会非常宽松，可能在 test 上出现 FAR 接近 1 的退化现象。
-  - `--threshold-strategy k_session_frr --k-rejects 5 --target-session-frr 0.0`：更贴近“持续性认证”的可用性目标：在 val 上选择**最严格**(阈值最高)但仍满足 `session_frr<=target-session-frr` 的阈值；其中 `session_frr` 是在“连续拒绝 K 次才打断”规则下统计的“真实用户被打断的会话比例”。该策略会在尽量不打断真实用户的前提下，最大化对冒充者的拒绝。
+不再拼接 `acc_magnitude`、`gyr_magnitude`、`mag_magnitude`。因此旧的 12 轴 checkpoint、阈值和策略文件不能继续作为线上模型使用，必须重新训练并重新运行 `policy_search` 标定。
 
-连续拒绝 K 次才打断（可用性优先）
-- `--k-rejects K`：只有连续拒绝 K 个窗口才触发一次 `interrupt`（默认 0=关闭）。
-- 推荐与 `--threshold-strategy k_session_frr` 联用来“保可用性”：例如 `K=5` 且 `--target-session-frr 0.0` 表示 val 上不打断真实用户（会牺牲对冒充者的检出率）。
-- 重点看 `lmseq-test`：
-  - `session_frr`：真实用户会话被打断比例（越低越好；你关注的“误报/打断”）。
-  - `session_tpr`：冒充者会话被打断比例（检出率；你允许降低）。
-  - `session_far`：冒充者会话未被打断比例（漏报；`session_far = 1 - session_tpr`）。
+## 推荐主入口
+
+优先使用服务端 CLI，它会读取 `ca_config.toml`：
+
+```bash
+python3 -m src.training.cli \
+  --user <device_id_hash> \
+  --device auto
+```
+
+关键默认值来自配置文件：
+
+- `[training].max_epochs = 50`
+- `[training].early_stop_patience = 3`
+- `[training].batch_size = 128`
+- `[training].device = "auto"`
+- `[training].max_parallel_train = 8`
+- `[training].run_policy_search = true`
+- `[windows].sizes = [0.2]`
+- `[auth].decision_strategy = "ema"`
+
+训练完成后会自动运行策略搜索，并写入：
+
+```text
+<models>/<user>/best_lock_policy.json
+<models>/<user>/policy_search/grid_results_vqgan_only.csv
+```
+
+在线推理、离线推理和管理接口均以 `best_lock_policy.json` 为该用户的策略来源。
+
+## 直接运行 VQGAN 实验脚本
+
+调试或研究窗口 sweep 时可直接运行：
+
+```bash
+python3 ca_train/hmog_vqgan_experiment.py \
+  --dataset-path <processed_data>/window \
+  --users <device_id_hash> \
+  --window-sizes 0.2 \
+  --device auto \
+  --sweep-epochs 50 \
+  --final-epochs 50 \
+  --early-stop-patience 3 \
+  --batch-size 128 \
+  --max-parallel-train 8
+```
+
+`--device auto` 会优先选择 NPU，其次 CUDA，最后 CPU。华为 Kunpeng 920 + Ascend 910B 8 卡环境下，训练管理器会把多个用户训练任务按设备池分配到 `npu:0` 到 `npu:7`，用于并行利用 8 张 NPU。
+
+常用 smoke test 参数：
+
+```bash
+python3 ca_train/hmog_vqgan_experiment.py \
+  --dataset-path /tmp/ca-server-functional/processed/window \
+  --users <device_id_hash> \
+  --window-sizes 0.2 \
+  --device auto \
+  --sweep-epochs 1 \
+  --final-epochs 1 \
+  --early-stop-patience 3 \
+  --batch-size 32 \
+  --max-train-per-user 512 \
+  --max-negative-per-split 256 \
+  --max-eval-per-split 256
+```
+
+## 策略搜索
+
+手工运行：
+
+```bash
+python3 -m src.policy_search.cli \
+  --user <device_id_hash> \
+  --device auto \
+  --auth-method vqgan-only
+```
+
+当前线上链路执行 VQGAN-only 分数，因此默认 `policy_search_auth_method = "vqgan-only"`。搜索会在验证集上选择阈值和连续认证策略参数，并把最终线上策略写入 `models/<user>/best_lock_policy.json`。
+
+支持的决策策略：
+
+- `ema`：默认，对分数做指数滑动平均，降低真实用户短时波动导致的 FRR。
+- `vote`：保留 y-of-x 投票机制，最近 `N` 窗中拒绝数 `>= M` 时打断。
+- `k`：兼容旧的连续 K 次拒绝机制。
+
+## 离线认证推理
+
+VQGAN-only 离线认证推荐通过服务端认证 runner 或容器子命令运行。Token-LM 实验脚本仍可用于 transformer 分支研究：
+
+```bash
+python3 ca_train/hmog_token_auth_inference.py \
+  --device auto \
+  --csv-path <processed_data>/window/0.2/<device_id_hash>/test.csv \
+  --window-size 0.2 \
+  --target-width 20 \
+  --vqgan-checkpoint <models>/<user>/checkpoints/vqgan_user_<user>_ws_0.2.pt \
+  --vqgan-config <models>/<user>/checkpoints/vqgan_user_<user>_ws_0.2.config.json \
+  --lm-checkpoint <token_lm_checkpoint> \
+  --threshold <threshold> \
+  --decision-strategy ema \
+  --ema-alpha 0.2 \
+  --output-csv /tmp/auth_results.csv
+```
+
+输出 CSV 会包含 `score`、`ema_score`、`decision_strategy`、`raw_accept`、`decision_accept`、`accept`、`interrupt` 等字段，便于回放阈值和策略效果。
+
+## 日志与结果
+
+训练脚本会输出：
+
+- `hmog_vqgan.log`：训练过程日志。
+- `hmog_metrics.txt`：人类可读指标。
+- `hmog_metrics.jsonl`：逐 epoch 机器可读指标。
+- `best_windows.json`：窗口 sweep 摘要。
+- checkpoint 和 config：包含 `input_height = 9`。
+
+策略搜索会输出：
+
+- `grid_results_vqgan_only.csv`
+- `best_lock_policy_vqgan_only.json`
+- 根目录 `best_lock_policy.json`
+
+线上认证会在 inference 目录中记录原始输入和结果 JSONL，结果中保留原始窗口分数、聚合后策略分数、阈值、策略名和最终判定，方便后续搜索阈值和策略。
+
+## 容器和 NPU 注意事项
+
+Docker Compose 会挂载 Ascend driver/toolkit、`/dev/davinci0` 到 `/dev/davinci7`、`npu-smi` 等宿主机资源。镜像内不安装驱动，只消费宿主机挂载的 Ascend 运行时。
+
+如只做 CPU smoke test，可显式设置：
+
+```bash
+INSTALL_TORCH_NPU=0 docker build -t ca-server:latest .
+```
+
+生产环境建议保持 `INSTALL_TORCH_NPU=1`，并确认容器内 `torch_npu` 能看到 8 张 NPU。

@@ -42,6 +42,9 @@ def load_vqgan(vqgan_ckpt: Path, *, device: torch.device, cfg_path: Optional[Pat
     if not cfg_path.exists():
         raise FileNotFoundError(f"Missing VQGAN config json: {cfg_path}")
     cfg = _load_json(cfg_path)
+    input_height = int(cfg.get("input_height", 9))
+    if input_height != 9:
+        raise ValueError(f"VQGAN config {cfg_path} has input_height={input_height}; 9-axis input is required.")
     args = argparse.Namespace(**cfg)
     # The VQGAN module expects these attribute names.
     args.use_nonlocal = bool(cfg.get("use_nonlocal", True))
@@ -88,6 +91,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lm-config", type=str, default=None)
 
     parser.add_argument("--threshold", type=float, default=None, help="Optional decision threshold on score")
+    parser.add_argument(
+        "--decision-strategy",
+        choices=("ema", "vote", "k", "none"),
+        default="ema",
+        help="认证决策策略：ema（默认）、vote、k 或 none。",
+    )
+    parser.add_argument("--ema-alpha", type=float, default=0.25, help="EMA 平滑系数，仅 decision-strategy=ema 时使用。")
     parser.add_argument(
         "--vote-window-size",
         type=int,
@@ -147,7 +157,10 @@ def main() -> None:
 
     vote_window_size = int(getattr(args, "vote_window_size", 0) or 0)
     vote_min_rejects = int(getattr(args, "vote_min_rejects", 0) or 0)
-    vote_enabled = vote_window_size > 0 or vote_min_rejects > 0
+    decision_strategy = str(getattr(args, "decision_strategy", "ema") or "ema").strip().lower()
+    if decision_strategy == "none":
+        decision_strategy = ""
+    vote_enabled = decision_strategy == "vote" or vote_window_size > 0 or vote_min_rejects > 0
     if (vote_window_size > 0) != (vote_min_rejects > 0):
         raise ValueError("--vote-window-size and --vote-min-rejects must be set together (or both 0).")
 
@@ -163,10 +176,17 @@ def main() -> None:
         raise ValueError("--interrupt-after-sec-scale requires --interrupt-after-sec-base.")
 
     if vote_enabled:
+        decision_strategy = "vote"
         if interrupt_after_sec is not None or interrupt_after_sec_base is not None or float(interrupt_after_sec_scale or 0.0) != 0.0:
             raise ValueError("Vote rule is incompatible with --interrupt-after-sec* options.")
         if int(args.k_rejects) > 0:
             raise ValueError("Vote rule is incompatible with --k-rejects; use only --vote-window-size/--vote-min-rejects.")
+    elif decision_strategy == "k" and int(args.k_rejects) <= 0 and interrupt_after_sec is None and interrupt_after_sec_base is None:
+        raise ValueError("decision-strategy=k requires --k-rejects or --interrupt-after-sec*.")
+    elif decision_strategy == "ema" and int(args.k_rejects) > 0:
+        raise ValueError("decision-strategy=ema is incompatible with --k-rejects.")
+    elif decision_strategy == "ema" and (interrupt_after_sec is not None or interrupt_after_sec_base is not None):
+        raise ValueError("decision-strategy=ema is incompatible with --interrupt-after-sec*.")
 
     if interrupt_after_sec_base is not None:
         if interrupt_after_sec is not None:
@@ -191,6 +211,8 @@ def main() -> None:
         k_rejects_effective = max(int(k_rejects_effective), int(interrupt_min_k))
     if vote_enabled:
         logger.info("[VOTE] window_size=%d min_rejects=%d", vote_window_size, vote_min_rejects)
+    elif decision_strategy == "ema":
+        logger.info("[EMA] alpha=%.6f", float(args.ema_alpha))
     elif k_rejects_effective > 0:
         stride_sec = float(args.window_size) * (1.0 - float(args.overlap))
         logger.info(
@@ -216,11 +238,12 @@ def main() -> None:
     batch_windows: List[np.ndarray] = []
     batch_meta: List[Dict] = []
     k_tracker = ConsecutiveRejectTracker()
+    ema_score: Optional[float] = None
     vote_tracker = VoteRejectTracker()
     current_session_key: Optional[str] = None
 
     def _flush_batch() -> None:
-        nonlocal current_session_key
+        nonlocal current_session_key, ema_score
         if not batch_windows:
             return
         windows_np = np.stack(batch_windows, axis=0).astype(np.float32, copy=False)
@@ -241,13 +264,23 @@ def main() -> None:
                 raw_accept = bool(float(score) >= thr)
                 row["accept"] = int(raw_accept)
 
-                if vote_enabled:
-                    session_key = f"{meta.get('subject','')}\t{meta.get('session','')}"
-                    if current_session_key is None:
-                        current_session_key = session_key
-                    elif session_key != current_session_key:
-                        vote_tracker.reset()
-                        current_session_key = session_key
+                session_key = f"{meta.get('subject','')}\t{meta.get('session','')}"
+                if current_session_key is None:
+                    current_session_key = session_key
+                elif session_key != current_session_key:
+                    k_tracker.reset()
+                    vote_tracker.reset()
+                    ema_score = None
+                    current_session_key = session_key
+
+                if decision_strategy == "ema":
+                    alpha = min(1.0, max(0.0, float(args.ema_alpha)))
+                    ema_score = float(score) if ema_score is None else alpha * float(score) + (1.0 - alpha) * float(ema_score)
+                    triggered = bool(float(ema_score) < thr)
+                    row["ema_score"] = float(ema_score)
+                    row["interrupt"] = int(triggered)
+                    row["accept"] = int(not triggered)
+                elif vote_enabled:
                     triggered = vote_tracker.update(
                         rejected=not raw_accept,
                         window_size=vote_window_size,
@@ -258,12 +291,6 @@ def main() -> None:
                     row["vote_recent_windows"] = int(vote_tracker.recent_windows)
                     row["vote_recent_rejects"] = int(vote_tracker.recent_rejects)
                 elif int(k_rejects_effective) > 0:
-                    session_key = f"{meta.get('subject','')}\t{meta.get('session','')}"
-                    if current_session_key is None:
-                        current_session_key = session_key
-                    elif session_key != current_session_key:
-                        k_tracker.reset()
-                        current_session_key = session_key
                     triggered = k_tracker.update(
                         rejected=not raw_accept,
                         k=int(k_rejects_effective),
@@ -318,6 +345,8 @@ def main() -> None:
     extra = ""
     if args.threshold is not None:
         extra = "\taccept"
+        if decision_strategy == "ema":
+            extra += "\tinterrupt\tema_score"
         if vote_enabled:
             extra += "\tinterrupt\tvote_recent_windows\tvote_recent_rejects"
         elif int(k_rejects_effective) > 0:
@@ -327,7 +356,11 @@ def main() -> None:
         if args.threshold is None:
             print(f"{r['window_id']}\t{r['subject']}\t{r['session']}\t{r['score']:.6f}")
         else:
-            if vote_enabled:
+            if decision_strategy == "ema":
+                print(
+                    f"{r['window_id']}\t{r['subject']}\t{r['session']}\t{r['score']:.6f}\t{r['accept']}\t{r.get('interrupt',0)}\t{float(r.get('ema_score',0.0)):.6f}"
+                )
+            elif vote_enabled:
                 print(
                     f"{r['window_id']}\t{r['subject']}\t{r['session']}\t{r['score']:.6f}\t{r['accept']}\t{r.get('interrupt',0)}\t{r.get('vote_recent_windows',0)}\t{r.get('vote_recent_rejects',0)}"
                 )

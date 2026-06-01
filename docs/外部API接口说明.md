@@ -13,6 +13,8 @@
 | gRPC | `10500` | App 主交互链路，包含策略、认证会话、传感器数据流、心跳、客户端指标上报 |
 | HTTP | `18000` | 当 `HTTP_ENABLED=true` 或 `MANAGEMENT_API_ENABLED=true`，且 `PORT != GRPC_PORT` 时监听 |
 
+公网部署时，Android app 不直接使用后端 h2c `10500`，而是连接 OpenResty 暴露的 `https://ca.macrz.com:443`。OpenResty 443 终止 TLS 并通过 `grpc_pass` 回源到后端 `10500`；80 端口只返回 HTTP 301，不作为 gRPC 入口。当前 app 会把 `https` 且端口为空或 `80` 的配置归一化为 `443`。
+
 管理 API 是 HTTP API。直接运行 Python 服务时使用 `PORT`；通过本项目 `docker-compose.yml` 启动时，外层变量 `CA_SERVER_HTTP_PORT` 会映射到容器内的 `PORT`。设置 `MANAGEMENT_API_ENABLED=true` 时服务会自动启用 HTTP；如果 HTTP 与 gRPC 配置为同一个端口，服务会拒绝启动并提示拆分端口。
 
 直接运行服务示例：
@@ -765,11 +767,11 @@ payload 解密解压后应为 `SerializedSensorBatch` protobuf：
 | --- | --- |
 | `packet_id` | 对应请求包 ID |
 | `creation_server_ts` | 服务端接收时间 |
-| `success` | 当前表示是否成功写入 raw session 文件 |
-| `error_code` | 非法设备 ID 时为 `INVALID_IDENTIFIER`；存储失败或未捕获处理异常时为 `SERVER_ERROR` |
+| `success` | 是否已完成解密、解压、`SerializedSensorBatch` 解析并可进入训练/认证流程 |
+| `error_code` | `INVALID_IDENTIFIER`、`DECRYPTION_FAILED`、`INVALID_FORMAT` 或 `SERVER_ERROR` |
 | `retry_after_ms` | 当前未设置 |
 
-解密、解压、protobuf 解析或 batch 用户校验失败时，服务会保存一条带 `decryption_status` / `decryption_error` 的 raw 记录；只要 raw 文件写入成功，`Ack.success` 仍为 `true`，但不会产生认证结果。
+解密、解压、protobuf 解析或 batch 用户校验失败时，服务会尽量保存一条带 `decryption_status` / `decryption_error` 的 raw 记录，但 `Ack.success=false`，不会产生训练样本或认证结果。存储失败或未捕获处理异常返回 `SERVER_ERROR`，客户端应保留数据包等待重试；数据格式或密钥类错误返回稳定错误码，客户端可标记失败并删除不可用包。
 
 `AuthResult` 字段：
 
@@ -887,6 +889,6 @@ results[].accept == false 或 results[].interrupt == true
 
 - 设备 ID 当前以 `device_id_hash` 为主索引；
 - `SerializedSensorBatch` 只保留样本和 session，在线训练/认证路径按设备 ID 管理；
-- gRPC `Ack.success` 当前表示 raw 文件是否写入成功，不等价于“已成功训练/推理”；
+- gRPC `Ack.success` 表示包已完成解密、解压和 protobuf 解析，可进入训练/认证流程；不等价于“已完成训练/推理”；
 - `encrypted_dek`、`dek_key_id`、`sha256` 当前会保存或透传部分信息，但主流程仍使用固定对称密钥解密，没有完整实现信封加密和哈希校验；
 - 管理 API 读取运行时内存态和文件系统状态。服务重启后，活跃认证会话内存态会清空，但历史 `results.jsonl` 仍可查询。

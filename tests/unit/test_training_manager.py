@@ -31,8 +31,8 @@ async def test_training_manager_triggers_when_threshold_met(tmp_path, monkeypatc
     def fake_process_user(user_id, cfg) -> None:
         calls.append(("process", user_id))
 
-    def fake_run_window_sweep_for_user(user_id) -> None:
-        calls.append(("train", user_id))
+    def fake_run_window_sweep_for_user(user_id, **kwargs) -> None:
+        calls.append(("train", user_id, kwargs.get("device")))
 
     fake_pipeline = types.ModuleType("src.processing.pipeline")
     fake_pipeline.build_config = lambda: object()
@@ -50,7 +50,9 @@ async def test_training_manager_triggers_when_threshold_met(tmp_path, monkeypatc
     await task
 
     assert ("process", "user1") in calls
-    assert ("train", "user1") in calls
+    train_calls = [call for call in calls if call[0] == "train" and call[1] == "user1"]
+    assert train_calls
+    assert str(train_calls[0][2]).split(":", 1)[0] in {"cpu", "npu", "cuda"}
 
     state_path = tmp_path / "models" / "user1" / "training_state.json"
     payload = json.loads(state_path.read_text(encoding="utf-8"))

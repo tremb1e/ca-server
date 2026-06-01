@@ -5,8 +5,8 @@ from helper import ResidualBlock, NonLocalBlock, DownSampleBlock, UpSampleBlock,
 class Encoder(nn.Module):
     def __init__(self, args):
         super(Encoder, self).__init__()
-        # Sensor windows are treated as a "1×H×T image" (H=12 sensor rows, T=time axis).
-        # Keep more spatial resolution early to avoid collapsing the 12 sensor rows too aggressively.
+        # Sensor windows are treated as a "1×H×T image" (H=9 sensor rows, T=time axis).
+        # Keep more spatial resolution early to avoid collapsing the sensor rows too aggressively.
         base_channels = int(getattr(args, "base_channels", 128))
         channels = [
             base_channels,
@@ -17,12 +17,12 @@ class Encoder(nn.Module):
         use_nonlocal = bool(getattr(args, "use_nonlocal", True))
         attn_resolutions = []  # 依赖瓶颈处的 NonLocal 即可
         num_res_blocks = 2
-        resolution = 12  # 粗略跟踪特征维度高度
+        resolution = int(getattr(args, "input_height", 9))  # 粗略跟踪特征维度高度
         layers = [nn.Conv2d(args.image_channels, channels[0], 3, 1, 1)]
         downsample_plan = [
-            {"stride": (2, 2), "pad": (0, 1, 0, 1)},  # 12x50 -> 6x25
-            {"stride": (1, 2), "pad": (0, 1, 1, 1)},  # 6x25 -> 6x12（仅压缩时间轴）
-            {"stride": (1, 2), "pad": (0, 1, 1, 1)},  # 6x12 -> 6x6  得到 36 个 token
+            {"stride": (2, 2), "pad": (0, 1, 0, 1)},  # HxT -> ceil(H/2)xceil(T/2)
+            {"stride": (1, 2), "pad": (0, 1, 1, 1)},  # 仅压缩时间轴
+            {"stride": (1, 2), "pad": (0, 1, 1, 1)},  # 仅压缩时间轴
         ]
         for i in range(len(channels)-1):
             in_channels = channels[i]

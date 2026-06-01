@@ -34,10 +34,17 @@ def _make_cfg(tmp_path: Path, *, min_total_bytes: int, target_total_bytes: int) 
         window_overlap=0.5,
         min_total_bytes=min_total_bytes,
         target_total_bytes=target_total_bytes,
+        train_ratio=0.75,
+        val_ratio=0.125,
+        test_ratio=0.125,
         workers=1,
         window_workers=1,
+        process_user_workers=1,
         hmog_val_subject_count=0,
         hmog_test_subject_count=0,
+        hmog_min_subject_count=10,
+        hmog_session_count=24,
+        hmog_balance_ratio=1.0,
         hmog_max_rows_per_subject=None,
         hmog_max_rows_total=None,
     )
@@ -178,7 +185,7 @@ def test_select_hmog_attacker_ids_uses_fixed_rank_ranges() -> None:
     subjects = [str(i) for i in range(1, 31)]
     val_ids, test_ids = _select_hmog_attacker_ids(subjects)
     assert val_ids == [str(i) for i in range(1, 11)]
-    assert test_ids == [str(i) for i in range(11, 21)]
+    assert test_ids == [str(i) for i in range(21, 31)]
 
 
 def test_load_hmog_attackers_keeps_only_requested_session_range(tmp_path: Path) -> None:
@@ -212,6 +219,37 @@ def test_load_hmog_attackers_keeps_only_requested_session_range(tmp_path: Path) 
     sessions = attackers["session"].astype(str).tolist()
     assert all(s.endswith("_session_1") or s.endswith("_session_6") for s in sessions)
     assert not any(s.endswith("_session_7") for s in sessions)
+
+
+def test_load_hmog_attackers_balances_to_target_rows(tmp_path: Path) -> None:
+    import pandas as pd
+
+    cfg = _make_cfg(tmp_path, min_total_bytes=0, target_total_bytes=0)
+    for sid in ("100669", "151985"):
+        subject_dir = cfg.hmog_root / sid
+        subject_dir.mkdir(parents=True, exist_ok=True)
+        rows = 20
+        df = pd.DataFrame(
+            {
+                "subject": [sid] * rows,
+                "session": [f"{sid}_session_1"] * rows,
+                "timestamp": list(range(rows)),
+                "acc_x": [0.1] * rows,
+                "acc_y": [0.1] * rows,
+                "acc_z": [0.1] * rows,
+                "gyr_x": [0.1] * rows,
+                "gyr_y": [0.1] * rows,
+                "gyr_z": [0.1] * rows,
+                "mag_x": [0.1] * rows,
+                "mag_y": [0.1] * rows,
+                "mag_z": [0.1] * rows,
+            }
+        )
+        df.to_csv(subject_dir / f"{sid}_train.csv", index=False)
+
+    attackers = _load_hmog_attackers(["100669", "151985"], cfg, session_range=(1, 24), target_rows=12)
+    assert len(attackers) == 12
+    assert attackers.groupby("subject").size().to_dict() == {"100669": 6, "151985": 6}
 
 
 def test_ensure_split_has_both_classes_rejects_single_class() -> None:
