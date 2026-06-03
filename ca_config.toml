@@ -101,6 +101,21 @@ target_window_frr = 0.05
 # 上线链路当前执行 VQGAN-only 分数，因此 policy_search 默认也使用 VQGAN-only，避免离线/线上策略不一致。
 policy_search_auth_method = "vqgan-only"
 
+# 二次“迟滞决策”：对一次迟滞结果再次做聚合，降低单次返回抖动。
+# 一次迟滞结果约每 1 秒进入二次迟滞一次；二次结果默认每 10 次 / 约 10 秒向 App 返回一次。
+secondary_hysteresis_enabled = true
+secondary_hysteresis_strategy = "vote"  # "vote" 或 "ema"
+primary_result_interval_sec = 1.0
+secondary_decision_time_sec = 10.0
+
+# 二次 vote：最近 x 次一次迟滞结果中，若不通过次数 >= y，则二次结果不通过。
+secondary_vote_window_size = 10
+secondary_vote_min_rejects = 8
+
+# 二次 EMA：对一次迟滞 reject(0/1) 序列做 EMA；EMA reject 分数超过阈值则不通过。
+secondary_ema_alpha = 0.25
+secondary_ema_reject_threshold = 0.8
+
 [training]
 # 模型最大训练轮数。实际训练会受 early_stop_patience 控制提前停止。
 max_epochs = 50

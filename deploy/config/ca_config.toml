@@ -20,15 +20,15 @@ test_ratio = 0.125
 
 # 数据预处理并发进程数（session 重采样、滑窗生成均受此限制）。
 # 后期如需调参可修改此值；在 process_all_users 多用户处理时会按用户级并发自动分配给子任务。
-workers = 5
-process_user_workers = 5
+workers = 20
+process_user_workers = 20
 
 # HMOG 攻击者用户选择（按 HMOG 目录名排序后的顺序）：
 # - val：使用从前往后的第 1~x 个 HMOG 用户，x 至少为 10
 # - test：使用从后往前的第 1~x 个 HMOG 用户，x 至少为 10
 # 每个 HMOG 用户以 24 个 session 作为候选来源；实际写入时会按真实用户 val/test 体量做 1:1 平衡截取。
-hmog_val_subject_count = 20
-hmog_test_subject_count = 20
+hmog_val_subject_count = 10
+hmog_test_subject_count = 10
 hmog_min_subject_count = 10
 hmog_session_count = 24
 hmog_balance_ratio = 1.0
@@ -61,7 +61,7 @@ sampling_rate_hz = 100
 [auth]
 # 认证策略目标：期望在该时间内完成首次打断决策（秒）。
 # 当前需求：T=2s。
-max_decision_time_sec = 20.0
+max_decision_time_sec = 2.0
 
 # 认证决策策略：
 # - "ema"：默认策略，对 VQGAN 分数做指数滑动平均后与 policy_search 选出的阈值比较，降低短时抖动造成的 FRR。
@@ -78,7 +78,7 @@ vote_min_rejects = 6
 
 # EMA 默认值和 policy_search 候选值。最终每个用户会在验证集上搜索并写入 models/<user>/best_lock_policy.json。
 ema_alpha = 0.25
-ema_alpha_candidates = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+ema_alpha_candidates = [0.10, 0.20, 0.30, 0.40, 0.50]
 
 # （兼容保留）“连续拒绝 K 次”策略的 K 计算方式：
 # - "by_window": K = ceil(max_decision_time_sec / stride_sec)
@@ -96,10 +96,25 @@ k_rejects_mode = "by_window"
 target_window_frr = 0.05
 
 # 限制真实用户会话在 max_decision_time_sec 内被误打断的概率；不填时沿用 target_window_frr。
-# max_genuine_first_interrupt_p = 0.005
+# max_genuine_first_interrupt_p = 0.05
 
 # 上线链路当前执行 VQGAN-only 分数，因此 policy_search 默认也使用 VQGAN-only，避免离线/线上策略不一致。
 policy_search_auth_method = "vqgan-only"
+
+# 二次“迟滞决策”：对一次迟滞结果再次做聚合，降低单次返回抖动。
+# 一次迟滞结果约每 1 秒进入二次迟滞一次；二次结果默认每 10 次 / 约 10 秒向 App 返回一次。
+secondary_hysteresis_enabled = true
+secondary_hysteresis_strategy = "vote"  # "vote" 或 "ema"
+primary_result_interval_sec = 1.0
+secondary_decision_time_sec = 10.0
+
+# 二次 vote：最近 x 次一次迟滞结果中，若不通过次数 >= y，则二次结果不通过。
+secondary_vote_window_size = 10
+secondary_vote_min_rejects = 8
+
+# 二次 EMA：对一次迟滞 reject(0/1) 序列做 EMA；EMA reject 分数超过阈值则不通过。
+secondary_ema_alpha = 0.25
+secondary_ema_reject_threshold = 0.8
 
 [training]
 # 模型最大训练轮数。实际训练会受 early_stop_patience 控制提前停止。

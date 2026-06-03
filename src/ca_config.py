@@ -65,6 +65,15 @@ class AuthConfig:
     target_window_frr: float = 0.10
     max_genuine_first_interrupt_p: Optional[float] = None
     policy_search_auth_method: Literal["vqgan-only", "vqgan+transformer"] = "vqgan-only"
+    # Second-stage hysteresis over first-stage online AuthResult candidates.
+    secondary_hysteresis_enabled: bool = True
+    secondary_hysteresis_strategy: Literal["vote", "ema"] = "vote"
+    primary_result_interval_sec: float = 1.0
+    secondary_decision_time_sec: float = 10.0
+    secondary_vote_window_size: int = 10
+    secondary_vote_min_rejects: int = 8
+    secondary_ema_alpha: float = 0.25
+    secondary_ema_reject_threshold: float = 0.8
 
     def __post_init__(self) -> None:
         if self.ema_alpha_candidates is None:
@@ -171,6 +180,12 @@ def load_ca_config(path: Optional[Path] = None) -> CAConfig:
     if policy_search_auth_method not in {"vqgan-only", "vqgan+transformer"}:
         policy_search_auth_method = AuthConfig.policy_search_auth_method
 
+    secondary_hysteresis_strategy = str(
+        auth_raw.get("secondary_hysteresis_strategy", AuthConfig.secondary_hysteresis_strategy)
+    ).strip().lower()
+    if secondary_hysteresis_strategy not in {"vote", "ema"}:
+        secondary_hysteresis_strategy = AuthConfig.secondary_hysteresis_strategy
+
     auth = AuthConfig(
         max_decision_time_sec=float(auth_raw.get("max_decision_time_sec", AuthConfig.max_decision_time_sec)),
         k_rejects_mode=str(auth_raw.get("k_rejects_mode", AuthConfig.k_rejects_mode)),  # type: ignore[arg-type]
@@ -182,6 +197,28 @@ def load_ca_config(path: Optional[Path] = None) -> CAConfig:
         target_window_frr=float(target_window_frr_raw),
         max_genuine_first_interrupt_p=None if max_genuine_raw is None else float(max_genuine_raw),
         policy_search_auth_method=policy_search_auth_method,  # type: ignore[arg-type]
+        secondary_hysteresis_enabled=bool(
+            auth_raw.get("secondary_hysteresis_enabled", AuthConfig.secondary_hysteresis_enabled)
+        ),
+        secondary_hysteresis_strategy=secondary_hysteresis_strategy,  # type: ignore[arg-type]
+        primary_result_interval_sec=float(
+            auth_raw.get("primary_result_interval_sec", AuthConfig.primary_result_interval_sec)
+        ),
+        secondary_decision_time_sec=float(
+            auth_raw.get("secondary_decision_time_sec", AuthConfig.secondary_decision_time_sec)
+        ),
+        secondary_vote_window_size=int(
+            auth_raw.get("secondary_vote_window_size", AuthConfig.secondary_vote_window_size)
+        ),
+        secondary_vote_min_rejects=int(
+            auth_raw.get("secondary_vote_min_rejects", AuthConfig.secondary_vote_min_rejects)
+        ),
+        secondary_ema_alpha=float(
+            auth_raw.get("secondary_ema_alpha", AuthConfig.secondary_ema_alpha)
+        ),
+        secondary_ema_reject_threshold=float(
+            auth_raw.get("secondary_ema_reject_threshold", AuthConfig.secondary_ema_reject_threshold)
+        ),
     )
 
     training = TrainingConfig(

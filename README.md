@@ -135,6 +135,8 @@ docker compose run --rm ca-server auth --user <device_id_hash> --csv-path /app/d
 - 训练默认最多 50 epoch，验证集性能连续 3 次不提升早停；训练完成后默认运行 `policy_search`。
 - `policy_search` 会把用户最终阈值、EMA 参数和投票参数写入 `/app/data_storage/models/<user>/best_lock_policy.json`，线上推理直接消费该文件。
 - 默认认证决策为 `EMA`；原 y-of-x 投票机制仍可通过配置或用户策略选择。
+- 在线认证默认启用二次“迟滞决策”：一次迟滞结果约每 1 秒进入二次迟滞一次，二次默认使用 `8-of-10` 投票，正常上传节奏下按 `10 * 1s` 约每 10 秒向 App 返回一个最终 `AuthResult`。ACK 仍按每个 `DataPacket` 即时返回。
+- 二次迟滞配置位于 `ca_config.toml [auth]`：`secondary_hysteresis_enabled`、`secondary_hysteresis_strategy`、`secondary_decision_time_sec`、`secondary_vote_window_size`、`secondary_vote_min_rejects`、`secondary_ema_alpha`、`secondary_ema_reject_threshold`。
 - 模型就绪检查同时要求 policy、checkpoint、config 和 `processed_data/z-score/<user>/scaler.json` 完整可读。
 - 在 Ascend 910B 8 卡机器上，`device=auto` 会优先使用 NPU，训练管理器会把并行用户任务分配到可见 NPU 设备池。
 

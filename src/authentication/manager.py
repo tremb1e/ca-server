@@ -13,6 +13,7 @@ from ..ca_config import get_ca_config
 from ..config import settings
 from ..storage.inference_storage import InferenceStorage
 from ..utils.reject_trackers import ConsecutiveRejectTracker, EMAScoreTracker, VoteRejectTracker
+from ..utils.secondary_hysteresis import SecondaryHysteresisConfig, SecondaryHysteresisTracker
 
 if TYPE_CHECKING:
     import torch
@@ -50,6 +51,8 @@ class AuthSessionState:
     consecutive_rejects: Any = None
     vote_rejects: Any = None
     ema_rejects: Any = None
+    secondary_hysteresis: Any = None
+    secondary_hysteresis_config: Any = None
 
 
 class VQGANModelCache:
@@ -146,6 +149,19 @@ class AuthSessionManager:
             model_version=cfg.model_version or cfg.vqgan_checkpoint.name,
         )
 
+    def _secondary_hysteresis_config(self) -> SecondaryHysteresisConfig:
+        auth = get_ca_config().auth
+        return SecondaryHysteresisConfig(
+            enabled=bool(getattr(auth, "secondary_hysteresis_enabled", True)),
+            strategy=str(getattr(auth, "secondary_hysteresis_strategy", "vote") or "vote"),
+            primary_result_interval_sec=float(getattr(auth, "primary_result_interval_sec", 1.0) or 1.0),
+            decision_time_sec=float(getattr(auth, "secondary_decision_time_sec", 10.0) or 10.0),
+            vote_window_size=int(getattr(auth, "secondary_vote_window_size", 10) or 10),
+            vote_min_rejects=int(getattr(auth, "secondary_vote_min_rejects", 8) or 8),
+            ema_alpha=float(getattr(auth, "secondary_ema_alpha", 0.25) or 0.25),
+            ema_reject_threshold=float(getattr(auth, "secondary_ema_reject_threshold", 0.8) or 0.8),
+        )
+
     @staticmethod
     def _format_vote_message(
         *,
@@ -211,6 +227,10 @@ class AuthSessionManager:
         state.consecutive_rejects = ConsecutiveRejectTracker()
         state.vote_rejects = VoteRejectTracker()
         state.ema_rejects = EMAScoreTracker()
+        secondary_cfg = self._secondary_hysteresis_config()
+        state.secondary_hysteresis_config = secondary_cfg
+        if secondary_cfg.enabled:
+            state.secondary_hysteresis = SecondaryHysteresisTracker(secondary_cfg)
         self._sessions[self._session_key(user_id, session_id)] = state
         return True, "ok", policy
 
@@ -244,6 +264,8 @@ class AuthSessionManager:
             consecutive = state.consecutive_rejects
             vote = state.vote_rejects
             ema = state.ema_rejects
+            secondary = state.secondary_hysteresis
+            secondary_cfg = state.secondary_hysteresis_config
             sessions.append(
                 {
                     "device_id_hash": str(state.user_id),
@@ -274,6 +296,20 @@ class AuthSessionManager:
                         "interrupts": int(getattr(ema, "interrupts", 0) or 0),
                         "first_interrupt_window": getattr(ema, "first_interrupt_window", None),
                         "ema_score": getattr(ema, "ema_score", None),
+                    },
+                    "secondary_hysteresis": {
+                        "enabled": bool(getattr(secondary_cfg, "enabled", False)),
+                        "strategy": str(getattr(secondary_cfg, "strategy", "")),
+                        "primary_result_interval_sec": float(getattr(secondary_cfg, "primary_result_interval_sec", 0.0) or 0.0),
+                        "decision_time_sec": float(getattr(secondary_cfg, "decision_time_sec", 0.0) or 0.0),
+                        "effective_decision_time_sec": float(getattr(secondary_cfg, "effective_decision_time_sec", 0.0) or 0.0),
+                        "vote_window_size": int(getattr(secondary_cfg, "vote_window_size", 0) or 0),
+                        "vote_min_rejects": int(getattr(secondary_cfg, "vote_min_rejects", 0) or 0),
+                        "ema_alpha": float(getattr(secondary_cfg, "ema_alpha", 0.0) or 0.0),
+                        "ema_reject_threshold": float(getattr(secondary_cfg, "ema_reject_threshold", 0.0) or 0.0),
+                        "inputs_seen": int(getattr(secondary, "inputs_seen", 0) or 0),
+                        "decisions_emitted": int(getattr(secondary, "decisions_emitted", 0) or 0),
+                        "pending_count": int(secondary.pending_count()) if secondary is not None else 0,
                     },
                 }
             )
@@ -421,6 +457,7 @@ class AuthSessionManager:
                     session_id,
                     {
                         "window_id": window_id,
+                        "result_stage": "primary",
                         "score": raw_score,
                         "threshold": float(state.policy.threshold),
                         "raw_accept": accept,
@@ -456,9 +493,66 @@ class AuthSessionManager:
                     message=decision_message,
                 )
 
+            response_payload = final_payload
+            if final_payload is not None and state.secondary_hysteresis is not None:
+                secondary_result = state.secondary_hysteresis.update(
+                    accepted=bool(final_payload.accept),
+                    interrupt=bool(final_payload.interrupt),
+                )
+                if secondary_result is None:
+                    response_payload = None
+                else:
+                    primary_message = final_payload.message.strip()
+                    secondary_message = secondary_result.message
+                    if primary_message:
+                        secondary_message = f"{secondary_message}; 一次迟滞: {primary_message}"
+                    response_payload = AuthResultPayload(
+                        user=final_payload.user,
+                        session_id=final_payload.session_id,
+                        window_id=final_payload.window_id,
+                        score=float(secondary_result.score),
+                        threshold=float(secondary_result.threshold),
+                        accept=bool(secondary_result.accept),
+                        interrupt=bool(secondary_result.interrupt),
+                        normalized_score=float(secondary_result.score),
+                        k_rejects=int(final_payload.k_rejects),
+                        window_size=float(final_payload.window_size),
+                        model_version=final_payload.model_version,
+                        message=secondary_message,
+                    )
+                    await self._inference_storage.append_result(
+                        user_id,
+                        session_id,
+                        {
+                            "window_id": int(final_payload.window_id),
+                            "result_stage": "secondary",
+                            "score": float(secondary_result.score),
+                            "threshold": float(secondary_result.threshold),
+                            "accept": bool(secondary_result.accept),
+                            "interrupt": bool(secondary_result.interrupt),
+                            "normalized_score": float(secondary_result.score),
+                            "decision_strategy": f"secondary_{secondary_result.strategy}",
+                            "decision_score": float(secondary_result.score),
+                            "decision_threshold": float(secondary_result.threshold),
+                            "secondary_strategy": str(secondary_result.strategy),
+                            "secondary_input_count": int(secondary_result.input_count),
+                            "secondary_reject_count": int(secondary_result.reject_count),
+                            "secondary_ema_reject_score": secondary_result.ema_reject_score,
+                            "secondary_inputs_seen": int(state.secondary_hysteresis.inputs_seen),
+                            "secondary_decisions_emitted": int(state.secondary_hysteresis.decisions_emitted),
+                            "primary_accept": bool(final_payload.accept),
+                            "primary_interrupt": bool(final_payload.interrupt),
+                            "primary_score": float(final_payload.score),
+                            "primary_threshold": float(final_payload.threshold),
+                            "window_size": float(state.policy.window_size),
+                            "model_version": state.policy.model_version,
+                            "message": secondary_message,
+                        },
+                    )
+
             state.window_index += len(window_ids)
             self._trim_tail(state, combined_records)
-            return final_payload
+            return response_payload
 
     def _trim_tail(self, state: AuthSessionState, records: Dict[str, List[Dict[str, Any]]]) -> None:
         tail_ms = int(round(float(state.policy.window_size) * float(state.policy.overlap) * 1000))

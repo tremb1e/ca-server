@@ -724,7 +724,7 @@ rpc StartAuthentication(AuthSessionRequest) returns (AuthSessionResponse)
 rpc StreamSensorData(stream DataPacket) returns (stream ServerDirective)
 ```
 
-用途：App 持续上传加密压缩后的传感器批次；服务端返回 Ack 和可能的认证结果。
+用途：App 持续上传加密压缩后的传感器批次；服务端返回 Ack 和可能的认证结果。启用二次迟滞决策时，Ack 仍按每个 `DataPacket` 即时返回，`AuthResult` 只在二次迟滞窗口 ready 时返回；默认 vote 为最近 10 个一次迟滞结果聚合一次，因此正常 1 包/秒上传节奏下约 10 秒返回一次。
 
 请求 `DataPacket` 核心字段：
 
@@ -758,7 +758,7 @@ payload 解密解压后应为 `SerializedSensorBatch` protobuf：
 | oneof 字段 | 说明 |
 | --- | --- |
 | `ack` | 包接收/存储结果 |
-| `auth_result` | 在线认证结果 |
+| `auth_result` | 在线认证最终结果；启用二次迟滞时代表二次聚合后的最终结果 |
 | `policy` | 协议支持，当前流处理中未主动下发 |
 | `key_rotation` | 协议支持，当前未实现 |
 | `emergency` | 协议支持，当前未实现 |
@@ -792,6 +792,8 @@ payload 解密解压后应为 `SerializedSensorBatch` protobuf：
 | `k_rejects` | K 连拒阈值 |
 | `model_version` | 模型版本 |
 | `message` | 投票状态说明 |
+
+启用二次迟滞后，`score` / `normalized_score` / `threshold` / `accept` / `interrupt` 均表示二次迟滞后的最终决策。一次迟滞细节仍会写入服务端 inference 结果文件；默认二次策略为 `8-of-10` 投票，即最近 10 次一次迟滞结果中不通过次数达到 8 次时，最终 `AuthResult.accept=false`、`interrupt=true`。vote 的实际返回间隔由 `secondary_vote_window_size * primary_result_interval_sec` 决定；默认值与 `secondary_decision_time_sec=10.0` 对齐。
 
 ### 4.4 SendHeartbeat
 

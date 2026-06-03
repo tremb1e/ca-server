@@ -19,6 +19,7 @@ from .crypto.payload_codec import decrypt_then_decompress
 from .management.runtime import RuntimeContext, get_runtime_context
 from .protos import sensor_data_pb2, sensor_data_pb2_grpc
 from .utils.path_safety import UnsafePathSegmentError, validate_storage_id
+from .utils.secondary_hysteresis import SecondaryHysteresisConfig
 from .utils.tls import TLS12_13_CIPHERS, TLSProbeResult, probe_tls_configuration
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,20 @@ def _message_to_dict(message, include_defaults: bool = False) -> dict:
         kwargs.pop("including_default_value_fields", None)
         kwargs.pop("always_print_fields_with_no_presence", None)
         return json_format.MessageToDict(message, **kwargs)
+
+
+def _effective_secondary_decision_time_sec(auth_cfg) -> float:
+    cfg = SecondaryHysteresisConfig(
+        enabled=bool(getattr(auth_cfg, "secondary_hysteresis_enabled", True)),
+        strategy=str(getattr(auth_cfg, "secondary_hysteresis_strategy", "vote") or "vote"),
+        primary_result_interval_sec=float(getattr(auth_cfg, "primary_result_interval_sec", 1.0) or 1.0),
+        decision_time_sec=float(getattr(auth_cfg, "secondary_decision_time_sec", 10.0) or 10.0),
+        vote_window_size=int(getattr(auth_cfg, "secondary_vote_window_size", 10) or 10),
+        vote_min_rejects=int(getattr(auth_cfg, "secondary_vote_min_rejects", 8) or 8),
+        ema_alpha=float(getattr(auth_cfg, "secondary_ema_alpha", 0.25) or 0.25),
+        ema_reject_threshold=float(getattr(auth_cfg, "secondary_ema_reject_threshold", 0.8) or 0.8),
+    )
+    return float(cfg.effective_decision_time_sec)
 
 
 class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
@@ -153,6 +168,9 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
                 decision_time_sec=0.0,
             )
         ca_cfg = get_ca_config()
+        decision_time_sec = float(ca_cfg.auth.max_decision_time_sec)
+        if bool(getattr(ca_cfg.auth, "secondary_hysteresis_enabled", False)):
+            decision_time_sec = _effective_secondary_decision_time_sec(ca_cfg.auth)
         if self.auth_manager.has_trained_model(device_id_hash):
             accepted, message, policy = self.auth_manager.start_session(device_id_hash, session_id)
             logger.info(
@@ -169,7 +187,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
                 message=str(message),
                 model_version=str(policy.model_version if policy else ""),
                 window_size_sec=float(policy.window_size if policy else 0.0),
-                decision_time_sec=float(ca_cfg.auth.max_decision_time_sec),
+                decision_time_sec=float(decision_time_sec),
             )
 
         readiness = self.training_manager.get_readiness(device_id_hash)
@@ -196,7 +214,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
             message=reason,
             model_version="",
             window_size_sec=0.0,
-            decision_time_sec=float(ca_cfg.auth.max_decision_time_sec),
+            decision_time_sec=float(decision_time_sec),
         )
 
     async def SendHeartbeat(self, request, context):
