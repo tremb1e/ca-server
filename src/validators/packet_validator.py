@@ -30,7 +30,7 @@ class DataPacket(BaseModel):
     window_start_ms: int
     window_end_ms: int
     type: str
-    foreground_package_name: Optional[str] = None
+    foreground_app_name: Optional[str] = None
     sensor_data: list[Dict[str, Any]]
 
     @field_validator("device_id_hash", "session_id", mode="before")
@@ -79,6 +79,11 @@ class PacketValidator:
         packet_sequence: int
     ) -> Tuple[bool, Optional[DataPacket], Optional[str]]:
         try:
+            if "foreground_package_name" in json_data:
+                error_msg = "Deprecated field foreground_package_name is not accepted; use foreground_app_name"
+                logger.error(error_msg)
+                return False, None, error_msg
+
             packet = DataPacket(**json_data)
 
             if packet.device_id_hash != device_id_hash:

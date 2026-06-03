@@ -103,6 +103,7 @@ async def test_stream_packet_uses_device_hash_as_batch_id(tmp_path):
                 z=3.0,
                 accuracy=3,
                 seq_no=1,
+                foreground_app_name="com.example.current",
             )
         ],
     )
@@ -124,5 +125,8 @@ async def test_stream_packet_uses_device_hash_as_batch_id(tmp_path):
     stored = service.storage.records[0]["packet_data"]
     assert stored["decryption_status"] == "parsed_sensor_batch"
     assert set(stored["sensor_batch"]) == {"samples", "session_id"}
+    sample = stored["sensor_batch"]["samples"][0]
+    assert sample["foreground_app_name"] == "com.example.current"
+    assert "foreground_app_hash" not in sample
     assert service.storage.records[0]["device_id_hash"] == "device-a"
     assert service.storage.records[0]["session_id"] == "auth-session"

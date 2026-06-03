@@ -64,7 +64,7 @@ class TestSensorDataEndpoint:
             "window_start_ms": int(datetime.now().timestamp() * 1000) - 5000,
             "window_end_ms": int(datetime.now().timestamp() * 1000),
             "type": "sensor",
-            "foreground_package_name": "com.test.app",
+            "foreground_app_name": "com.test.app",
             "sensor_data": [
                 {
                     "sensor_name": "accelerometer",

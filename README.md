@@ -138,6 +138,12 @@ docker compose run --rm ca-server auth --user <device_id_hash> --csv-path /app/d
 - 模型就绪检查同时要求 policy、checkpoint、config 和 `processed_data/z-score/<user>/scaler.json` 完整可读。
 - 在 Ascend 910B 8 卡机器上，`device=auto` 会优先使用 NPU，训练管理器会把并行用户任务分配到可见 NPU 设备池。
 
+## 数据字段说明
+
+- gRPC `SerializedSensorBatch.samples[]` 的前台应用字段为 `foreground_app_name`，字段号为 8，内容是 Android 当前前台应用的明文包名。
+- HTTP JSON 兼容链路使用同名 `foreground_app_name` 可选字段。
+- 旧字段 `foreground_app_hash` / `foreground_package_name` 已不作为当前 app/server 数据契约使用。
+
 ## 宿主机目录映射
 
 Compose 保留并补全了以下目录映射：

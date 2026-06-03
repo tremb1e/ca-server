@@ -140,7 +140,7 @@
   "window_start_ms": 1643723400000,
   "window_end_ms": 1643723401000,
   "type": "sensor",
-  "foreground_package_name": "包名",
+  "foreground_app_name": "com.example.app",
   "sensor_data": [
     {
       "sensor_name": "accelerometer",

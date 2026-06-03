@@ -15,9 +15,9 @@ psutil>=5.9.8,<8.0.0
 pytest>=8.2.0,<9.0.0
 pytest-asyncio>=0.23.0,<0.25.0
 httpx>=0.27.0,<0.29.0
-grpcio>=1.67.0,<2.0.0
-grpcio-tools>=1.67.0,<2.0.0
-grpcio-health-checking>=1.67.0,<2.0.0
+grpcio>=1.78.1,<2.0.0
+grpcio-tools>=1.78.1,<2.0.0
+grpcio-health-checking>=1.78.1,<2.0.0
 googleapis-common-protos>=1.70.0,<2.0.0
 pandas>=2.2.0,<3.0.0
 # Ascend CANN Python runtime (te/tbe) is currently incompatible with NumPy 2.x.

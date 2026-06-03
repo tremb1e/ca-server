@@ -19,7 +19,7 @@ class TestPacketValidator:
             "window_start_ms": int(datetime.now().timestamp() * 1000) - 5000,
             "window_end_ms": int(datetime.now().timestamp() * 1000),
             "type": "sensor",
-            "foreground_package_name": "com.example.app",
+            "foreground_app_name": "com.example.app",
             "sensor_data": [
                 {
                     "sensor_name": "accelerometer",
@@ -158,3 +158,15 @@ class TestPacketValidator:
         assert success is False
         assert packet is None
         assert "validation failed" in error.lower()
+
+    def test_validate_rejects_deprecated_foreground_package_name(self, validator, valid_packet_data):
+        valid_packet_data.pop("foreground_app_name")
+        valid_packet_data["foreground_package_name"] = "com.example.app"
+
+        success, packet, error = validator.validate(
+            valid_packet_data, "123456789", "987654321", 1
+        )
+
+        assert success is False
+        assert packet is None
+        assert "foreground_package_name" in error

@@ -50,7 +50,7 @@ message SensorSample {
     float z = 5;
     int32 accuracy = 6;
     int64 seq_no = 7;                      // 自增序号，保障一致性/防重放
-    string foreground_app_hash = 8;        // HMAC(key_id, packageName) - 非明文
+    string foreground_app_name = 8;        // 当前前台应用的明文包名
 }
 
 enum SensorType {

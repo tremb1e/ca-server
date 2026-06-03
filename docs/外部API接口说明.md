@@ -749,6 +749,8 @@ payload 解密解压后应为 `SerializedSensorBatch` protobuf：
 | `samples` | 传感器样本列表 |
 | `session_id` | 业务 session ID |
 
+`samples[]` 中的前台应用上下文字段为 `foreground_app_name`，字段号 8，内容是 Android 当前前台应用的明文包名。
+
 当前在线训练/认证路径以外层 `DataPacket.device_id_hash` 作为设备主索引；payload 内部只包含样本和 session。
 
 服务端响应 `ServerDirective`：
