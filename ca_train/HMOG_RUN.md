@@ -73,7 +73,7 @@ python3 -m src.training.cli \
 ```bash
 python3 ca_train/hmog_vqgan_experiment.py \
   --dataset-path <processed_data>/window \
-  --users <device_id_hash> \
+  --users=<device_id_hash> \
   --window-sizes 0.2 \
   --device auto \
   --sweep-epochs 50 \
@@ -83,14 +83,14 @@ python3 ca_train/hmog_vqgan_experiment.py \
   --max-parallel-train 8
 ```
 
-`--device auto` 会优先选择 NPU，其次 CUDA，最后 CPU。华为 Kunpeng 920 + Ascend 910B 8 卡环境下，训练管理器会把多个用户训练任务按设备池分配到 `npu:0` 到 `npu:7`，用于并行利用 8 张 NPU。
+`--device auto` 会优先选择 NPU，其次 CUDA，最后 CPU。华为 Kunpeng 920 + Ascend 910B 8 卡环境下，训练管理器会把多个用户训练任务按设备池分配到 `npu:0` 到 `npu:7`，用于并行利用 8 张 NPU。若设备 ID 以 `-` 开头，直接调用该脚本时必须使用 `--users=<device_id_hash>`。
 
 常用 smoke test 参数：
 
 ```bash
 python3 ca_train/hmog_vqgan_experiment.py \
   --dataset-path /tmp/ca-server-functional/processed/window \
-  --users <device_id_hash> \
+  --users=<device_id_hash> \
   --window-sizes 0.2 \
   --device auto \
   --sweep-epochs 1 \

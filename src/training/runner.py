@@ -18,6 +18,10 @@ from ..utils.runtime import app_root
 logger = logging.getLogger(__name__)
 
 
+class TrainingCommandError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class TrainingRunResult:
     window_size: float
@@ -69,20 +73,59 @@ def _write_vqgan_config(cfg: Dict, checkpoint: Path) -> Path:
     return config_path
 
 
-def _extract_last_training_error(log_dir: Path) -> Optional[str]:
-    log_path = log_dir / "hmog_vqgan.log"
-    if not log_path.exists():
+def _extract_last_error_line(path: Path) -> Optional[str]:
+    if not path.exists():
         return None
     try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception:
         return None
-    patterns = ("[ERROR]", "Traceback", "ValueError:", "RuntimeError:")
+    patterns = (
+        "[ERROR]",
+        "Traceback",
+        "ValueError:",
+        "RuntimeError:",
+        "FileNotFoundError:",
+        "ModuleNotFoundError:",
+        "ImportError:",
+        "error:",
+        "unrecognized arguments",
+        "usage:",
+    )
     for raw in reversed(lines):
         line = raw.strip()
         if line and any(p in line for p in patterns):
             return line
     return None
+
+
+def _extract_last_training_error(log_dir: Path) -> Optional[str]:
+    for name in ("hmog_vqgan.log", "hmog_vqgan_subprocess.log"):
+        line = _extract_last_error_line(log_dir / name)
+        if line:
+            return line
+    return None
+
+
+def _run_training_command(cmd: Sequence[str], *, log_dir: Path) -> None:
+    subprocess_log = log_dir / "hmog_vqgan_subprocess.log"
+    subprocess_log.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Running training command: %s", " ".join(str(part) for part in cmd))
+    with subprocess_log.open("ab") as stream:
+        completed = subprocess.run(
+            list(cmd),
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    returncode = int(getattr(completed, "returncode", 0) or 0)
+    if returncode != 0:
+        detail = _extract_last_training_error(log_dir)
+        suffix = f"; last_error={detail}" if detail else ""
+        raise TrainingCommandError(
+            f"Training command failed with exit code {returncode}: {' '.join(str(part) for part in cmd)}"
+            f"{suffix}; log={subprocess_log}"
+        )
 
 
 def _read_best_window(log_dir: Path, user_id: str) -> Dict:
@@ -234,8 +277,7 @@ def run_window_sweep_for_user(
                 *ca_train_command("hmog_vqgan_experiment.py", override=ca_train_override),
                 "--dataset-path",
                 str(dataset_path),
-                "--users",
-                str(user_id),
+                f"--users={user_id}",
                 "--window-sizes",
                 f"{ws_f:.1f}",
                 "--overlap",
@@ -272,7 +314,7 @@ def run_window_sweep_for_user(
             if max_eval_per_split is not None:
                 cmd.extend(["--max-eval-per-split", str(int(max_eval_per_split))])
 
-            subprocess.run(cmd, check=True)
+            _run_training_command(cmd, log_dir=log_dir)
             summary = _read_best_window(log_dir, user_id)
 
         if not isinstance(summary, dict):

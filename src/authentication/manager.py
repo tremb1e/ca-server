@@ -383,7 +383,21 @@ class AuthSessionManager:
                     use_amp=True,
                 )
 
-            final_payload: Optional[AuthResultPayload] = None
+            response_payload: Optional[AuthResultPayload] = None
+            secondary_sample_every = 1
+            secondary_sample_phase = 0
+            if state.secondary_hysteresis is not None and len(window_ids) > 1:
+                secondary_cfg = state.secondary_hysteresis_config
+                primary_interval = float(
+                    getattr(secondary_cfg, "normalized_primary_interval_sec", 1.0) or 1.0
+                )
+                stride_sec = float(state.policy.window_size) * (1.0 - float(state.policy.overlap))
+                if stride_sec > 0.0:
+                    secondary_sample_every = max(1, int(round(primary_interval / stride_sec)))
+                    secondary_sample_phase = max(
+                        0,
+                        int(math.floor(max(0.0, primary_interval - float(state.policy.window_size)) / stride_sec)),
+                    )
             for offset, score in zip(window_ids, scores):
                 window_id = state.window_index + int(offset)
                 raw_score = float(score)
@@ -478,7 +492,7 @@ class AuthSessionManager:
                     },
                 )
 
-                final_payload = AuthResultPayload(
+                primary_payload = AuthResultPayload(
                     user=user_id,
                     session_id=session_id,
                     window_id=window_id,
@@ -492,63 +506,78 @@ class AuthSessionManager:
                     model_version=state.policy.model_version,
                     message=decision_message,
                 )
+                if state.secondary_hysteresis is None:
+                    response_payload = primary_payload
+                    continue
 
-            response_payload = final_payload
-            if final_payload is not None and state.secondary_hysteresis is not None:
+                feed_secondary = (
+                    len(window_ids) == 1
+                    or secondary_sample_every <= 1
+                    or (
+                        (int(primary_payload.window_id) - int(secondary_sample_phase))
+                        % int(secondary_sample_every)
+                        == 0
+                    )
+                )
+                if not feed_secondary:
+                    continue
+
                 secondary_result = state.secondary_hysteresis.update(
-                    accepted=bool(final_payload.accept),
-                    interrupt=bool(final_payload.interrupt),
+                    accepted=bool(primary_payload.accept),
+                    interrupt=bool(primary_payload.interrupt),
                 )
                 if secondary_result is None:
-                    response_payload = None
-                else:
-                    primary_message = final_payload.message.strip()
-                    secondary_message = secondary_result.message
-                    if primary_message:
-                        secondary_message = f"{secondary_message}; 一次迟滞: {primary_message}"
-                    response_payload = AuthResultPayload(
-                        user=final_payload.user,
-                        session_id=final_payload.session_id,
-                        window_id=final_payload.window_id,
-                        score=float(secondary_result.score),
-                        threshold=float(secondary_result.threshold),
-                        accept=bool(secondary_result.accept),
-                        interrupt=bool(secondary_result.interrupt),
-                        normalized_score=float(secondary_result.score),
-                        k_rejects=int(final_payload.k_rejects),
-                        window_size=float(final_payload.window_size),
-                        model_version=final_payload.model_version,
-                        message=secondary_message,
-                    )
-                    await self._inference_storage.append_result(
-                        user_id,
-                        session_id,
-                        {
-                            "window_id": int(final_payload.window_id),
-                            "result_stage": "secondary",
-                            "score": float(secondary_result.score),
-                            "threshold": float(secondary_result.threshold),
-                            "accept": bool(secondary_result.accept),
-                            "interrupt": bool(secondary_result.interrupt),
-                            "normalized_score": float(secondary_result.score),
-                            "decision_strategy": f"secondary_{secondary_result.strategy}",
-                            "decision_score": float(secondary_result.score),
-                            "decision_threshold": float(secondary_result.threshold),
-                            "secondary_strategy": str(secondary_result.strategy),
-                            "secondary_input_count": int(secondary_result.input_count),
-                            "secondary_reject_count": int(secondary_result.reject_count),
-                            "secondary_ema_reject_score": secondary_result.ema_reject_score,
-                            "secondary_inputs_seen": int(state.secondary_hysteresis.inputs_seen),
-                            "secondary_decisions_emitted": int(state.secondary_hysteresis.decisions_emitted),
-                            "primary_accept": bool(final_payload.accept),
-                            "primary_interrupt": bool(final_payload.interrupt),
-                            "primary_score": float(final_payload.score),
-                            "primary_threshold": float(final_payload.threshold),
-                            "window_size": float(state.policy.window_size),
-                            "model_version": state.policy.model_version,
-                            "message": secondary_message,
-                        },
-                    )
+                    continue
+
+                primary_message = primary_payload.message.strip()
+                secondary_message = secondary_result.message
+                if primary_message:
+                    secondary_message = f"{secondary_message}; 一次迟滞: {primary_message}"
+                response_payload = AuthResultPayload(
+                    user=primary_payload.user,
+                    session_id=primary_payload.session_id,
+                    window_id=primary_payload.window_id,
+                    score=float(secondary_result.score),
+                    threshold=float(secondary_result.threshold),
+                    accept=bool(secondary_result.accept),
+                    interrupt=bool(secondary_result.interrupt),
+                    normalized_score=float(secondary_result.score),
+                    k_rejects=int(primary_payload.k_rejects),
+                    window_size=float(primary_payload.window_size),
+                    model_version=primary_payload.model_version,
+                    message=secondary_message,
+                )
+                await self._inference_storage.append_result(
+                    user_id,
+                    session_id,
+                    {
+                        "window_id": int(primary_payload.window_id),
+                        "result_stage": "secondary",
+                        "score": float(secondary_result.score),
+                        "threshold": float(secondary_result.threshold),
+                        "accept": bool(secondary_result.accept),
+                        "interrupt": bool(secondary_result.interrupt),
+                        "normalized_score": float(secondary_result.score),
+                        "decision_strategy": f"secondary_{secondary_result.strategy}",
+                        "decision_score": float(secondary_result.score),
+                        "decision_threshold": float(secondary_result.threshold),
+                        "secondary_strategy": str(secondary_result.strategy),
+                        "secondary_input_count": int(secondary_result.input_count),
+                        "secondary_reject_count": int(secondary_result.reject_count),
+                        "secondary_ema_reject_score": secondary_result.ema_reject_score,
+                        "secondary_inputs_seen": int(state.secondary_hysteresis.inputs_seen),
+                        "secondary_decisions_emitted": int(state.secondary_hysteresis.decisions_emitted),
+                        "secondary_sample_every": int(secondary_sample_every),
+                        "secondary_sample_phase": int(secondary_sample_phase),
+                        "primary_accept": bool(primary_payload.accept),
+                        "primary_interrupt": bool(primary_payload.interrupt),
+                        "primary_score": float(primary_payload.score),
+                        "primary_threshold": float(primary_payload.threshold),
+                        "window_size": float(state.policy.window_size),
+                        "model_version": state.policy.model_version,
+                        "message": secondary_message,
+                    },
+                )
 
             state.window_index += len(window_ids)
             self._trim_tail(state, combined_records)

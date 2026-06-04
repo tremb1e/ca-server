@@ -4,12 +4,14 @@ import argparse
 import logging
 from pathlib import Path
 
+from ..utils.cli_args import normalize_option_value_args
 from .runner import load_best_policy, run_auth_inference
 
 logger = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = normalize_option_value_args(argv, options={"--user"})
     parser = argparse.ArgumentParser(description="Run Continuous Authentication inference from a window CSV")
     parser.add_argument("--user", required=True, help="Target device_id_hash.")
     parser.add_argument(
@@ -21,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="Inference device, e.g. auto / npu:0 / cuda:0 / cpu.")
     parser.add_argument("--output-csv", default=None, help="Optional output CSV path; defaults under data_storage/models/<device_id_hash>/inference/.")
     parser.add_argument("--max-windows", type=int, default=None, help="Debug: stop after N windows (avoid scanning huge CSVs).")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:

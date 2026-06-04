@@ -20,6 +20,14 @@ from src.utils.secondary_hysteresis import SecondaryHysteresisConfig, SecondaryH
 
 
 @dataclass(frozen=True)
+class ScoreArrays:
+    session_ids: np.ndarray
+    labels: np.ndarray
+    score: np.ndarray
+    time_sec: np.ndarray
+
+
+@dataclass(frozen=True)
 class DecisionArrays:
     session_ids: np.ndarray
     labels: np.ndarray
@@ -63,17 +71,16 @@ def _ema_by_session(session_ids: np.ndarray, scores: np.ndarray, alpha: float) -
     return out
 
 
-def _primary_ema_decisions(
+def _primary_ema_scores(
     *,
     session_ids: np.ndarray,
     labels: np.ndarray,
     scores: np.ndarray,
-    threshold: float,
     ema_alpha: float,
     window_sec: float,
     overlap: float,
     primary_interval_sec: float,
-) -> DecisionArrays:
+) -> ScoreArrays:
     ema = _ema_by_session(session_ids, scores, alpha=float(ema_alpha))
     stride_sec = float(window_sec) * (1.0 - float(overlap))
     sample_every = max(1, int(round(float(primary_interval_sec) / max(stride_sec, 1e-9))))
@@ -91,27 +98,57 @@ def _primary_ema_decisions(
             times.append(float(bucket * primary_interval_sec))
 
     if not idxs:
-        return DecisionArrays(
+        return ScoreArrays(
             session_ids=np.empty((0,), dtype=np.int32),
             labels=np.empty((0,), dtype=np.int8),
-            accept=np.empty((0,), dtype=bool),
-            interrupt=np.empty((0,), dtype=bool),
             score=np.empty((0,), dtype=np.float32),
-            threshold=np.empty((0,), dtype=np.float32),
             time_sec=np.empty((0,), dtype=np.float32),
         )
 
     selected_scores = ema[np.asarray(idxs, dtype=np.int64)]
-    accepted = selected_scores >= float(threshold)
-    return DecisionArrays(
+    return ScoreArrays(
         session_ids=session_ids[np.asarray(idxs, dtype=np.int64)].astype(np.int32, copy=False),
         labels=labels[np.asarray(idxs, dtype=np.int64)].astype(np.int8, copy=False),
+        score=selected_scores.astype(np.float32, copy=False),
+        time_sec=np.asarray(times, dtype=np.float32),
+    )
+
+
+def _decisions_from_scores(sampled: ScoreArrays, threshold: float) -> DecisionArrays:
+    selected_scores = sampled.score
+    accepted = selected_scores >= float(threshold)
+    return DecisionArrays(
+        session_ids=sampled.session_ids,
+        labels=sampled.labels,
         accept=accepted.astype(bool, copy=False),
         interrupt=(~accepted).astype(bool, copy=False),
         score=selected_scores.astype(np.float32, copy=False),
-        threshold=np.full((len(idxs),), float(threshold), dtype=np.float32),
-        time_sec=np.asarray(times, dtype=np.float32),
+        threshold=np.full((len(selected_scores),), float(threshold), dtype=np.float32),
+        time_sec=sampled.time_sec,
     )
+
+
+def _primary_ema_decisions(
+    *,
+    session_ids: np.ndarray,
+    labels: np.ndarray,
+    scores: np.ndarray,
+    threshold: float,
+    ema_alpha: float,
+    window_sec: float,
+    overlap: float,
+    primary_interval_sec: float,
+) -> DecisionArrays:
+    sampled = _primary_ema_scores(
+        session_ids=session_ids,
+        labels=labels,
+        scores=scores,
+        ema_alpha=ema_alpha,
+        window_sec=window_sec,
+        overlap=overlap,
+        primary_interval_sec=primary_interval_sec,
+    )
+    return _decisions_from_scores(sampled, threshold)
 
 
 def _secondary_decisions(primary: DecisionArrays, cfg: SecondaryHysteresisConfig) -> DecisionArrays:
@@ -393,11 +430,338 @@ def _write_report(rows: Sequence[Dict[str, object]], path: Path, *, models_root:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _secondary_configs(
+    *,
+    primary_interval_sec: float,
+    secondary_time_sec: float,
+) -> Dict[str, Optional[SecondaryHysteresisConfig]]:
+    vote_window_size = max(1, int(round(float(secondary_time_sec) / float(primary_interval_sec))))
+    return {
+        "一次迟滞 EMA": None,
+        "二次迟滞 EMA+EMA": SecondaryHysteresisConfig(
+            enabled=True,
+            strategy="ema",
+            primary_result_interval_sec=primary_interval_sec,
+            decision_time_sec=secondary_time_sec,
+            ema_alpha=0.25,
+            ema_reject_threshold=0.8,
+        ),
+        f"二次迟滞 EMA+vote {math.ceil(0.8 * vote_window_size)}/{vote_window_size}": SecondaryHysteresisConfig(
+            enabled=True,
+            strategy="vote",
+            primary_result_interval_sec=primary_interval_sec,
+            decision_time_sec=secondary_time_sec,
+            vote_window_size=vote_window_size,
+            vote_min_rejects=math.ceil(0.8 * vote_window_size),
+        ),
+    }
+
+
+def _variant_decisions(
+    sampled: ScoreArrays,
+    *,
+    threshold: float,
+    secondary_cfg: Optional[SecondaryHysteresisConfig],
+) -> DecisionArrays:
+    primary = _decisions_from_scores(sampled, threshold)
+    if secondary_cfg is None:
+        return primary
+    return _secondary_decisions(primary, secondary_cfg)
+
+
+def _select_threshold_for_target_frr(
+    sampled_val: ScoreArrays,
+    *,
+    target_frr: float,
+    secondary_cfg: Optional[SecondaryHysteresisConfig],
+) -> Tuple[float, Dict[str, float]]:
+    candidates = np.unique(sampled_val.score.astype(np.float64, copy=False))
+    if candidates.size == 0:
+        return 0.0, _metrics(_variant_decisions(sampled_val, threshold=0.0, secondary_cfg=secondary_cfg))
+
+    lo = 0
+    hi = int(candidates.size - 1)
+    best_idx = 0
+    best_metrics: Optional[Dict[str, float]] = None
+    target_frr = max(0.0, min(1.0, float(target_frr)))
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        threshold = float(candidates[mid])
+        arr = _variant_decisions(sampled_val, threshold=threshold, secondary_cfg=secondary_cfg)
+        metrics = _metrics(arr)
+        if float(metrics["frr_false_reject_rate"]) <= target_frr + 1e-12:
+            best_idx = mid
+            best_metrics = metrics
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    threshold = float(candidates[best_idx])
+    if best_metrics is None:
+        best_metrics = _metrics(_variant_decisions(sampled_val, threshold=threshold, secondary_cfg=secondary_cfg))
+    return threshold, best_metrics
+
+
+def _load_sampled_scores(
+    user_dir: Path,
+    *,
+    split: str,
+    window_sec: float,
+    overlap: float,
+    ema_alpha: float,
+    primary_interval_sec: float,
+) -> ScoreArrays:
+    cache = user_dir / "policy_search" / "cache" / "vqgan_only" / f"ws_{window_sec:.1f}" / f"{split}.npz"
+    payload = np.load(cache)
+    return _primary_ema_scores(
+        session_ids=payload["session_ids"].astype(np.int32, copy=False),
+        labels=payload["labels"].astype(np.int8, copy=False),
+        scores=payload["scores"].astype(np.float32, copy=False),
+        ema_alpha=ema_alpha,
+        window_sec=window_sec,
+        overlap=overlap,
+        primary_interval_sec=primary_interval_sec,
+    )
+
+
+def _evaluate_user_target_frr(
+    user_dir: Path,
+    *,
+    target_frrs: Sequence[float],
+    primary_interval_sec: float,
+    secondary_time_sec: float,
+) -> List[Dict[str, object]]:
+    policy = _load_policy(user_dir / "best_lock_policy.json")
+    window_sec = float(policy.get("window", 0.2) or 0.2)
+    overlap = float(policy.get("overlap", 0.5) or 0.5)
+    ema_alpha = float(policy.get("ema_alpha", 0.25) or 0.25)
+    sampled_val = _load_sampled_scores(
+        user_dir,
+        split="val",
+        window_sec=window_sec,
+        overlap=overlap,
+        ema_alpha=ema_alpha,
+        primary_interval_sec=primary_interval_sec,
+    )
+    sampled_test = _load_sampled_scores(
+        user_dir,
+        split="test",
+        window_sec=window_sec,
+        overlap=overlap,
+        ema_alpha=ema_alpha,
+        primary_interval_sec=primary_interval_sec,
+    )
+
+    rows: List[Dict[str, object]] = []
+    variants = _secondary_configs(
+        primary_interval_sec=primary_interval_sec,
+        secondary_time_sec=secondary_time_sec,
+    )
+    for target_frr in target_frrs:
+        for variant, secondary_cfg in variants.items():
+            threshold, val_metrics = _select_threshold_for_target_frr(
+                sampled_val,
+                target_frr=target_frr,
+                secondary_cfg=secondary_cfg,
+            )
+            test_arr = _variant_decisions(sampled_test, threshold=threshold, secondary_cfg=secondary_cfg)
+            test_metrics = _metrics(test_arr)
+            row: Dict[str, object] = {
+                "user": user_dir.name,
+                "target_frr": float(target_frr),
+                "variant": variant,
+                "selected_threshold": float(threshold),
+                "ema_alpha": ema_alpha,
+                "primary_interval_sec": primary_interval_sec,
+                "secondary_time_sec": secondary_time_sec if variant.startswith("二次") else primary_interval_sec,
+                "validation_outputs": val_metrics["outputs"],
+                "validation_genuine_outputs": val_metrics["genuine_outputs"],
+                "validation_impostor_outputs": val_metrics["impostor_outputs"],
+                "validation_frr": val_metrics["frr_false_reject_rate"],
+                "validation_far": val_metrics["far_false_accept_rate"],
+            }
+            row.update(test_metrics)
+            rows.append(row)
+    return rows
+
+
+def _aggregate_target_rows(rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    grouped: Dict[Tuple[float, str], List[Dict[str, object]]] = {}
+    for row in rows:
+        grouped.setdefault((float(row["target_frr"]), str(row["variant"])), []).append(row)
+
+    out: List[Dict[str, object]] = []
+    for (target_frr, variant), group in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1])):
+        total_outputs = sum(float(r["outputs"]) for r in group)
+        total_genuine = sum(float(r["genuine_outputs"]) for r in group)
+        total_impostor = sum(float(r["impostor_outputs"]) for r in group)
+        val_genuine = sum(float(r["validation_genuine_outputs"]) for r in group)
+        val_impostor = sum(float(r["validation_impostor_outputs"]) for r in group)
+        genuine_first_values = [
+            float(r["genuine_mean_first_reject_sec"])
+            for r in group
+            if float(r["genuine_mean_first_reject_sec"]) > 0.0
+        ]
+        impostor_first_values = [
+            float(r["impostor_mean_first_reject_sec"])
+            for r in group
+            if float(r["impostor_mean_first_reject_sec"]) > 0.0
+        ]
+        out.append(
+            {
+                "user": "ALL_WEIGHTED",
+                "target_frr": target_frr,
+                "variant": variant,
+                "selected_threshold": "",
+                "ema_alpha": "",
+                "primary_interval_sec": "",
+                "secondary_time_sec": "",
+                "validation_outputs": sum(float(r["validation_outputs"]) for r in group),
+                "validation_genuine_outputs": val_genuine,
+                "validation_impostor_outputs": val_impostor,
+                "validation_frr": sum(float(r["validation_frr"]) * float(r["validation_genuine_outputs"]) for r in group) / max(val_genuine, 1.0),
+                "validation_far": sum(float(r["validation_far"]) * float(r["validation_impostor_outputs"]) for r in group) / max(val_impostor, 1.0),
+                "outputs": total_outputs,
+                "genuine_outputs": total_genuine,
+                "impostor_outputs": total_impostor,
+                "frr_false_reject_rate": sum(float(r["frr_false_reject_rate"]) * float(r["genuine_outputs"]) for r in group) / max(total_genuine, 1.0),
+                "far_false_accept_rate": sum(float(r["far_false_accept_rate"]) * float(r["impostor_outputs"]) for r in group) / max(total_impostor, 1.0),
+                "impostor_reject_rate": sum(float(r["impostor_reject_rate"]) * float(r["impostor_outputs"]) for r in group) / max(total_impostor, 1.0),
+                "err": sum(float(r["err"]) * float(r["outputs"]) for r in group) / max(total_outputs, 1.0),
+                "genuine_first_reject_sessions": sum(float(r["genuine_first_reject_sessions"]) for r in group),
+                "impostor_first_reject_sessions": sum(float(r["impostor_first_reject_sessions"]) for r in group),
+                "genuine_mean_first_reject_sec": float(np.mean(genuine_first_values)) if genuine_first_values else 0.0,
+                "impostor_mean_first_reject_sec": float(np.mean(impostor_first_values)) if impostor_first_values else 0.0,
+            }
+        )
+    return out
+
+
+def _target_label(value: object) -> str:
+    return f"{float(value) * 100:.0f}%"
+
+
+def _write_target_report(rows: Sequence[Dict[str, object]], path: Path, *, models_root: Path) -> None:
+    aggregate = [r for r in rows if r.get("user") == "ALL_WEIGHTED"]
+    detail = [r for r in rows if r.get("user") != "ALL_WEIGHTED"]
+    lines = [
+        "# HMOG 不同 FRR 目标下的二次迟滞性能对比报告",
+        "",
+        "## 测试方法",
+        "",
+        f"- 模型目录：`{models_root}`",
+        "- 数据来源：各用户 `policy_search/cache/vqgan_only/ws_0.2/{val,test}.npz`，复用已有 VQGAN-only 分数缓存。",
+        "- 阈值选择：每个用户、每个目标 FRR、每个方案都在 `val.npz` 上选择最高 EMA 分数阈值，使该方案的验证集 FRR 不超过目标值。",
+        "- 评估方式：把验证集选出的阈值固定后，在 `test.npz` 上计算性能指标；不限制、不惩罚检测出时间，首次拒绝时间只作为观察指标。",
+        "- 一次迟滞：VQGAN 分数先按用户 `best_lock_policy.json` 中的 `ema_alpha` 做 EMA，再按 1 秒节拍抽样为一次返回结果。",
+        "- 二次迟滞 EMA+EMA：对一次结果 reject(0/1) 序列做二次 EMA，10 个一次结果输出一次，`alpha=0.25`，reject 阈值 `0.8`。",
+        "- 二次迟滞 EMA+vote：对最近 10 个一次结果做 `8-of-10` 投票，10 个一次结果输出一次。",
+        "",
+        "## 汇总结果",
+        "",
+        "| 目标 FRR | 方案 | 验证 FRR | 验证 FAR | 测试 FRR | 测试 FAR | 攻击拒绝率 | ERR | 输出数 | 攻击平均首次拒绝(s) |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in aggregate:
+        lines.append(
+            "| {target} | {variant} | {val_frr} | {val_far} | {test_frr} | {test_far} | {imp_reject} | {err} | {outputs:.0f} | {imp_first:.2f} |".format(
+                target=_target_label(row["target_frr"]),
+                variant=row["variant"],
+                val_frr=_format_pct(row["validation_frr"]),
+                val_far=_format_pct(row["validation_far"]),
+                test_frr=_format_pct(row["frr_false_reject_rate"]),
+                test_far=_format_pct(row["far_false_accept_rate"]),
+                imp_reject=_format_pct(row["impostor_reject_rate"]),
+                err=_format_pct(row["err"]),
+                outputs=float(row["outputs"]),
+                imp_first=float(row["impostor_mean_first_reject_sec"]),
+            )
+        )
+
+    lines.extend(["", "## 分析结论", ""])
+    by_target: Dict[float, Dict[str, Dict[str, object]]] = {}
+    for row in aggregate:
+        by_target.setdefault(float(row["target_frr"]), {})[str(row["variant"])] = row
+    for target in sorted(by_target):
+        group = by_target[target]
+        primary = group.get("一次迟滞 EMA")
+        ema_ema = group.get("二次迟滞 EMA+EMA")
+        vote = next((v for k, v in group.items() if k.startswith("二次迟滞 EMA+vote")), None)
+        if primary and ema_ema and vote:
+            lines.append(
+                "- 目标 {target}：一次 EMA 测试 FAR={primary_far}，二次 EMA+EMA FAR={ema_far}，二次 EMA+vote FAR={vote_far}；"
+                "对应测试 FRR 分别为 {primary_frr}、{ema_frr}、{vote_frr}。".format(
+                    target=_target_label(target),
+                    primary_far=_format_pct(primary["far_false_accept_rate"]),
+                    ema_far=_format_pct(ema_ema["far_false_accept_rate"]),
+                    vote_far=_format_pct(vote["far_false_accept_rate"]),
+                    primary_frr=_format_pct(primary["frr_false_reject_rate"]),
+                    ema_frr=_format_pct(ema_ema["frr_false_reject_rate"]),
+                    vote_frr=_format_pct(vote["frr_false_reject_rate"]),
+                )
+            )
+    lines.extend(
+        [
+            "- 由于本次明确不限制检测出时间，阈值选择只受验证集 FRR 约束；测试集 FRR 可能因数据分布差异略高或略低于目标。",
+            "- 二次迟滞会显著降低输出频率，因此其 FRR/FAR 是按最终返回给 App 的二次结果统计，不是按每秒一次结果统计。",
+            "- 在相同目标 FRR 下，二次迟滞通常需要更激进的一次 EMA 阈值才能用满 FRR 预算；这可能降低 FAR，但也会推迟或减少最终拒绝次数。",
+            "",
+            "## 分用户结果",
+            "",
+            "| 用户 | 目标 FRR | 方案 | 阈值 | 验证 FRR | 测试 FRR | 测试 FAR | 攻击拒绝率 | ERR | 输出数 |",
+            "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in detail:
+        lines.append(
+            "| {user} | {target} | {variant} | {threshold:.6f} | {val_frr} | {test_frr} | {test_far} | {imp_reject} | {err} | {outputs:.0f} |".format(
+                user=row["user"],
+                target=_target_label(row["target_frr"]),
+                variant=row["variant"],
+                threshold=float(row["selected_threshold"]),
+                val_frr=_format_pct(row["validation_frr"]),
+                test_frr=_format_pct(row["frr_false_reject_rate"]),
+                test_far=_format_pct(row["far_false_accept_rate"]),
+                imp_reject=_format_pct(row["impostor_reject_rate"]),
+                err=_format_pct(row["err"]),
+                outputs=float(row["outputs"]),
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "## 明细",
+            "",
+            "完整明细见同目录 CSV：`secondary_hysteresis_hmog_frr_targets_metrics.csv`。",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _parse_target_frrs(value: str) -> List[float]:
+    out: List[float] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        parsed = float(part)
+        if parsed > 1.0:
+            parsed = parsed / 100.0
+        out.append(max(0.0, min(1.0, parsed)))
+    if not out:
+        raise ValueError("target FRR list must not be empty")
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate secondary hysteresis on cached HMOG policy_search scores.")
     parser.add_argument("--models-root", type=Path, default=ROOT / "deploy" / "data" / "models")
     parser.add_argument("--output-csv", type=Path, default=ROOT / "docs" / "secondary_hysteresis_hmog_metrics.csv")
     parser.add_argument("--output-md", type=Path, default=ROOT / "docs" / "secondary_hysteresis_hmog_report.md")
+    parser.add_argument("--target-output-csv", type=Path, default=ROOT / "docs" / "secondary_hysteresis_hmog_frr_targets_metrics.csv")
+    parser.add_argument("--target-output-md", type=Path, default=ROOT / "docs" / "secondary_hysteresis_hmog_frr_targets_report.md")
+    parser.add_argument("--target-frrs", type=str, default="0.05,0.10,0.15,0.20")
     parser.add_argument("--primary-interval-sec", type=float, default=1.0)
     parser.add_argument("--secondary-time-sec", type=float, default=10.0)
     args = parser.parse_args()
@@ -420,6 +784,23 @@ def main() -> None:
     _write_report(rows, args.output_md, models_root=args.models_root)
     print(f"Wrote {args.output_csv}")
     print(f"Wrote {args.output_md}")
+
+    target_rows: List[Dict[str, object]] = []
+    target_frrs = _parse_target_frrs(str(args.target_frrs))
+    for user_dir in user_dirs:
+        target_rows.extend(
+            _evaluate_user_target_frr(
+                user_dir,
+                target_frrs=target_frrs,
+                primary_interval_sec=float(args.primary_interval_sec),
+                secondary_time_sec=float(args.secondary_time_sec),
+            )
+        )
+    target_rows.extend(_aggregate_target_rows(target_rows))
+    _write_csv(target_rows, args.target_output_csv)
+    _write_target_report(target_rows, args.target_output_md, models_root=args.models_root)
+    print(f"Wrote {args.target_output_csv}")
+    print(f"Wrote {args.target_output_md}")
 
 
 if __name__ == "__main__":

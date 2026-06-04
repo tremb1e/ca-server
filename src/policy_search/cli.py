@@ -4,12 +4,14 @@ import argparse
 import logging
 
 from ..ca_config import get_ca_config
+from ..utils.cli_args import normalize_option_value_args
 from .runner import PROMPT_VOTE_MIN_REJECTS_RANGE_BY_N, GridSearchConfig, run_policy_grid_search
 
 logger = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = normalize_option_value_args(argv, options={"--user"})
     parser = argparse.ArgumentParser(description="Offline policy grid search + Pareto frontier for Continuous Authentication")
     parser.add_argument("--user", required=True, help="Target device_id_hash.")
     parser.add_argument("--device", default="auto", help="Scoring device, e.g. auto / npu:0 / cuda:0 / cpu.")
@@ -65,7 +67,7 @@ def parse_args() -> argparse.Namespace:
         help="Disable writing per-(auth_method,t,N,M) CSV files (keeps grid_results.csv).",
     )
     parser.set_defaults(write_per_combo=True)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
