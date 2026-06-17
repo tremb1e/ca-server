@@ -107,11 +107,11 @@ policy_search_auth_method = "vqgan-only"
 secondary_hysteresis_enabled = true
 secondary_hysteresis_strategy = "vote"  # "vote" 或 "ema"
 primary_result_interval_sec = 1.0
-secondary_decision_time_sec = 10.0
+secondary_decision_time_sec = 5.0
 
 # 二次 vote：最近 x 次一次迟滞结果中，若不通过次数 >= y，则二次结果不通过。
-secondary_vote_window_size = 10
-secondary_vote_min_rejects = 8
+secondary_vote_window_size = 5
+secondary_vote_min_rejects = 3
 
 # 二次 EMA：对一次迟滞 reject(0/1) 序列做 EMA；EMA reject 分数超过阈值则不通过。
 secondary_ema_alpha = 0.25
