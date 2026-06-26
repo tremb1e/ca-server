@@ -182,36 +182,40 @@ class AuthSessionManager:
         for key in expired:
             self._sessions.pop(key, None)
 
-    def has_trained_model(self, user_id: str) -> bool:
+    def check_trained_model(self, user_id: str) -> Tuple[bool, str]:
         from .runner import load_best_policy
 
         try:
             cfg = load_best_policy(user_id, models_root=self._models_root)
-        except Exception:
-            return False
+        except Exception as exc:
+            return False, str(exc)
         if not cfg.vqgan_checkpoint.exists():
-            return False
+            return False, f"missing checkpoint: {cfg.vqgan_checkpoint}"
         if cfg.vqgan_config and not cfg.vqgan_config.exists():
-            return False
+            return False, f"missing config: {cfg.vqgan_config}"
         scaler_path = Path(settings.processed_data_path) / "z-score" / user_id / "scaler.json"
         if not scaler_path.exists() or not scaler_path.is_file():
-            return False
+            return False, f"missing scaler: {scaler_path}"
         try:
             import json
 
             json.loads(scaler_path.read_text(encoding="utf-8"))
-        except Exception:
-            return False
+        except Exception as exc:
+            return False, f"invalid scaler: {exc}"
         if cfg.vqgan_config:
             try:
                 import json
 
                 model_cfg = json.loads(cfg.vqgan_config.read_text(encoding="utf-8"))
                 if int(model_cfg.get("input_height", 9)) != 9:
-                    return False
-            except Exception:
-                return False
-        return True
+                    return False, f"unsupported model input_height: {model_cfg.get('input_height')}"
+            except Exception as exc:
+                return False, f"invalid config: {exc}"
+        return True, ""
+
+    def has_trained_model(self, user_id: str) -> bool:
+        ready, _ = self.check_trained_model(user_id)
+        return ready
 
     def start_session(self, user_id: str, session_id: str) -> Tuple[bool, str, Optional["VQGANPolicy"]]:
         self._prune_sessions()

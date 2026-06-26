@@ -136,6 +136,42 @@ def test_management_models_and_auth_results(tmp_path, monkeypatch) -> None:
     results = client.get(f"/api/v1/management/devices/{device_id}/auth/results?limit=1", headers=headers).json()
     assert results["total"] == 1
     assert results["results"][0]["window_id"] == 2
+    assert results["results"][0]["device_id_hash"] == device_id
+    assert results["results"][0]["session_id"] == "auth-session-a"
+    assert results["results"][0]["vote_recent_windows"] == 0
+    assert results["results"][0]["vote_recent_rejects"] == 0
+
+
+def test_management_latest_auth_results_honors_large_limit(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    headers = {"X-Management-API-Key": "secret-token"}
+    result_dir = settings.inference_storage_path / "device-large" / "auth-session-large"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for i in range(150):
+        rows.append(
+            json.dumps(
+                {
+                    "window_id": i,
+                    "decision_score": i / 1000,
+                    "decision_threshold": 0.5,
+                    "decision_accept": True,
+                    "server_written_timestamp": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}+00:00",
+                }
+            )
+        )
+    (result_dir / "results.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    results = client.get("/api/v1/management/auth/results/latest?limit=125", headers=headers).json()
+
+    assert results["total"] == 125
+    assert len(results["results"]) == 125
+    assert results["results"][0]["window_id"] == 149
+    assert results["results"][0]["score"] == 0.149
+    assert results["results"][0]["threshold"] == 0.5
+    assert results["results"][0]["accept"] is True
+    assert results["results"][0]["device_id_hash"] == "device-large"
+    assert results["results"][0]["session_id"] == "auth-session-large"
 
 
 def test_management_model_not_ready_without_scaler(tmp_path, monkeypatch) -> None:

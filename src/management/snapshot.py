@@ -354,17 +354,32 @@ def tail_jsonl(path: Path, *, limit: int) -> List[Dict[str, Any]]:
     rows: deque[Dict[str, Any]] = deque(maxlen=limit)
     if not Path(path).exists():
         return []
-    with Path(path).open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict):
-                rows.append(payload)
+    for line in _tail_lines(Path(path), limit=limit):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
     return list(rows)
+
+
+def _tail_lines(path: Path, *, limit: int, chunk_size: int = 64 * 1024) -> List[str]:
+    limit = max(1, min(int(limit), 1000))
+    buffer = b""
+    lines: List[bytes] = []
+    with Path(path).open("rb") as handle:
+        handle.seek(0, 2)
+        position = handle.tell()
+        while position > 0 and len(lines) <= limit:
+            read_size = min(int(chunk_size), position)
+            position -= read_size
+            handle.seek(position)
+            buffer = handle.read(read_size) + buffer
+            lines = [line for line in buffer.splitlines() if line.strip()]
+    return [line.decode("utf-8", errors="replace") for line in lines[-limit:]]
 
 
 def auth_results(device_id: str, *, session_id: Optional[str], limit: int) -> Dict[str, Any]:
@@ -381,27 +396,43 @@ def auth_results(device_id: str, *, session_id: Optional[str], limit: int) -> Di
     for path in paths:
         sid = path.parent.name
         for row in tail_jsonl(path, limit=limit):
-            row = dict(row)
-            row.setdefault("device_id_hash", device_id)
-            row.setdefault("session_id", sid)
-            out.append(row)
+            out.append(_normalise_auth_result_row(row, device_id=device_id, session_id=sid))
     out = _sort_results(out)[: max(1, min(int(limit), 1000))]
     return {"results": out, "total": len(out)}
 
 
 def latest_auth_results(*, limit: int) -> Dict[str, Any]:
     root = Path(settings.inference_storage_path)
+    effective_limit = max(1, min(int(limit), 1000))
     rows: List[Dict[str, Any]] = []
     for path in sorted(root.glob("*/*/results.jsonl") if root.exists() else [], key=lambda p: p.stat().st_mtime, reverse=True):
         device_id = path.parent.parent.name
         session_id = path.parent.name
-        for row in tail_jsonl(path, limit=min(limit, 100)):
-            row = dict(row)
-            row.setdefault("device_id_hash", device_id)
-            row.setdefault("session_id", session_id)
-            rows.append(row)
-    rows = _sort_results(rows)[: max(1, min(int(limit), 1000))]
+        for row in tail_jsonl(path, limit=effective_limit):
+            rows.append(_normalise_auth_result_row(row, device_id=device_id, session_id=session_id))
+    rows = _sort_results(rows)[:effective_limit]
     return {"results": rows, "total": len(rows)}
+
+
+def _normalise_auth_result_row(row: Dict[str, Any], *, device_id: str, session_id: str) -> Dict[str, Any]:
+    payload = dict(row)
+    payload.setdefault("device_id_hash", str(device_id))
+    payload.setdefault("session_id", str(session_id))
+    if "score" not in payload and "decision_score" in payload:
+        payload["score"] = payload.get("decision_score")
+    if "threshold" not in payload and "decision_threshold" in payload:
+        payload["threshold"] = payload.get("decision_threshold")
+    if "accept" not in payload and "decision_accept" in payload:
+        payload["accept"] = payload.get("decision_accept")
+    if "normalized_score" not in payload and "decision_score" in payload:
+        payload["normalized_score"] = payload.get("decision_score")
+    payload.setdefault("interrupt", False)
+    payload.setdefault("k_rejects", 0)
+    payload.setdefault("vote_recent_windows", 0)
+    payload.setdefault("vote_recent_rejects", 0)
+    payload.setdefault("window_size", payload.get("window_size_sec", 0.0))
+    payload.setdefault("model_version", "")
+    return payload
 
 
 def _sort_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -57,6 +57,24 @@ def _message_to_dict(message, include_defaults: bool = False) -> dict:
         return json_format.MessageToDict(message, **kwargs)
 
 
+def _metrics_report_to_dict(report: sensor_data_pb2.MetricsReport) -> dict:
+    """Return management-facing metrics with numeric types, not proto JSON strings."""
+    return {
+        "device_id_hash": str(report.device_id_hash),
+        "timestamp_ms": int(report.timestamp_ms),
+        "reporting_period_ms": int(report.reporting_period_ms),
+        "batches_processed": int(report.batches_processed),
+        "uploads_success": int(report.uploads_success),
+        "uploads_failed": int(report.uploads_failed),
+        "sensor_samples_collected": int(report.sensor_samples_collected),
+        "anomalies_detected": int(report.anomalies_detected),
+        "avg_upload_latency_ms": float(report.avg_upload_latency_ms),
+        "avg_cpu_usage_percent": float(report.avg_cpu_usage_percent),
+        "peak_memory_usage_mb": int(report.peak_memory_usage_mb),
+        "upload_success_rate": float(report.upload_success_rate),
+    }
+
+
 def _effective_secondary_decision_time_sec(auth_cfg) -> float:
     cfg = SecondaryHysteresisConfig(
         enabled=bool(getattr(auth_cfg, "secondary_hysteresis_enabled", True)),
@@ -152,7 +170,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         )
 
     async def StartAuthentication(self, request, context):
-        device_id_hash = getattr(request, "device_id_hash", "") or "unknown_device"
+        device_id_hash = getattr(request, "device_id_hash", "")
         session_id = getattr(request, "session_id", "") or f"auth_{uuid.uuid4().hex}"
         try:
             device_id_hash = validate_storage_id(device_id_hash, field_name="device_id_hash")
@@ -171,7 +189,8 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         decision_time_sec = float(ca_cfg.auth.max_decision_time_sec)
         if bool(getattr(ca_cfg.auth, "secondary_hysteresis_enabled", False)):
             decision_time_sec = _effective_secondary_decision_time_sec(ca_cfg.auth)
-        if self.auth_manager.has_trained_model(device_id_hash):
+        model_ready, model_error = self.auth_manager.check_trained_model(device_id_hash)
+        if model_ready:
             accepted, message, policy = self.auth_manager.start_session(device_id_hash, session_id)
             logger.info(
                 "Auth session start: device=%s session=%s accepted=%s message=%s model=%s",
@@ -194,7 +213,9 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         min_bytes = readiness.min_bytes
         total_mb = readiness.total_bytes / (1024 * 1024)
         min_mb = min_bytes / (1024 * 1024)
-        if readiness.total_bytes >= min_bytes:
+        if readiness.has_enough_data and str(readiness.status) == "completed":
+            reason = f"model_not_ready: {model_error or 'trained artifacts incomplete'}"
+        elif readiness.total_bytes >= min_bytes:
             await self.training_manager.submit_if_ready(device_id_hash, force=True)
             reason = "training_in_progress"
         else:
@@ -226,7 +247,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         )
 
     async def ReportMetrics(self, request, context):
-        metric_payload = _message_to_dict(request, include_defaults=True)
+        metric_payload = _metrics_report_to_dict(request)
         self.metrics.record_client_metrics(metric_payload)
         logger.info(
             "Metrics received: device=%s, period_ms=%s, uploads_success=%s, uploads_failed=%s",
@@ -270,7 +291,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         response_queue: asyncio.Queue,
         pending_inference: set[asyncio.Task],
     ) -> sensor_data_pb2.ServerDirective:
-        device_id_hash = packet.device_id_hash or "unknown_device"
+        device_id_hash = packet.device_id_hash
         session_id = "default"
         metadata_dict = None
         decryption_status = "skipped"
@@ -321,12 +342,12 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
                         for sample in parsed_batch.get("samples", []):
                             for axis in ("x", "y", "z"):
                                 sample.setdefault(axis, 0.0)
-                        session_id = batch.session_id or session_id
                         try:
-                            session_id = validate_storage_id(session_id, field_name="session_id")
+                            session_id = validate_storage_id(batch.session_id, field_name="session_id")
                             decryption_status = "parsed_sensor_batch"
                         except UnsafePathSegmentError as exc:
                             parsed_batch = None
+                            session_id = "default"
                             decryption_status = "invalid_identifier"
                             error_detail = str(exc)
                             logger.warning("Invalid session id for packet %s: %s", packet.packet_id, exc)

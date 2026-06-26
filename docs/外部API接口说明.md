@@ -273,7 +273,7 @@ curl -H "X-Management-API-Key: ${API_KEY}" \
 | `processed.windows` | 各窗口尺寸下的 train/val/test 文件信息 |
 | `inference.sessions` | inference 目录下 session 数 |
 | `training.status` | `pending`、`in_progress`、`completed`、`failed` |
-| `model.ready` | policy、checkpoint、config 是否齐全 |
+| `model.ready` | policy、checkpoint、config、scaler 是否齐全，且模型输入高度为当前线上支持的 9 轴格式 |
 | `active_auth_sessions` | 当前内存中的活跃认证会话 |
 
 ### 2.5 获取 raw session 文件列表
@@ -364,6 +364,7 @@ GET /api/v1/management/devices/{device_id}/models
 | `files.policy` | object | `best_lock_policy.json` 文件信息 |
 | `files.vqgan_checkpoint` | object | VQGAN checkpoint 文件信息 |
 | `files.vqgan_config` | object | VQGAN config 文件信息 |
+| `files.scaler` | object | `processed_data/z-score/<device_id>/scaler.json` 文件信息 |
 | `files.lm_checkpoint` | object | 如果策略中配置语言模型 checkpoint，则返回该文件信息 |
 | `training_summary` | array | 训练汇总指标，如 AUC/FAR/FRR/EER/F1 |
 | `policy_search` | object | 策略搜索输出文件 |
