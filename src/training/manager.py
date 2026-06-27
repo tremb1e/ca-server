@@ -157,24 +157,44 @@ class TrainingManager:
     async def submit_if_ready(self, user_id: str, *, force: bool = False) -> None:
         now = time.time()
         last = self._last_checked.get(user_id, 0.0)
-        if (now - last) < self._check_interval_sec:
+        # The passive per-packet path is throttled so we don't rescan disk on
+        # every packet. An explicit forced trigger (StartAuthentication / the
+        # app's "开始认证") must NOT be throttled: otherwise the user is told
+        # "training_in_progress" while no training is ever scheduled.
+        if not force and (now - last) < self._check_interval_sec:
             return
         self._last_checked[user_id] = now
 
-        state = load_state(self._models_root, user_id)
-        if state.status == "in_progress":
-            return
-        if user_id in self._tasks and not self._tasks[user_id].done():
+        # A live in-process task is the authoritative "already training" signal;
+        # dedup against it first so a forced trigger can never launch a second
+        # concurrent run for the same user.
+        existing = self._tasks.get(user_id)
+        if existing is not None and not existing.done():
             return
 
         raw_total = _user_total_bytes(self._raw_root, user_id)
         ca_cfg = get_ca_config()
         if raw_total < int(ca_cfg.processing.min_total_mb * 1024 * 1024):
             return
+
+        state = load_state(self._models_root, user_id)
+        # A persisted "in_progress" with no live task means a previous run was
+        # interrupted by a process/container restart (training runs as an
+        # in-process task, so a restart guarantees that run is dead). Keep the
+        # passive path waiting, but let a forced trigger recover instead of being
+        # stuck on "training_in_progress" forever.
+        if state.status == "in_progress" and not force:
+            return
         if state.status == "completed" and not force:
             return
 
-        logger.info("Training trigger: user=%s total_bytes=%d", user_id, raw_total)
+        logger.info(
+            "Training trigger: user=%s total_bytes=%d force=%s prev_status=%s",
+            user_id,
+            raw_total,
+            force,
+            state.status,
+        )
         self._tasks[user_id] = asyncio.create_task(self._run_training(user_id, raw_total))
 
     async def _run_training(self, user_id: str, raw_total: int) -> None:

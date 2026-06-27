@@ -119,12 +119,12 @@ allow_training_fallback_policy = false
 secondary_hysteresis_enabled = true
 secondary_hysteresis_strategy = "vote"  # "vote" 或 "ema"
 primary_result_interval_sec = 1.0
-secondary_decision_time_sec = 10.0
+secondary_decision_time_sec = 5.0
 
 # 二次 vote：最近 x 次一次迟滞结果中，若不通过次数 >= y，则二次结果不通过（计数判定不变）。
 # 报告的 score 为窗口内第 y(=M) 小的一次分数（sigmoid(policy) 轴），threshold 为该一次分数对应的 policy 阈值。
-secondary_vote_window_size = 10
-secondary_vote_min_rejects = 8
+secondary_vote_window_size = 5
+secondary_vote_min_rejects = 3
 
 # 二次 EMA：对“一次分数”（sigmoid(policy) 轴）做分数域 double-EMA，并与 policy 阈值比较：
 # ema_score >= threshold 则通过。
