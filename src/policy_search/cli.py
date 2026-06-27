@@ -21,7 +21,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="vqgan-only",
         help="Which per-window score to use for offline policy search (default: vqgan-only).",
     )
-    parser.add_argument("--no-write-best", dest="write_best", action="store_false", help="Do not overwrite best_lock_policy.json.")
+    parser.add_argument(
+        "--no-write-best",
+        dest="write_best",
+        action="store_false",
+        help=(
+            "Do not overwrite best_lock_policy.json. When written, it is the authoritative policy "
+            "(written atomically, carrying policy_status=\"ready\"/policy_search_completed=true)."
+        ),
+    )
     parser.set_defaults(write_best=True)
 
     parser.add_argument("--window-sizes", nargs="*", type=float, default=None, help="Window sizes (sec). Defaults to ca_config.toml [windows].sizes.")

@@ -7,6 +7,7 @@ It reuses trained checkpoints and cached per-window scores, then evaluates
 window-level FAR/FRR/ERR and time-to-first-lock stats to output:
   - full grid table
   - Pareto frontier table
-  - best_lock_policy.json (optional)
+  - best_lock_policy.json (optional): the authoritative policy, written ATOMICALLY and
+    carrying policy_status="ready"/policy_search_completed=true.
 """
 

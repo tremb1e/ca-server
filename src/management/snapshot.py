@@ -398,7 +398,7 @@ def auth_results(device_id: str, *, session_id: Optional[str], limit: int) -> Di
         for row in tail_jsonl(path, limit=limit):
             out.append(_normalise_auth_result_row(row, device_id=device_id, session_id=sid))
     out = _sort_results(out)[: max(1, min(int(limit), 1000))]
-    return {"results": out, "total": len(out)}
+    return {"results": out, "total": len(out), "by_stage": _group_by_stage(out)}
 
 
 def latest_auth_results(*, limit: int) -> Dict[str, Any]:
@@ -411,7 +411,7 @@ def latest_auth_results(*, limit: int) -> Dict[str, Any]:
         for row in tail_jsonl(path, limit=effective_limit):
             rows.append(_normalise_auth_result_row(row, device_id=device_id, session_id=session_id))
     rows = _sort_results(rows)[:effective_limit]
-    return {"results": rows, "total": len(rows)}
+    return {"results": rows, "total": len(rows), "by_stage": _group_by_stage(rows)}
 
 
 def _normalise_auth_result_row(row: Dict[str, Any], *, device_id: str, session_id: str) -> Dict[str, Any]:
@@ -432,6 +432,15 @@ def _normalise_auth_result_row(row: Dict[str, Any], *, device_id: str, session_i
     payload.setdefault("vote_recent_rejects", 0)
     payload.setdefault("window_size", payload.get("window_size_sec", 0.0))
     payload.setdefault("model_version", "")
+    payload["result_stage"] = str(row.get("result_stage", "primary"))
+    if "display_score" not in payload:
+        payload["display_score"] = payload.get(
+            "display_score", payload.get("decision_score", payload.get("score"))
+        )
+    if "display_threshold" not in payload:
+        payload["display_threshold"] = payload.get(
+            "display_threshold", payload.get("decision_threshold", payload.get("threshold"))
+        )
     return payload
 
 
@@ -440,6 +449,14 @@ def _sort_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return str(row.get("server_written_timestamp") or row.get("timestamp") or "")
 
     return sorted(rows, key=key, reverse=True)
+
+
+def _group_by_stage(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    by_stage: Dict[str, List[Dict[str, Any]]] = {"primary": [], "secondary": []}
+    for row in rows:
+        stage = str(row.get("result_stage", "primary"))
+        by_stage.setdefault(stage, []).append(row)
+    return by_stage
 
 
 def runtime_snapshot(ctx: RuntimeContext) -> Dict[str, Any]:

@@ -111,6 +111,7 @@ class AuthSessionsResponse(FlexibleModel):
 class AuthResultsResponse(FlexibleModel):
     results: List[Dict[str, Any]]
     total: int
+    by_stage: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
 
 class ClientMetricsResponse(FlexibleModel):

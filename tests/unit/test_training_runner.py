@@ -106,10 +106,19 @@ def test_run_window_sweep_retrains_when_cached_summary_has_other_user(tmp_path, 
     assert len(results) == 1
     assert results[0].summary["user"] == user_id
 
-    policy = json.loads((models_root / user_id / "best_lock_policy.json").read_text(encoding="utf-8"))
+    # Training writes the training_fallback_policy.json (NOT best_lock_policy.json);
+    # the formal best_lock_policy.json is only produced by policy search.
+    policy = json.loads(
+        (models_root / user_id / "training_fallback_policy.json").read_text(encoding="utf-8")
+    )
     assert user_id in policy
     assert policy[user_id]["vqgan_checkpoint"] == f"checkpoints/vqgan_user_{user_id}_ws_{ws:.1f}.pt"
     assert policy[user_id]["vqgan_config"] == f"checkpoints/vqgan_user_{user_id}_ws_{ws:.1f}.json"
+    # New training-fallback readiness/telemetry fields (contract A.1).
+    assert policy[user_id]["policy_status"] == "training_fallback"
+    assert policy[user_id]["policy_search_completed"] is False
+    assert policy[user_id]["score_metric"] == "mse"
+    assert policy[user_id]["score_scale"] == "negative_reconstruction_error"
 
     summary_rows = json.loads((models_root / user_id / "training_summary.json").read_text(encoding="utf-8"))
     assert isinstance(summary_rows, list)
@@ -180,8 +189,15 @@ def test_run_window_sweep_passes_dash_prefixed_user_with_equals(tmp_path, monkey
     assert len(results) == 1
     assert f"--users={user_id}" in calls[0]
     assert "--users" not in calls[0]
-    policy = json.loads((models_root / user_id / "best_lock_policy.json").read_text(encoding="utf-8"))
+    # Training writes training_fallback_policy.json (contract A.1).
+    policy = json.loads(
+        (models_root / user_id / "training_fallback_policy.json").read_text(encoding="utf-8")
+    )
     assert user_id in policy
+    assert policy[user_id]["policy_status"] == "training_fallback"
+    assert policy[user_id]["policy_search_completed"] is False
+    assert policy[user_id]["score_metric"] == "mse"
+    assert policy[user_id]["score_scale"] == "negative_reconstruction_error"
 
 
 def test_training_command_error_includes_subprocess_log_context(tmp_path, monkeypatch) -> None:

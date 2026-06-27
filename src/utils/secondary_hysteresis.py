@@ -73,34 +73,49 @@ class SecondaryHysteresisTracker:
     inputs_seen: int = 0
     decisions_emitted: int = 0
     _recent_rejects: Deque[int] = field(default_factory=deque)
+    _recent_scores: Deque[float] = field(default_factory=deque)
     _ema_reject_score: Optional[float] = None
+    _ema_score: Optional[float] = None
     _ema_since_emit: int = 0
     _ema_rejects_since_emit: int = 0
 
-    def update(self, *, accepted: bool, interrupt: bool) -> Optional[SecondaryHysteresisResult]:
+    def update(
+        self,
+        *,
+        accepted: bool,
+        interrupt: bool,
+        primary_score: float,
+        primary_threshold: float,
+    ) -> Optional[SecondaryHysteresisResult]:
         rejected = (not bool(accepted)) or bool(interrupt)
         self.inputs_seen += 1
         if self.config.normalized_strategy == "ema":
-            return self._update_ema(rejected)
-        return self._update_vote(rejected)
+            return self._update_ema(rejected, float(primary_score), float(primary_threshold))
+        return self._update_vote(rejected, float(primary_score), float(primary_threshold))
 
-    def _update_vote(self, rejected: bool) -> Optional[SecondaryHysteresisResult]:
+    def _update_vote(
+        self, rejected: bool, primary_score: float, primary_threshold: float
+    ) -> Optional[SecondaryHysteresisResult]:
         window_size = max(1, int(self.config.vote_effective_window_size))
         min_rejects = max(1, int(self.config.vote_min_rejects))
         min_rejects = min(min_rejects, window_size)
 
         self._recent_rejects.append(1 if rejected else 0)
+        self._recent_scores.append(float(primary_score))
         if len(self._recent_rejects) < window_size:
             return None
 
         reject_count = int(sum(self._recent_rejects))
+        # M-th smallest primary score (1-based M=min_rejects) reported on the
+        # sigmoid(policy) axis so it stays self-consistent with the count-based
+        # verdict: accepted <=> boundary_score >= primary_threshold.
+        boundary_score = float(sorted(self._recent_scores)[min_rejects - 1])
         self._recent_rejects.clear()
+        self._recent_scores.clear()
         accepted = reject_count < min_rejects
         self.decisions_emitted += 1
-        accept_count = window_size - reject_count
-        score = float(accept_count / window_size)
-        # Smallest accept ratio that still means reject_count < min_rejects.
-        threshold = float((window_size - min_rejects + 1) / window_size)
+        score = boundary_score
+        threshold = float(primary_threshold)
         return SecondaryHysteresisResult(
             ready=True,
             accept=accepted,
@@ -110,19 +125,30 @@ class SecondaryHysteresisTracker:
             strategy="vote",
             message=(
                 f"二次迟滞 vote={min_rejects}/{window_size}, "
-                f"本轮不通过={reject_count}/{window_size}"
+                f"本轮不通过={reject_count}/{window_size}, "
+                f"边界(第{min_rejects}小)分数={boundary_score:.6f} vs 策略阈值={threshold:.6f}"
             ),
             input_count=window_size,
             reject_count=reject_count,
         )
 
-    def _update_ema(self, rejected: bool) -> Optional[SecondaryHysteresisResult]:
+    def _update_ema(
+        self, rejected: bool, primary_score: float, primary_threshold: float
+    ) -> Optional[SecondaryHysteresisResult]:
         alpha = max(0.0, min(1.0, float(self.config.ema_alpha)))
-        value = 1.0 if rejected else 0.0
-        if self._ema_reject_score is None:
-            self._ema_reject_score = value
+        # Score-domain double-EMA on the sigmoid(policy) axis drives the verdict.
+        score_value = float(primary_score)
+        if self._ema_score is None:
+            self._ema_score = score_value
         else:
-            self._ema_reject_score = alpha * value + (1.0 - alpha) * float(self._ema_reject_score)
+            self._ema_score = alpha * score_value + (1.0 - alpha) * float(self._ema_score)
+
+        # Reject EMA is kept for telemetry only (no longer part of the verdict).
+        reject_value = 1.0 if rejected else 0.0
+        if self._ema_reject_score is None:
+            self._ema_reject_score = reject_value
+        else:
+            self._ema_reject_score = alpha * reject_value + (1.0 - alpha) * float(self._ema_reject_score)
 
         self._ema_since_emit += 1
         if rejected:
@@ -134,12 +160,12 @@ class SecondaryHysteresisTracker:
         self._ema_since_emit = 0
         reject_count = int(self._ema_rejects_since_emit)
         self._ema_rejects_since_emit = 0
-        threshold_reject = max(0.0, min(1.0, float(self.config.ema_reject_threshold)))
+        ema_score = float(self._ema_score)
         ema_reject = float(self._ema_reject_score)
-        accepted = ema_reject < threshold_reject
+        threshold = float(primary_threshold)
+        accepted = ema_score >= threshold
         self.decisions_emitted += 1
-        score = 1.0 - ema_reject
-        threshold = 1.0 - threshold_reject
+        score = ema_score
         return SecondaryHysteresisResult(
             ready=True,
             accept=accepted,
@@ -148,8 +174,8 @@ class SecondaryHysteresisTracker:
             threshold=max(0.0, min(1.0, threshold)),
             strategy="ema",
             message=(
-                f"二次迟滞 EMA={ema_reject:.6f}, alpha={alpha:.3f}, "
-                f"reject_threshold={threshold_reject:.3f}, emit_every={emit_every}"
+                f"二次迟滞 EMA分数={ema_score:.6f} vs 策略阈值={threshold:.6f}, "
+                f"alpha={alpha:.3f}, emit_every={emit_every}, reject_ema={ema_reject:.6f}"
             ),
             input_count=emit_every,
             reject_count=reject_count,
@@ -165,6 +191,8 @@ class SecondaryHysteresisTracker:
         self.inputs_seen = 0
         self.decisions_emitted = 0
         self._recent_rejects.clear()
+        self._recent_scores.clear()
         self._ema_reject_score = None
+        self._ema_score = None
         self._ema_since_emit = 0
         self._ema_rejects_since_emit = 0

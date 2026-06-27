@@ -19,6 +19,20 @@ if str(ROOT) not in sys.path:
 from src.utils.secondary_hysteresis import SecondaryHysteresisConfig, SecondaryHysteresisTracker  # noqa: E402
 
 
+def _sigmoid(x: float) -> float:
+    """sig(x)=1/(1+exp(-x)) on the sigmoid(policy) axis used at runtime.
+
+    The offline `primary` scores/thresholds live on the raw VQGAN (-MSE) axis,
+    while the runtime feeds the secondary tracker sigmoid(policy)-axis values
+    (primary_payload.score/threshold). Map raw -> sigmoid here for parity.
+    """
+    value = float(x)
+    if value >= 0.0:
+        return 1.0 / (1.0 + math.exp(-value))
+    exp_value = math.exp(value)
+    return exp_value / (1.0 + exp_value)
+
+
 @dataclass(frozen=True)
 class ScoreArrays:
     session_ids: np.ndarray
@@ -163,7 +177,12 @@ def _secondary_decisions(primary: DecisionArrays, cfg: SecondaryHysteresisConfig
     for _, start, end in _iter_sessions(primary.session_ids):
         tracker = SecondaryHysteresisTracker(cfg)
         for idx in range(start, end):
-            result = tracker.update(accepted=bool(primary.accept[idx]), interrupt=bool(primary.interrupt[idx]))
+            result = tracker.update(
+                accepted=bool(primary.accept[idx]),
+                interrupt=bool(primary.interrupt[idx]),
+                primary_score=_sigmoid(float(primary.score[idx])),
+                primary_threshold=_sigmoid(float(primary.threshold[idx])),
+            )
             if result is None:
                 continue
             session_out.append(int(primary.session_ids[idx]))

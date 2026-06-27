@@ -114,6 +114,13 @@ def _seed_contract_device(device_id: str = "contract-device") -> str:
                     "vqgan_checkpoint": "checkpoints/vqgan.pt",
                     "vqgan_config": "checkpoints/vqgan.json",
                     "model_version": "vqgan-contract.pt",
+                    # Readiness fields so this seeded policy is accepted as a valid
+                    # READY policy by check_trained_model (StartAuthentication gate).
+                    "policy_status": "ready",
+                    "policy_search_completed": True,
+                    "threshold_strategy": "interrupt_window_frr",
+                    "score_metric": "mse",
+                    "score_scale": "negative_reconstruction_error",
                 }
             }
         ),

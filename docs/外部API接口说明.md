@@ -794,7 +794,12 @@ payload 解密解压后应为 `SerializedSensorBatch` protobuf：
 | `model_version` | 模型版本 |
 | `message` | 投票状态说明 |
 
-启用二次迟滞后，`score` / `normalized_score` / `threshold` / `accept` / `interrupt` 均表示二次迟滞后的最终决策。一次迟滞细节仍会写入服务端 inference 结果文件；默认二次策略为 `8-of-10` 投票，即最近 10 次一次迟滞结果中不通过次数达到 8 次时，最终 `AuthResult.accept=false`、`interrupt=true`。vote 的实际返回间隔由 `secondary_vote_window_size * primary_result_interval_sec` 决定；默认值与 `secondary_decision_time_sec=10.0` 对齐。二次结果文件会记录 `secondary_sample_every` 和 `secondary_sample_phase`，用于追踪一次窗口到 1 秒级二次输入的抽样关系。
+启用二次迟滞后，`score` / `normalized_score` / `threshold` / `accept` / `interrupt` 均表示二次迟滞后的最终决策。其中 `accept` / `interrupt` 承载最终判定结论，`score` / `normalized_score` / `threshold` 与一次迟滞、以及 policy 阈值在**同一条量纲轴**上：即 `sigmoid(policy)` 轴（`score=sigmoid(-MSE)`、`threshold=sigmoid(policy.threshold)`，取值落在 `(0,1)`），并满足 `score >= threshold` 等价于 `accept` 的自洽关系。这里不再使用旧版“reject 比例 / 8-of-10 阈值 0.6/0.2”那种量纲：
+
+- `vote` 策略：判定仍是计数规则——最近 `secondary_vote_window_size` 次一次迟滞结果中不通过次数达到 `secondary_vote_min_rejects`（默认 8-of-10）即 `accept=false`、`interrupt=true`；但回传的 `score` 是该窗口内第 `M`（`M=secondary_vote_min_rejects`）小的一次分数（即 M-th order-statistic，仍在 `sigmoid(policy)` 轴），`threshold` 为对应的 policy 阈值。
+- `ema` 策略：对“一次分数”（`sigmoid(policy)` 轴）做分数域 double-EMA，与 policy 阈值比较，`ema_score >= threshold` 则通过；回传的 `score` 即该 double-EMA 分数。配置项 `secondary_ema_reject_threshold` 已废弃（DEPRECATED），不再参与 ema 判定，仅作向后兼容/遥测保留。
+
+一次迟滞细节仍会写入服务端 inference 结果文件。vote 的实际返回间隔由 `secondary_vote_window_size * primary_result_interval_sec` 决定；默认值与 `secondary_decision_time_sec=10.0` 对齐。二次结果文件会记录 `secondary_sample_every` 和 `secondary_sample_phase`，用于追踪一次窗口到 1 秒级二次输入的抽样关系。
 
 ### 4.4 SendHeartbeat
 

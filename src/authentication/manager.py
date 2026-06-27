@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -36,6 +38,17 @@ class AuthResultPayload:
     window_size: float
     model_version: str
     message: str
+    # NEW (contract F): explicit multi-axis fields. score/threshold/normalized_score
+    # above remain the app-facing DISPLAY values for wire compatibility.
+    result_stage: str = "primary"
+    raw_score: Optional[float] = None
+    raw_threshold: Optional[float] = None
+    ema_score: Optional[float] = None
+    ema_threshold: Optional[float] = None
+    display_score: Optional[float] = None
+    display_threshold: Optional[float] = None
+    secondary_score: Optional[float] = None
+    secondary_threshold: Optional[float] = None
 
 
 @dataclass
@@ -182,36 +195,203 @@ class AuthSessionManager:
         for key in expired:
             self._sessions.pop(key, None)
 
-    def check_trained_model(self, user_id: str) -> Tuple[bool, str]:
+    @staticmethod
+    def _artifact_fingerprint(path: Optional[Path]) -> Dict[str, Any]:
+        """Return {path, exists, sha256(first 1MB or None), mtime(float or None)}.
+
+        Tolerates missing/unreadable files (sha256/mtime become None).
+        """
+        fp: Dict[str, Any] = {
+            "path": (str(path) if path is not None else None),
+            "exists": False,
+            "sha256": None,
+            "mtime": None,
+        }
+        if path is None:
+            return fp
+        try:
+            p = Path(path)
+            if not p.exists() or not p.is_file():
+                return fp
+            fp["exists"] = True
+            try:
+                fp["mtime"] = float(p.stat().st_mtime)
+            except Exception:
+                fp["mtime"] = None
+            try:
+                with open(p, "rb") as fh:
+                    chunk = fh.read(1024 * 1024)
+                fp["sha256"] = hashlib.sha256(chunk).hexdigest()
+            except Exception:
+                fp["sha256"] = None
+        except Exception:
+            return fp
+        return fp
+
+    def _validate_model(self, user_id: str) -> Tuple[bool, str, Dict[str, Any]]:
+        import json
+
         from .runner import load_best_policy
 
+        allow_fb = bool(getattr(get_ca_config().auth, "allow_training_fallback_policy", False))
         try:
-            cfg = load_best_policy(user_id, models_root=self._models_root)
+            cfg = load_best_policy(user_id, models_root=self._models_root, allow_training_fallback=allow_fb)
         except Exception as exc:
-            return False, str(exc)
-        if not cfg.vqgan_checkpoint.exists():
-            return False, f"missing checkpoint: {cfg.vqgan_checkpoint}"
-        if cfg.vqgan_config and not cfg.vqgan_config.exists():
-            return False, f"missing config: {cfg.vqgan_config}"
-        scaler_path = Path(settings.processed_data_path) / "z-score" / user_id / "scaler.json"
-        if not scaler_path.exists() or not scaler_path.is_file():
-            return False, f"missing scaler: {scaler_path}"
-        try:
-            import json
+            return False, str(exc), {}
 
+        policy_status = str(getattr(cfg, "policy_status", "") or "")
+        policy_search_completed = bool(getattr(cfg, "policy_search_completed", False))
+        policy_source = str(getattr(cfg, "policy_source", "") or "")
+        policy_file = str(getattr(cfg, "policy_file", "") or "")
+        score_metric = str(getattr(cfg, "score_metric", "") or "")
+        score_scale = str(getattr(cfg, "score_scale", "") or "")
+        threshold_strategy = str(getattr(cfg, "threshold_strategy", "") or "")
+        decision_strategy = str(getattr(cfg, "decision_strategy", "") or "")
+        genuine_stats = getattr(cfg, "genuine_score_stats", None)
+        scaler_path = Path(settings.processed_data_path) / "z-score" / user_id / "scaler.json"
+
+        def _build_details(*, threshold_finite: bool, genuine_band_ok: bool) -> Dict[str, Any]:
+            return {
+                "policy_status": policy_status,
+                "policy_search_completed": policy_search_completed,
+                "policy_source": policy_source,
+                "policy_file": policy_file,
+                "score_metric": score_metric,
+                "score_scale": score_scale,
+                "threshold_strategy": threshold_strategy,
+                "threshold": (float(cfg.threshold) if cfg.threshold is not None else None),
+                "threshold_finite": bool(threshold_finite),
+                "genuine_band_ok": bool(genuine_band_ok),
+                "artifacts": {
+                    "checkpoint": self._artifact_fingerprint(cfg.vqgan_checkpoint),
+                    "config": self._artifact_fingerprint(cfg.vqgan_config if cfg.vqgan_config else None),
+                    "scaler": self._artifact_fingerprint(scaler_path),
+                    "policy": self._artifact_fingerprint(Path(policy_file) if policy_file else None),
+                },
+            }
+
+        # READINESS GATE (contract E).
+        ready = (
+            policy_source == "best"
+            and policy_status == "ready"
+            and policy_search_completed
+        )
+        if not ready:
+            degraded = False
+            if allow_fb and policy_source == "training_fallback":
+                degraded = True
+            elif allow_fb and policy_status in ("ready", "legacy"):
+                degraded = True
+            if not degraded:
+                detail = (
+                    f"source={policy_source or 'unknown'}, status={policy_status or 'unknown'}, "
+                    f"completed={policy_search_completed}"
+                )
+                reason = (
+                    f"policy_not_ready: {detail} "
+                    "(set auth.allow_training_fallback_policy=true to override)"
+                )
+                return False, reason, _build_details(threshold_finite=False, genuine_band_ok=True)
+
+        # VALIDATION (contract E).
+        # 1. threshold finite.
+        threshold = cfg.threshold
+        threshold_finite = (
+            threshold is not None
+            and math.isfinite(float(threshold))
+            and abs(float(threshold)) < 1e6
+            and abs(float(threshold)) < sys.float_info.max
+        )
+        if not threshold_finite:
+            return (
+                False,
+                f"invalid threshold: {threshold!r}",
+                _build_details(threshold_finite=False, genuine_band_ok=True),
+            )
+
+        # 2. required policy fields present/non-empty (score_metric/score_scale defaulted by cfg).
+        if not decision_strategy:
+            return (
+                False,
+                "missing decision_strategy",
+                _build_details(threshold_finite=True, genuine_band_ok=True),
+            )
+        if not threshold_strategy:
+            return (
+                False,
+                "missing threshold_strategy",
+                _build_details(threshold_finite=True, genuine_band_ok=True),
+            )
+
+        # 3. artifact checks (KEEP existing behaviour).
+        if not cfg.vqgan_checkpoint.exists():
+            return (
+                False,
+                f"missing checkpoint: {cfg.vqgan_checkpoint}",
+                _build_details(threshold_finite=True, genuine_band_ok=True),
+            )
+        if cfg.vqgan_config and not cfg.vqgan_config.exists():
+            return (
+                False,
+                f"missing config: {cfg.vqgan_config}",
+                _build_details(threshold_finite=True, genuine_band_ok=True),
+            )
+        if not scaler_path.exists() or not scaler_path.is_file():
+            return (
+                False,
+                f"missing scaler: {scaler_path}",
+                _build_details(threshold_finite=True, genuine_band_ok=True),
+            )
+        try:
             json.loads(scaler_path.read_text(encoding="utf-8"))
         except Exception as exc:
-            return False, f"invalid scaler: {exc}"
+            return (
+                False,
+                f"invalid scaler: {exc}",
+                _build_details(threshold_finite=True, genuine_band_ok=True),
+            )
         if cfg.vqgan_config:
             try:
-                import json
-
                 model_cfg = json.loads(cfg.vqgan_config.read_text(encoding="utf-8"))
                 if int(model_cfg.get("input_height", 9)) != 9:
-                    return False, f"unsupported model input_height: {model_cfg.get('input_height')}"
+                    return (
+                        False,
+                        f"unsupported model input_height: {model_cfg.get('input_height')}",
+                        _build_details(threshold_finite=True, genuine_band_ok=True),
+                    )
             except Exception as exc:
-                return False, f"invalid config: {exc}"
-        return True, ""
+                return (
+                    False,
+                    f"invalid config: {exc}",
+                    _build_details(threshold_finite=True, genuine_band_ok=True),
+                )
+
+        # 4. genuine band check (skip silently when stats absent — legacy policies).
+        genuine_band_ok = True
+        if isinstance(genuine_stats, dict):
+            lo_raw = genuine_stats.get("min")
+            hi_raw = genuine_stats.get("max")
+            if isinstance(lo_raw, (int, float)) and isinstance(hi_raw, (int, float)):
+                lo = float(lo_raw)
+                hi = float(hi_raw)
+                span = max(hi - lo, 1e-6)
+                margin = max(1.0, 0.5 * span)
+                if not (lo - margin <= float(threshold) <= hi + margin):
+                    genuine_band_ok = False
+                    return (
+                        False,
+                        (
+                            f"threshold out of genuine score band: threshold={float(threshold):.6f}, "
+                            f"band=[{lo:.6f}, {hi:.6f}], margin={margin:.6f}"
+                        ),
+                        _build_details(threshold_finite=True, genuine_band_ok=False),
+                    )
+
+        return True, "", _build_details(threshold_finite=True, genuine_band_ok=genuine_band_ok)
+
+    def check_trained_model(self, user_id: str) -> Tuple[bool, str]:
+        ok, reason, _ = self._validate_model(user_id)
+        return ok, reason
 
     def has_trained_model(self, user_id: str) -> bool:
         ready, _ = self.check_trained_model(user_id)
@@ -221,8 +401,12 @@ class AuthSessionManager:
         self._prune_sessions()
         from .runner import load_best_policy
 
+        # Mirror check_trained_model's policy selection so the degrade switch is
+        # honoured consistently (otherwise check passes but start_session would
+        # fail to find best_lock_policy.json when only the training fallback exists).
+        allow_fb = bool(getattr(get_ca_config().auth, "allow_training_fallback_policy", False))
         try:
-            cfg = load_best_policy(user_id, models_root=self._models_root)
+            cfg = load_best_policy(user_id, models_root=self._models_root, allow_training_fallback=allow_fb)
         except Exception as exc:
             return False, f"model_not_ready: {exc}", None
 
@@ -236,6 +420,24 @@ class AuthSessionManager:
         if secondary_cfg.enabled:
             state.secondary_hysteresis = SecondaryHysteresisTracker(secondary_cfg)
         self._sessions[self._session_key(user_id, session_id)] = state
+
+        # SESSION-START RECORDING (contract E): persist model validation details.
+        # Never let recording failure break session start.
+        try:
+            import json
+
+            _, _, details = self._validate_model(user_id)
+            validation_path = (
+                Path(settings.inference_storage_path) / user_id / session_id / "model_validation.json"
+            )
+            validation_path.parent.mkdir(parents=True, exist_ok=True)
+            validation_path.write_text(
+                json.dumps(details, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
         return True, "ok", policy
 
     @staticmethod
@@ -476,6 +678,15 @@ class AuthSessionManager:
                     {
                         "window_id": window_id,
                         "result_stage": "primary",
+                        # NEW (contract F): explicit multi-axis fields.
+                        "raw_score": raw_score,                       # clean raw axis (=-MSE)
+                        "raw_threshold": float(state.policy.threshold),
+                        "ema_threshold": (
+                            float(state.policy.threshold) if decision_strategy == "ema" else None
+                        ),
+                        "display_score": decision_score,              # app-facing normalized [0,1]
+                        "display_threshold": decision_threshold,
+                        # compat: prefer raw_*/display_* fields
                         "score": raw_score,
                         "threshold": float(state.policy.threshold),
                         "raw_accept": accept,
@@ -509,6 +720,15 @@ class AuthSessionManager:
                     window_size=float(state.policy.window_size),
                     model_version=state.policy.model_version,
                     message=decision_message,
+                    result_stage="primary",
+                    raw_score=raw_score,
+                    raw_threshold=float(state.policy.threshold),
+                    ema_score=ema_score,
+                    ema_threshold=(
+                        float(state.policy.threshold) if decision_strategy == "ema" else None
+                    ),
+                    display_score=decision_score,
+                    display_threshold=decision_threshold,
                 )
                 if state.secondary_hysteresis is None:
                     response_payload = primary_payload
@@ -529,6 +749,8 @@ class AuthSessionManager:
                 secondary_result = state.secondary_hysteresis.update(
                     accepted=bool(primary_payload.accept),
                     interrupt=bool(primary_payload.interrupt),
+                    primary_score=float(primary_payload.score),
+                    primary_threshold=float(primary_payload.threshold),
                 )
                 if secondary_result is None:
                     continue
@@ -550,6 +772,11 @@ class AuthSessionManager:
                     window_size=float(primary_payload.window_size),
                     model_version=primary_payload.model_version,
                     message=secondary_message,
+                    result_stage="secondary",
+                    secondary_score=float(secondary_result.score),
+                    secondary_threshold=float(secondary_result.threshold),
+                    display_score=float(secondary_result.score),
+                    display_threshold=float(secondary_result.threshold),
                 )
                 await self._inference_storage.append_result(
                     user_id,
@@ -557,6 +784,12 @@ class AuthSessionManager:
                     {
                         "window_id": int(primary_payload.window_id),
                         "result_stage": "secondary",
+                        # NEW (contract F): explicit secondary/display fields.
+                        "secondary_score": float(secondary_result.score),
+                        "secondary_threshold": float(secondary_result.threshold),
+                        "display_score": float(secondary_result.score),
+                        "display_threshold": float(secondary_result.threshold),
+                        # compat: prefer secondary_*/display_* fields
                         "score": float(secondary_result.score),
                         "threshold": float(secondary_result.threshold),
                         "accept": bool(secondary_result.accept),

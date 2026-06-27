@@ -65,7 +65,19 @@ class AuthConfig:
     target_window_frr: float = 0.10
     max_genuine_first_interrupt_p: Optional[float] = None
     policy_search_auth_method: Literal["vqgan-only", "vqgan+transformer"] = "vqgan-only"
+    # Degrade switch: when True, authentication may fall back to
+    # training_fallback_policy.json if best_lock_policy.json is missing or not
+    # policy-search-ready. When False (default), only the formal policy_search
+    # output (best_lock_policy.json with policy_status=ready) is accepted for
+    # going live.
+    allow_training_fallback_policy: bool = False
     # Second-stage hysteresis over first-stage online AuthResult candidates.
+    # Plan B scale fix: when secondary hysteresis is enabled, the app-facing
+    # score / normalized_score / threshold are reported on the SAME sigmoid(policy)
+    # axis as the primary/policy threshold (i.e. sigmoid(-MSE) vs sigmoid(policy.threshold)),
+    # not the old reject-ratio axis. accept/interrupt carry the final verdict and
+    # score >= threshold <=> accept holds for both strategies: "vote" reports the
+    # M-th order-statistic primary score, "ema" reports the score-domain double-EMA.
     secondary_hysteresis_enabled: bool = True
     secondary_hysteresis_strategy: Literal["vote", "ema"] = "vote"
     primary_result_interval_sec: float = 1.0
@@ -73,6 +85,9 @@ class AuthConfig:
     secondary_vote_window_size: int = 10
     secondary_vote_min_rejects: int = 8
     secondary_ema_alpha: float = 0.25
+    # DEPRECATED: no longer used for the ema verdict (the ema strategy now compares
+    # the score-domain double-EMA against the policy threshold on the sigmoid axis).
+    # Kept only for back-compat / telemetry; safe to leave at its default.
     secondary_ema_reject_threshold: float = 0.8
 
     def __post_init__(self) -> None:
@@ -197,6 +212,9 @@ def load_ca_config(path: Optional[Path] = None) -> CAConfig:
         target_window_frr=float(target_window_frr_raw),
         max_genuine_first_interrupt_p=None if max_genuine_raw is None else float(max_genuine_raw),
         policy_search_auth_method=policy_search_auth_method,  # type: ignore[arg-type]
+        allow_training_fallback_policy=bool(
+            auth_raw.get("allow_training_fallback_policy", AuthConfig.allow_training_fallback_policy)
+        ),
         secondary_hysteresis_enabled=bool(
             auth_raw.get("secondary_hysteresis_enabled", AuthConfig.secondary_hysteresis_enabled)
         ),

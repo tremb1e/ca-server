@@ -216,3 +216,92 @@ def test_runtime_context_uses_configured_models_root(tmp_path, monkeypatch) -> N
 
     assert ctx.models_root == settings.data_storage_path.parent / "models"
     assert ctx.auth_manager._models_root == ctx.models_root
+
+
+def _seed_two_stage_results(device_id: str, session_id: str) -> None:
+    """Write one primary row and one secondary row to an inference results.jsonl."""
+    result_dir = settings.inference_storage_path / device_id / session_id
+    result_dir.mkdir(parents=True, exist_ok=True)
+    primary = {
+        "window_id": 1,
+        "result_stage": "primary",
+        "raw_score": -0.5,
+        "raw_threshold": 0.0,
+        "display_score": 0.62,
+        "display_threshold": 0.5,
+        "decision_score": 0.62,
+        "decision_threshold": 0.5,
+        "decision_accept": True,
+        "accept": True,
+        "server_written_timestamp": "2026-01-01T00:00:00+00:00",
+    }
+    secondary = {
+        "window_id": 1,
+        "result_stage": "secondary",
+        "secondary_score": 0.3,
+        "secondary_threshold": 0.4,
+        "display_score": 0.3,
+        "display_threshold": 0.4,
+        "accept": False,
+        "interrupt": True,
+        "server_written_timestamp": "2026-01-01T00:00:01+00:00",
+    }
+    (result_dir / "results.jsonl").write_text(
+        json.dumps(primary) + "\n" + json.dumps(secondary) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_auth_results_by_stage_grouping(tmp_path, monkeypatch) -> None:
+    # Configure settings to point at tmp dirs (no HTTP client needed).
+    _client(tmp_path, monkeypatch)
+    from src.management import snapshot
+
+    device_id = "device-stage"
+    session_id = "auth-session-stage"
+    _seed_two_stage_results(device_id, session_id)
+
+    result = snapshot.auth_results(device_id, session_id=session_id, limit=10)
+
+    # Flat list stays for back-compat.
+    assert result["total"] == 2
+    assert "by_stage" in result
+    by_stage = result["by_stage"]
+    assert {"primary", "secondary"} <= set(by_stage.keys())
+    assert len(by_stage["primary"]) == 1
+    assert len(by_stage["secondary"]) == 1
+
+    primary_row = by_stage["primary"][0]
+    secondary_row = by_stage["secondary"][0]
+    assert primary_row["result_stage"] == "primary"
+    assert secondary_row["result_stage"] == "secondary"
+    assert primary_row["raw_score"] == -0.5
+    assert primary_row["display_score"] == 0.62
+    assert secondary_row["secondary_score"] == 0.3
+    assert secondary_row["display_threshold"] == 0.4
+
+    # Grouped rows are the same normalized rows that appear in the flat list.
+    flat_stages = sorted(row["result_stage"] for row in result["results"])
+    grouped_stages = sorted(
+        row["result_stage"] for rows in by_stage.values() for row in rows
+    )
+    assert flat_stages == grouped_stages == ["primary", "secondary"]
+
+
+def test_latest_auth_results_by_stage_grouping(tmp_path, monkeypatch) -> None:
+    _client(tmp_path, monkeypatch)
+    from src.management import snapshot
+
+    device_id = "device-stage"
+    session_id = "auth-session-stage"
+    _seed_two_stage_results(device_id, session_id)
+
+    result = snapshot.latest_auth_results(limit=10)
+
+    assert result["total"] == 2
+    by_stage = result["by_stage"]
+    assert len(by_stage["primary"]) == 1
+    assert len(by_stage["secondary"]) == 1
+    assert by_stage["primary"][0]["result_stage"] == "primary"
+    assert by_stage["secondary"][0]["result_stage"] == "secondary"
+    assert by_stage["secondary"][0]["secondary_score"] == 0.3

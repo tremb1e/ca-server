@@ -73,8 +73,8 @@ decision_strategy = "ema"
 # 最近连续 N 个窗口中，若 reject>=M，则判定为恶意用户并触发打断（如锁屏等）。
 #
 # 当前策略：连续 10 个窗口内，若至少 8 个窗口为恶意，则判定为恶意并触发打断。
-# vote_window_size = 10
-# vote_min_rejects = 8
+vote_window_size = 10
+vote_min_rejects = 8
 
 # EMA 默认值和 policy_search 候选值。最终每个用户会在验证集上搜索并写入 models/<user>/best_lock_policy.json。
 ema_alpha = 0.25
@@ -101,19 +101,34 @@ target_window_frr = 0.05
 # 上线链路当前执行 VQGAN-only 分数，因此 policy_search 默认也使用 VQGAN-only，避免离线/线上策略不一致。
 policy_search_auth_method = "vqgan-only"
 
+# 策略降级开关（默认关闭）：
+# - false：认证启动仅接受 policy_search 产出的正式策略（best_lock_policy.json，且 policy_status=ready、
+#   policy_search_completed=true）。训练阶段的 training_fallback_policy.json 不会被用于上线。
+# - true：当 best_lock_policy.json 缺失或未就绪时，允许回退使用 training_fallback_policy.json（降级运行）。
+allow_training_fallback_policy = false
+
 # 二次“迟滞决策”：对一次迟滞结果再次做聚合，降低单次返回抖动。
 # 正常 1 秒上传包会贡献 1 个一次结果；单包积压多秒数据时会按 primary_result_interval_sec
 # 从一次窗口序列中抽样多个结果进入二次迟滞。二次结果默认每 10 次 / 约 10 秒向 App 返回一次。
+#
+# 重要（与一次迟滞同量纲）：启用二次迟滞后，返回给 App 的 score / normalized_score / threshold
+# 与一次（primary）/policy 阈值在同一条 sigmoid(policy) 轴上（即 sigmoid(-MSE) 与 sigmoid(policy.threshold)），
+# 不再是旧版“reject 比例 / 8-of-10 阈值 0.6/0.2”那种量纲。最终通过与否以 accept/interrupt 为准，
+# 且满足 score >= threshold <=> accept 的自洽关系。vote 报告第 M 小（M-th order-statistic）的一次分数，
+# ema 报告分数域 double-EMA 分数。
 secondary_hysteresis_enabled = true
 secondary_hysteresis_strategy = "vote"  # "vote" 或 "ema"
 primary_result_interval_sec = 1.0
-secondary_decision_time_sec = 5.0
+secondary_decision_time_sec = 10.0
 
-# 二次 vote：最近 x 次一次迟滞结果中，若不通过次数 >= y，则二次结果不通过。
-secondary_vote_window_size = 5
-secondary_vote_min_rejects = 3
+# 二次 vote：最近 x 次一次迟滞结果中，若不通过次数 >= y，则二次结果不通过（计数判定不变）。
+# 报告的 score 为窗口内第 y(=M) 小的一次分数（sigmoid(policy) 轴），threshold 为该一次分数对应的 policy 阈值。
+secondary_vote_window_size = 10
+secondary_vote_min_rejects = 8
 
-# 二次 EMA：对一次迟滞 reject(0/1) 序列做 EMA；EMA reject 分数超过阈值则不通过。
+# 二次 EMA：对“一次分数”（sigmoid(policy) 轴）做分数域 double-EMA，并与 policy 阈值比较：
+# ema_score >= threshold 则通过。
+# 注意：secondary_ema_reject_threshold 仅为向后兼容保留，已不再参与 ema 判定（DEPRECATED，仅遥测/兼容字段）。
 secondary_ema_alpha = 0.25
 secondary_ema_reject_threshold = 0.8
 
@@ -122,7 +137,7 @@ secondary_ema_reject_threshold = 0.8
 max_epochs = 50
 
 # 早停：验证集性能连续 3 次不提升则停止。
-early_stop_patience = 5
+early_stop_patience = 3
 
 # 默认训练批量大小和设备。device=auto 时优先 NPU，其次 CUDA，最后 CPU。
 batch_size = 128

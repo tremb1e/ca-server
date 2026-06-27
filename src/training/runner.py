@@ -185,7 +185,7 @@ def _write_vqgan_policy(
     vqgan_checkpoint: Path,
     vqgan_config: Path,
 ) -> Path:
-    policy_path = user_output_dir / "best_lock_policy.json"
+    policy_path = user_output_dir / "training_fallback_policy.json"
     policy = {
         "user": str(user_id),
         "window": float(window_size),
@@ -202,6 +202,11 @@ def _write_vqgan_policy(
         "vqgan_checkpoint": serialize_policy_path(vqgan_checkpoint, relative_to=policy_path.parent),
         "vqgan_config": serialize_policy_path(vqgan_config, relative_to=policy_path.parent),
         "model_version": vqgan_checkpoint.name,
+        "policy_search_completed": False,
+        "policy_status": "training_fallback",
+        "score_metric": "mse",
+        "score_scale": "negative_reconstruction_error",
+        "threshold_strategy": "training_val_genuine_threshold",
     }
     policy_path.write_text(json.dumps({str(user_id): policy}, indent=2, ensure_ascii=False), encoding="utf-8")
     return policy_path

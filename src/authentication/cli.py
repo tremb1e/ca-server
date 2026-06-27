@@ -17,7 +17,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--policy-json",
         default=None,
-        help="Optional policy json path; defaults to data_storage/models/<device_id_hash>/best_lock_policy.json.",
+        help=(
+            "Optional policy json path; defaults to the authoritative "
+            "data_storage/models/<device_id_hash>/best_lock_policy.json. Authentication "
+            "falls back to training_fallback_policy.json only when the degrade switch "
+            "(auth.allow_training_fallback_policy) is enabled."
+        ),
     )
     parser.add_argument("--csv-path", required=True, help="Input window CSV path (server processed_data/window/*/*/*.csv).")
     parser.add_argument("--device", default="auto", help="Inference device, e.g. auto / npu:0 / cuda:0 / cpu.")

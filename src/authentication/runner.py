@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from ..utils.reject_trackers import ConsecutiveRejectTracker, EMAScoreTracker, VoteRejectTracker
 from ..utils.runtime import app_root
@@ -29,6 +30,14 @@ class AuthRunConfig:
     vqgan_checkpoint: Path
     vqgan_config: Path
     model_version: str = ""
+    policy_status: str = ""               # "ready" | "training_fallback" | "legacy" | ""
+    policy_search_completed: bool = False
+    score_metric: str = "mse"
+    score_scale: str = "negative_reconstruction_error"
+    threshold_strategy: str = ""
+    policy_source: str = ""               # "best" | "training_fallback"
+    policy_file: str = ""                 # absolute path of the loaded json
+    genuine_score_stats: Optional[Dict[str, Any]] = None
 
 
 def _server_root() -> Path:
@@ -39,17 +48,45 @@ def _default_models_root(server_root: Path) -> Path:
     return server_root / "data_storage" / "models"
 
 
+def _infer_policy_readiness(policy: dict, policy_path: Path) -> Tuple[str, bool]:
+    """Legacy-compatible readiness shim (contract C).
+
+    Returns (policy_status, policy_search_completed).
+    """
+    has_status = "policy_status" in policy
+    has_completed = "policy_search_completed" in policy
+    if has_status or has_completed:
+        completed = bool(policy.get("policy_search_completed")) if has_completed else (
+            str(policy.get("policy_status")) == "ready"
+        )
+        status = str(policy.get("policy_status")) if has_status else ("ready" if completed else "unknown")
+        return status, completed
+    if policy_path.name == "training_fallback_policy.json":
+        return "training_fallback", False
+    if "grid_search" in policy or policy.get("threshold_strategy") == "interrupt_window_frr":
+        return "ready", True
+    return "legacy", False
+
+
 def load_best_policy(
     user: str,
     *,
     models_root: Optional[Path] = None,
     policy_path: Optional[Path] = None,
+    allow_training_fallback: bool = False,
 ) -> AuthRunConfig:
     user = validate_storage_id(user, field_name="user")
     server_root = _server_root()
     models_root = Path(models_root) if models_root is not None else _default_models_root(server_root)
     if policy_path is None:
-        policy_path = safe_child_path(models_root, user) / "best_lock_policy.json"
+        best = safe_child_path(models_root, user) / "best_lock_policy.json"
+        fallback = safe_child_path(models_root, user) / "training_fallback_policy.json"
+        if best.exists():
+            policy_path = best
+        elif allow_training_fallback and fallback.exists():
+            policy_path = fallback
+        else:
+            policy_path = best
     policy_path = Path(policy_path)
     if not policy_path.exists():
         raise FileNotFoundError(f"Missing policy json for user={user}: {policy_path}")
@@ -85,6 +122,13 @@ def load_best_policy(
         server_root=server_root,
         models_root=models_root,
     )
+
+    policy_status, policy_search_completed = _infer_policy_readiness(policy, policy_path)
+    policy_source = "training_fallback" if policy_path.name == "training_fallback_policy.json" else "best"
+    genuine_score_stats = policy.get("genuine_score_stats")
+    if not isinstance(genuine_score_stats, dict):
+        genuine_score_stats = None
+
     return AuthRunConfig(
         user=str(policy.get("user", user)),
         window_size=float(policy.get("window", 0.0)),
@@ -100,6 +144,14 @@ def load_best_policy(
         vqgan_checkpoint=vqgan_checkpoint,
         vqgan_config=vqgan_config,
         model_version=str(policy.get("model_version", "")),
+        policy_status=policy_status,
+        policy_search_completed=policy_search_completed,
+        score_metric=str(policy.get("score_metric", "mse")),
+        score_scale=str(policy.get("score_scale", "negative_reconstruction_error")),
+        threshold_strategy=str(policy.get("threshold_strategy", "")),
+        policy_source=policy_source,
+        policy_file=str(policy_path),
+        genuine_score_stats=genuine_score_stats,
     )
 
 
@@ -158,6 +210,9 @@ def run_auth_inference(
                 "consecutive_rejects",
                 "vote_recent_windows",
                 "vote_recent_rejects",
+                "raw_threshold",
+                "display_score",
+                "display_threshold",
             ]
         )
 
@@ -221,6 +276,13 @@ def run_auth_inference(
                     decision_accept = not bool(interrupt)
                     consecutive_rejects = int(k_tracker.consecutive_rejects)
 
+                raw_threshold = f"{float(policy.threshold):.6f}"
+                if decision_strategy == "ema":
+                    display_score = 1.0 / (1.0 + math.exp(-float(ema_tracker.ema_score or score)))
+                else:
+                    display_score = 1.0 / (1.0 + math.exp(-float(score)))
+                display_threshold = 1.0 / (1.0 + math.exp(-float(policy.threshold)))
+
                 writer.writerow(
                     [
                         meta["window_id"],
@@ -236,6 +298,9 @@ def run_auth_inference(
                         consecutive_rejects,
                         vote_recent_windows,
                         vote_recent_rejects,
+                        raw_threshold,
+                        display_score,
+                        display_threshold,
                     ]
                 )
 
