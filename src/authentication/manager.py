@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import math
 import os
 import sys
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
 
     from .runner import AuthRunConfig
     from .vqgan_inference import VQGANPolicy
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -141,13 +145,42 @@ class AuthSessionManager:
         from .vqgan_inference import VQGANPolicy
 
         ca_cfg = get_ca_config()
-        vote_window_size = int(cfg.vote_window_size or 0)
-        vote_min_rejects = int(cfg.vote_min_rejects or 0)
-        decision_strategy = str(cfg.decision_strategy or cfg.interrupt_rule or ca_cfg.auth.decision_strategy).strip().lower()
-        if decision_strategy == "vote" and (vote_window_size <= 0 or vote_min_rejects <= 0):
-            vote_window_size = int(ca_cfg.auth.vote_window_size)
-            vote_min_rejects = int(ca_cfg.auth.vote_min_rejects)
-        ema_alpha = float(cfg.ema_alpha or ca_cfg.auth.ema_alpha)
+        auth_cfg = ca_cfg.auth
+        # 认证结果的“聚合策略 / 投票窗口 / 阈值”一律以 ca_config.toml [auth] 为权威来源，
+        # 覆盖 best_lock_policy.json 中 policy_search 为该用户产出的投票窗口（例如 5-of-9）。
+        # 这样 App 端展示的 “M of N”（如 30-of-50）始终来自配置，且与 result_delay_sec 折算的
+        # 发布窗口数（5s => 50 窗）保持一致 —— 仍是单一 primary 阶段，不引入任何二次迟滞/二次投票。
+        # per-user 策略仅继续提供：该用户的“单窗口原始分数阈值 threshold”与模型工件路径。
+        decision_strategy = str(
+            auth_cfg.decision_strategy or cfg.decision_strategy or cfg.interrupt_rule or "ema"
+        ).strip().lower()
+        vote_window_size = int(auth_cfg.vote_window_size or cfg.vote_window_size or 0)
+        vote_min_rejects = int(auth_cfg.vote_min_rejects or cfg.vote_min_rejects or 0)
+        ema_alpha = float(auth_cfg.ema_alpha or cfg.ema_alpha or 0.25)
+
+        # 一致性校验：vote 聚合窗口应与 result_delay_sec 折算的发布窗口数一致，否则
+        # “聚合该延迟内全部窗口”的语义会被破坏，这里给出明确告警，便于排查配置。
+        if decision_strategy == "vote":
+            if vote_window_size <= 0 or vote_min_rejects <= 0 or vote_min_rejects > vote_window_size:
+                logger.warning(
+                    "auth.decision_strategy=vote 但投票阈值非法：vote_window_size=%s, vote_min_rejects=%s；"
+                    "请在 ca_config.toml [auth] 配置 0 < vote_min_rejects <= vote_window_size",
+                    vote_window_size,
+                    vote_min_rejects,
+                )
+            target_windows = windows_for_delay(
+                auth_cfg.result_delay_sec,
+                window_size_sec=cfg.window_size,
+                overlap=cfg.overlap,
+            )
+            if target_windows > 0 and vote_window_size != target_windows:
+                logger.warning(
+                    "auth.vote_window_size=%d 与 result_delay_sec=%.3fs 折算的发布窗口数=%d 不一致；"
+                    "建议两者保持一致，使 App 收到的聚合结果恰好覆盖该延迟内的全部窗口",
+                    vote_window_size,
+                    float(auth_cfg.result_delay_sec),
+                    target_windows,
+                )
         return VQGANPolicy(
             user=cfg.user,
             window_size=cfg.window_size,

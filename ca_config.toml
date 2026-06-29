@@ -60,31 +60,36 @@ sampling_rate_hz = 100
 
 [auth]
 # 认证策略目标：期望在该时间内完成首次打断决策（秒）。
-# 当前需求：T=2s。
-max_decision_time_sec = 2.0
+# 当前需求：T=20s。
+max_decision_time_sec = 20.0
 
 # 认证结果发布延迟（秒）：服务端每累积该时长对应的滑窗后，才向 App 发布一次“聚合认证结果”。
 # - 端侧约每 1s 上送一个数据包；服务端按 [windows] 的 sizes/overlap 切窗
 #   （默认 0.2s 窗 + 50% overlap => stride 0.1s，即每秒约 10 个窗口）。
 # - 折算窗口数 target_windows = round(result_delay_sec / stride_sec)，例如 5.0s => 50 个窗口。
-# - 发布时综合这 target_windows 个窗口、按该用户策略（EMA 或 y-of-x 投票）得到的最新聚合结果回包；
+# - 发布时综合这 target_windows 个窗口、按 [auth] 配置的聚合策略（y-of-x 投票 / EMA）得到的最新聚合结果回包；
 #   发布间隔内的数据包只回 Ack，不回 AuthResult（全量窗口仍照常落盘到 inference 结果）。
 # - 0 表示不延迟（每个数据包都回结果，兼容旧行为）；值越大结果越平滑、抖动越低，但 App 收到结论的时延越高。
 # - 建议不超过 max_decision_time_sec 太多；若超过，StartAuthentication 会按两者较大值回报 decision_time_sec 并打日志告警。
 result_delay_sec = 5.0
 
-# 认证决策策略：
-# - "ema"：默认策略，对 VQGAN 分数做指数滑动平均后与 policy_search 选出的阈值比较，降低短时抖动造成的 FRR。
-# - "vote"：保留 y-of-x 投票机制，即最近 N 窗中 reject>=M 触发。
+# 认证决策策略（本 [auth] 配置为权威来源：运行时覆盖 best_lock_policy.json 中 per-user 的投票窗口）：
+# - "vote"：y-of-x 投票，最近 N=vote_window_size 个窗口中 reject>=M=vote_min_rejects 即判定恶意；
+#           App 端展示的 “M of N”（如 30 of 50）即来自此处配置。
+# - "ema"：对 VQGAN 分数做指数滑动平均后与 per-user 阈值比较（App 端展示 EMA 分数，而非 “M of N”）。
 # - "k"：兼容旧的连续 K 次拒绝策略。
-decision_strategy = "ema"
+# 说明：per-user best_lock_policy.json 仅继续提供该用户“单窗口原始分数阈值 threshold”与模型工件路径；
+#       聚合策略/窗口/阈值统一以本 [auth] 配置为准，确保 App 收到的窗口阈值始终来自 ca_config.toml。
+decision_strategy = "vote"
 
-# 判定策略（投票规则）：
-# 最近连续 N 个窗口中，若 reject>=M，则判定为恶意用户并触发打断（如锁屏等）。
+# 判定策略（投票规则 y-of-x）：
+# 最近连续 N=vote_window_size 个窗口中，若 reject>=M=vote_min_rejects，则判定为恶意并触发打断（如锁屏等）。
 #
-# 当前策略：连续 7 个窗口内，若至少 6 个窗口为恶意，则判定为恶意并触发打断。
-vote_window_size = 7
-vote_min_rejects = 6
+# 当前策略：综合 result_delay_sec=5s 对应的 50 个窗口（=vote_window_size），其中至少 30 个为恶意才判定，
+#           即 App 端展示的 “30 of 50”。注意：vote_window_size 应与 result_delay_sec 折算的发布窗口数保持一致
+#           （5s、0.2s 窗、50% overlap => stride 0.1s => 50 窗），否则服务端启动会话时会打日志告警。
+vote_window_size = 50
+vote_min_rejects = 30
 
 # EMA 默认值和 policy_search 候选值。最终每个用户会在验证集上搜索并写入 models/<user>/best_lock_policy.json。
 ema_alpha = 0.25
@@ -103,7 +108,7 @@ k_rejects_mode = "by_window"
 # 本轮需求：在尽可能少打断正常用户的前提下提升恶意用户检测率，
 # 因此把窗口级误打断率（FRR）上限收紧到 0.05。
 # 注意：这里的 FRR 以“窗口”为粒度统计，并会排除每个 session 末尾 (N-1) 个窗口（无法组成完整 N 窗投票窗口）。
-target_window_frr = 0.05
+target_window_frr = 0.10
 
 # 限制真实用户会话在 max_decision_time_sec 内被误打断的概率；不填时沿用 target_window_frr。
 # max_genuine_first_interrupt_p = 0.05

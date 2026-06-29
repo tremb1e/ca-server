@@ -172,7 +172,7 @@ GET /api/v1/management/runtime
 | `started_at` | string | 启动时间，ISO8601 UTC |
 | `uptime_seconds` | float | 运行秒数 |
 | `http` | object | HTTP 是否启用、host、port |
-| `grpc` | object | gRPC host、port、消息大小和并发配置 |
+| `grpc` | object | gRPC host、port、`max_message_size` 和 `max_concurrent_rpcs`（同时处理的 RPC 上限，每条 `StreamSensorData` 长流计 1 个；默认 `512`，可从容支撑 100 并发认证用户）|
 | `tls` | object | TLS 是否启用、证书配置、禁用原因 |
 | `backend` | object | 当前推理/训练后端探测结果，如 `npu`、`cuda`、`cpu` |
 | `metrics.counters` | object | 运行计数器 |
@@ -356,8 +356,8 @@ GET /api/v1/management/devices/{device_id}/models
 | `policy.threshold` | float | 判定阈值 |
 | `policy.interrupt_rule` | string | `k`、`vote` 或 `none` |
 | `policy.k_rejects` | int | 连续拒绝 K 次触发打断 |
-| `policy.vote_window_size` | int | 投票窗口 N |
-| `policy.vote_min_rejects` | int | 投票窗口中至少 M 次拒绝 |
+| `policy.vote_window_size` | int | 投票窗口 N（读自 per-user `best_lock_policy.json`）|
+| `policy.vote_min_rejects` | int | 投票窗口中至少 M 次拒绝（读自 per-user `best_lock_policy.json`）|
 | `policy.model_version` | string | 模型版本 |
 | `policy.vqgan_checkpoint` | string | VQGAN checkpoint 解析后的路径 |
 | `policy.vqgan_config` | string | VQGAN config 解析后的路径 |
@@ -368,6 +368,8 @@ GET /api/v1/management/devices/{device_id}/models
 | `training_summary` | array | 训练汇总指标，如 AUC/FAR/FRR/EER/F1 |
 | `policy_search` | object | 策略搜索输出文件 |
 | `error` | string/null | policy 读取错误 |
+
+> 说明：本接口的 `policy.*` 字段直接读自该用户的 `best_lock_policy.json`（`policy_search` 产物），反映的是 per-user 策略文件内容。自 2026-06-29 起，**在线认证运行时的聚合策略 / 投票窗口**（`decision_strategy` / `vote_window_size` / `vote_min_rejects` / `ema_alpha`）以 `ca_config.toml [auth]` 为权威来源并覆盖 per-user 同名字段（当前部署为 `vote`、`50/30`），per-user 文件仅继续提供该用户“单窗口原始分数阈值 `threshold`”与模型工件路径。因此本接口展示的 `vote_window_size` / `decision_strategy` 可能与运行时实际生效的配置值不同；App 端在 `AuthResult.message` 中看到的 “M of N” 以 `[auth]` 配置为准。
 
 示例：
 
@@ -718,7 +720,7 @@ rpc StartAuthentication(AuthSessionRequest) returns (AuthSessionResponse)
 | `message` | `ok` |
 | `model_version` | 使用的模型版本 |
 | `window_size_sec` | 认证窗口秒数 |
-| `decision_time_sec` | 最大决策时间配置 |
+| `decision_time_sec` | 决策时间配置，取 `max(max_decision_time_sec, result_delay_sec)`（结果发布节流不短于决策时间）|
 
 拒绝响应：
 
@@ -808,7 +810,7 @@ payload 解密解压后应为 `SerializedSensorBatch` protobuf：
 | `normalized_score` | 归一化分数（兼容字段）|
 | `k_rejects` | K 连拒阈值 |
 | `model_version` | 模型版本 |
-| `message` | 投票状态说明 |
+| `message` | 投票状态说明；`vote` 策略下承载 App 端展示的 “M of N” 文案（如“近50窗恶意 30/50，阈值 30”，即 “30 of 50”）。该 M / N 来自 `ca_config.toml [auth]` 的 `vote_min_rejects` / `vote_window_size`，当前部署为 `30 / 50`。窗口不足时为“窗口不足 r/N，等待更多数据”。 |
 
 返回 payload 与管理接口还会附带按尺度拆分的字段，避免不同量纲被混读：
 

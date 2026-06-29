@@ -20,15 +20,15 @@ test_ratio = 0.125
 
 # 数据预处理并发进程数（session 重采样、滑窗生成均受此限制）。
 # 后期如需调参可修改此值；在 process_all_users 多用户处理时会按用户级并发自动分配给子任务。
-workers = 5
-process_user_workers = 5
+workers = 20
+process_user_workers = 20
 
 # HMOG 攻击者用户选择（按 HMOG 目录名排序后的顺序）：
 # - val：使用从前往后的第 1~x 个 HMOG 用户，x 至少为 10
 # - test：使用从后往前的第 1~x 个 HMOG 用户，x 至少为 10
 # 每个 HMOG 用户以 24 个 session 作为候选来源；实际写入时会按真实用户 val/test 体量做 1:1 平衡截取。
-hmog_val_subject_count = 20
-hmog_test_subject_count = 20
+hmog_val_subject_count = 10
+hmog_test_subject_count = 10
 hmog_min_subject_count = 10
 hmog_session_count = 24
 hmog_balance_ratio = 1.0
@@ -67,28 +67,33 @@ max_decision_time_sec = 20.0
 # - 端侧约每 1s 上送一个数据包；服务端按 [windows] 的 sizes/overlap 切窗
 #   （默认 0.2s 窗 + 50% overlap => stride 0.1s，即每秒约 10 个窗口）。
 # - 折算窗口数 target_windows = round(result_delay_sec / stride_sec)，例如 5.0s => 50 个窗口。
-# - 发布时综合这 target_windows 个窗口、按该用户策略（EMA 或 y-of-x 投票）得到的最新聚合结果回包；
+# - 发布时综合这 target_windows 个窗口、按 [auth] 配置的聚合策略（y-of-x 投票 / EMA）得到的最新聚合结果回包；
 #   发布间隔内的数据包只回 Ack，不回 AuthResult（全量窗口仍照常落盘到 inference 结果）。
 # - 0 表示不延迟（每个数据包都回结果，兼容旧行为）；值越大结果越平滑、抖动越低，但 App 收到结论的时延越高。
 # - 建议不超过 max_decision_time_sec 太多；若超过，StartAuthentication 会按两者较大值回报 decision_time_sec 并打日志告警。
 result_delay_sec = 5.0
 
-# 认证决策策略：
-# - "ema"：默认策略，对 VQGAN 分数做指数滑动平均后与 policy_search 选出的阈值比较，降低短时抖动造成的 FRR。
-# - "vote"：保留 y-of-x 投票机制，即最近 N 窗中 reject>=M 触发。
+# 认证决策策略（本 [auth] 配置为权威来源：运行时覆盖 best_lock_policy.json 中 per-user 的投票窗口）：
+# - "vote"：y-of-x 投票，最近 N=vote_window_size 个窗口中 reject>=M=vote_min_rejects 即判定恶意；
+#           App 端展示的 “M of N”（如 30 of 50）即来自此处配置。
+# - "ema"：对 VQGAN 分数做指数滑动平均后与 per-user 阈值比较（App 端展示 EMA 分数，而非 “M of N”）。
 # - "k"：兼容旧的连续 K 次拒绝策略。
+# 说明：per-user best_lock_policy.json 仅继续提供该用户“单窗口原始分数阈值 threshold”与模型工件路径；
+#       聚合策略/窗口/阈值统一以本 [auth] 配置为准，确保 App 收到的窗口阈值始终来自 ca_config.toml。
 decision_strategy = "vote"
 
-# 判定策略（投票规则）：
-# 最近连续 N 个窗口中，若 reject>=M，则判定为恶意用户并触发打断（如锁屏等）。
+# 判定策略（投票规则 y-of-x）：
+# 最近连续 N=vote_window_size 个窗口中，若 reject>=M=vote_min_rejects，则判定为恶意并触发打断（如锁屏等）。
 #
-# 当前策略：连续 50 个窗口内，若至少 30 个窗口为恶意，则判定为恶意并触发打断。
+# 当前策略：综合 result_delay_sec=5s 对应的 50 个窗口（=vote_window_size），其中至少 30 个为恶意才判定，
+#           即 App 端展示的 “30 of 50”。注意：vote_window_size 应与 result_delay_sec 折算的发布窗口数保持一致
+#           （5s、0.2s 窗、50% overlap => stride 0.1s => 50 窗），否则服务端启动会话时会打日志告警。
 vote_window_size = 50
 vote_min_rejects = 30
 
 # EMA 默认值和 policy_search 候选值。最终每个用户会在验证集上搜索并写入 models/<user>/best_lock_policy.json。
 ema_alpha = 0.25
-ema_alpha_candidates = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+ema_alpha_candidates = [0.10, 0.20, 0.30, 0.40, 0.50]
 
 # （兼容保留）“连续拒绝 K 次”策略的 K 计算方式：
 # - "by_window": K = ceil(max_decision_time_sec / stride_sec)
@@ -106,7 +111,7 @@ k_rejects_mode = "by_window"
 target_window_frr = 0.10
 
 # 限制真实用户会话在 max_decision_time_sec 内被误打断的概率；不填时沿用 target_window_frr。
-# max_genuine_first_interrupt_p = 0.005
+# max_genuine_first_interrupt_p = 0.05
 
 # 上线链路当前执行 VQGAN-only 分数，因此 policy_search 默认也使用 VQGAN-only，避免离线/线上策略不一致。
 policy_search_auth_method = "vqgan-only"
