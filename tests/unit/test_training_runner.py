@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import sys
 
 import pytest
@@ -56,6 +56,10 @@ def test_run_window_sweep_retrains_when_cached_summary_has_other_user(tmp_path, 
     fake_ca_cfg = SimpleNamespace(
         windows=SimpleNamespace(sizes=[ws], sampling_rate_hz=100, overlap=0.5),
         auth=SimpleNamespace(max_decision_time_sec=2.0),
+        # Disable policy search for this reuse/retrain test: it only asserts the
+        # training-fallback policy is written. The new policy-search completeness
+        # guard would otherwise (correctly) flag the absent best_lock_policy.json.
+        training=SimpleNamespace(run_policy_search=False),
     )
 
     calls: list[list[str]] = []
@@ -218,3 +222,99 @@ def test_training_command_error_includes_subprocess_log_context(tmp_path, monkey
     assert "exit code 2" in message
     assert "unrecognized arguments" in message
     assert (log_dir / "hmog_vqgan_subprocess.log").exists()
+
+
+def _make_window_sweep_cfg(ws: float, *, run_policy_search: bool, allow_fb: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        windows=SimpleNamespace(sizes=[ws], sampling_rate_hz=100, overlap=0.5),
+        auth=SimpleNamespace(max_decision_time_sec=2.0, allow_training_fallback_policy=allow_fb),
+        training=SimpleNamespace(run_policy_search=run_policy_search),
+    )
+
+
+def _stub_train_subprocess_writes_checkpoint(monkeypatch) -> None:
+    """Fake the CA-train subprocess so the window sweep produces a checkpoint +
+    best_windows.json (hence training_fallback_policy.json), reaching the
+    policy-search stage without touching real training."""
+
+    def _fake_run(cmd, **kwargs):
+        del kwargs
+        out_dir = Path(cmd[cmd.index("--output-dir") + 1])
+        run_log_dir = Path(cmd[cmd.index("--log-dir") + 1])
+        users_arg = next(part for part in cmd if str(part).startswith("--users="))
+        run_user = str(users_arg).split("=", 1)[1]
+        run_ws = float(cmd[cmd.index("--window-sizes") + 1])
+        ckpt = out_dir / "checkpoints" / f"vqgan_user_{run_user}_ws_{run_ws:.1f}.pt"
+        ckpt.parent.mkdir(parents=True, exist_ok=True)
+        ckpt.write_text("ok", encoding="utf-8")
+        run_log_dir.mkdir(parents=True, exist_ok=True)
+        (run_log_dir / "best_windows.json").write_text(
+            json.dumps(
+                {run_user: {"user": run_user, "window": run_ws, "val": {"threshold": -0.12}, "checkpoint": str(ckpt)}}
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(training_runner.subprocess, "run", _fake_run)
+    monkeypatch.setattr(training_runner, "k_from_interrupt_time", lambda *a, **k: 3)
+
+
+def _install_fake_policy_search(monkeypatch, fn) -> None:
+    fake_ps = ModuleType("src.policy_search.runner")
+    fake_ps.run_policy_grid_search = fn
+    monkeypatch.setitem(sys.modules, "src.policy_search.runner", fake_ps)
+
+
+def test_window_sweep_raises_when_policy_search_yields_no_accepted_policy(tmp_path, monkeypatch) -> None:
+    """Policy search ran but produced no auth-accepted best_lock_policy.json and
+    the degrade switch is off → run_window_sweep_for_user must raise so the
+    caller records the run as failed (retriable) instead of completed."""
+    user_id = "user_no_policy"
+    ws = 0.2
+    dataset_path = tmp_path / "dataset"
+    models_root = tmp_path / "models"
+    script_path = tmp_path / "fake_train.py"
+    dataset_path.mkdir(parents=True)
+    script_path.write_text("# fake", encoding="utf-8")
+    _stub_train_subprocess_writes_checkpoint(monkeypatch)
+    # Policy search runs but writes NO best_lock_policy.json (no viable policy).
+    _install_fake_policy_search(monkeypatch, lambda *a, **k: None)
+
+    with pytest.raises(training_runner.PolicySearchIncompleteError):
+        run_window_sweep_for_user(
+            user_id,
+            device="cpu",
+            ca_cfg=_make_window_sweep_cfg(ws, run_policy_search=True, allow_fb=False),
+            dataset_path=dataset_path,
+            models_root=models_root,
+            ca_train_script=script_path,
+        )
+    # Training itself succeeded → the fallback policy is on disk; only the
+    # auth-accepted best policy is missing, which is what makes the run "failed".
+    assert (models_root / user_id / "training_fallback_policy.json").exists()
+
+
+def test_window_sweep_keeps_fallback_when_degrade_switch_enabled(tmp_path, monkeypatch) -> None:
+    """With auth.allow_training_fallback_policy=true the fallback policy is an
+    acceptable model, so a missing best_lock_policy.json must NOT raise."""
+    user_id = "user_degrade"
+    ws = 0.2
+    dataset_path = tmp_path / "dataset"
+    models_root = tmp_path / "models"
+    script_path = tmp_path / "fake_train.py"
+    dataset_path.mkdir(parents=True)
+    script_path.write_text("# fake", encoding="utf-8")
+    _stub_train_subprocess_writes_checkpoint(monkeypatch)
+    _install_fake_policy_search(monkeypatch, lambda *a, **k: None)
+
+    results = run_window_sweep_for_user(
+        user_id,
+        device="cpu",
+        ca_cfg=_make_window_sweep_cfg(ws, run_policy_search=True, allow_fb=True),
+        dataset_path=dataset_path,
+        models_root=models_root,
+        ca_train_script=script_path,
+    )
+    assert len(results) == 1
+    assert (models_root / user_id / "training_fallback_policy.json").exists()

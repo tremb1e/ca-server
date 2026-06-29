@@ -22,6 +22,20 @@ class TrainingCommandError(RuntimeError):
     pass
 
 
+class PolicySearchIncompleteError(RuntimeError):
+    """A window sweep finished but produced no policy that auth will accept.
+
+    Training only writes ``training_fallback_policy.json``; the auth-accepted
+    ``best_lock_policy.json`` is produced solely by policy search. When policy
+    search fails (raises) or finds no viable policy (writes nothing), and the
+    degrade switch ``auth.allow_training_fallback_policy`` is off, the run has
+    NOT yielded a usable model. Raising — instead of returning quietly — keeps
+    ``TrainingState`` honest: the caller records ``failed`` (retriable) rather
+    than ``completed``, which would otherwise dead-end ``StartAuthentication``
+    on ``model_not_ready`` with no recovery path.
+    """
+
+
 @dataclass(frozen=True)
 class TrainingRunResult:
     window_size: float
@@ -41,6 +55,27 @@ def _default_dataset_path(server_root: Path) -> Path:
 
 def _default_models_root(server_root: Path) -> Path:
     return server_root / "data_storage" / "models"
+
+
+def _has_accepted_best_policy(user_id: str, models_root: Path) -> bool:
+    """Return True iff the auth readiness gate (contract E) would accept a
+    *ready* best policy for ``user_id``: a ``best_lock_policy.json`` that loads
+    with ``policy_source=="best"``, ``policy_status=="ready"`` and
+    ``policy_search_completed`` (the legacy grid_search shim also qualifies via
+    ``load_best_policy``). Imported lazily to avoid a module-level import cycle
+    with the authentication package.
+    """
+    try:
+        from ..authentication.runner import load_best_policy
+
+        cfg = load_best_policy(str(user_id), models_root=models_root, allow_training_fallback=False)
+    except Exception:
+        return False
+    return (
+        str(getattr(cfg, "policy_source", "")) == "best"
+        and str(getattr(cfg, "policy_status", "")) == "ready"
+        and bool(getattr(cfg, "policy_search_completed", False))
+    )
 
 
 def _default_ca_train_script() -> Path:
@@ -373,6 +408,7 @@ def run_window_sweep_for_user(
         )
 
     if bool(getattr(training_cfg, "run_policy_search", True)) and results:
+        policy_search_error: Optional[str] = None
         try:
             from ..policy_search.runner import run_policy_grid_search
 
@@ -387,6 +423,24 @@ def run_window_sweep_for_user(
             )
             logger.info("Policy search completed for user=%s", user_id)
         except Exception as exc:
+            policy_search_error = str(exc)
             logger.warning("Policy search failed for user=%s; keeping training fallback policy: %s", user_id, exc)
+
+        # Keep TrainingState honest: a window sweep alone only writes
+        # training_fallback_policy.json. If policy search did not yield an
+        # auth-accepted best_lock_policy.json (it raised, or found no viable
+        # policy and skipped the write) and the operator has not opted into the
+        # fallback, the model is NOT usable for auth. Returning here would let
+        # _run_training mark the run "completed", and StartAuthentication would
+        # then dead-end the app on "model_not_ready" with no retrain path. Raise
+        # so the run is recorded "failed" and becomes retriable.
+        allow_fb = bool(getattr(ca_cfg.auth, "allow_training_fallback_policy", False))
+        if not allow_fb and not _has_accepted_best_policy(str(user_id), models_root):
+            raise PolicySearchIncompleteError(
+                f"Training finished but produced no auth-accepted best policy for "
+                f"user={user_id} (only training_fallback_policy.json is available; set "
+                f"auth.allow_training_fallback_policy=true to accept it). "
+                f"policy_search_error={policy_search_error or 'no best_lock_policy.json written'}"
+            )
 
     return results

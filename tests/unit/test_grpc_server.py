@@ -215,7 +215,11 @@ async def test_report_metrics_keeps_numeric_management_fields(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_start_authentication_reports_model_not_ready_after_completed_training(tmp_path):
+async def test_start_authentication_force_retrains_when_completed_model_invalid(tmp_path):
+    # A run marked "completed" whose model fails validation (stale/corrupted/
+    # legacy artifacts) must NOT dead-end the app on model_not_ready. The server
+    # now force-triggers a retrain and reports training_in_progress so the model
+    # can self-heal.
     class _CompletedTrainingManager(_TrainingManager):
         def get_readiness(self, device_id_hash):
             return SimpleNamespace(
@@ -244,5 +248,36 @@ async def test_start_authentication_reports_model_not_ready_after_completed_trai
     )
 
     assert response.accepted is False
-    assert response.message.startswith("model_not_ready: missing checkpoint")
-    assert service.training_manager.submitted == []
+    assert response.message == "training_in_progress"
+    # completed-but-invalid → forced retrain (self-heal), not a dead-end.
+    assert service.training_manager.submitted == [("device-a", True)]
+
+
+@pytest.mark.asyncio
+async def test_start_authentication_triggers_training_when_data_ready_but_untrained(tmp_path):
+    class _ReadyDataTrainingManager(_TrainingManager):
+        def get_readiness(self, device_id_hash):
+            return SimpleNamespace(
+                status="pending",
+                total_bytes=200,
+                min_bytes=100,
+                has_enough_data=True,
+            )
+
+    ctx = SimpleNamespace(
+        storage=_Storage(),
+        training_manager=_ReadyDataTrainingManager(),
+        auth_manager=_AuthManager(),
+        metrics=RuntimeMetrics(),
+        models_root=tmp_path / "models",
+    )
+    service = SensorDataService(ctx)
+
+    response = await service.StartAuthentication(
+        sensor_data_pb2.AuthSessionRequest(device_id_hash="device-a"),
+        None,
+    )
+
+    assert response.accepted is False
+    assert response.message == "training_in_progress"
+    assert service.training_manager.submitted == [("device-a", True)]

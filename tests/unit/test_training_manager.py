@@ -153,3 +153,43 @@ async def test_forced_submit_recovers_stale_in_progress(tmp_path, monkeypatch) -
     assert ("process", "user1") in calls
     payload = json.loads((models_root / "user1" / "training_state.json").read_text(encoding="utf-8"))
     assert payload["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_run_training_marks_failed_when_policy_search_incomplete(tmp_path, monkeypatch) -> None:
+    """If the window sweep raises PolicySearchIncompleteError (no auth-accepted
+    best policy), _run_training must record status=failed — NOT completed — so
+    the run stays retriable and StartAuthentication won't dead-end the app on a
+    completed-but-unusable model."""
+    from src.training.runner import PolicySearchIncompleteError
+
+    raw_root = tmp_path / "raw_data"
+    user_dir = raw_root / "user1"
+    user_dir.mkdir(parents=True)
+    (user_dir / "session_test.jsonl").write_bytes(b"x" * 2 * 1024 * 1024)
+
+    monkeypatch.setattr(training_manager.settings, "data_storage_path", raw_root)
+    monkeypatch.setattr(training_manager.settings, "processed_data_path", tmp_path / "processed_data")
+    monkeypatch.setattr(training_manager, "get_ca_config", _make_ca_cfg)
+
+    fake_pipeline = types.ModuleType("src.processing.pipeline")
+    fake_pipeline.build_config = lambda: object()
+    fake_pipeline.process_user = lambda user_id, cfg: None
+
+    def _raise_incomplete(user_id, **kwargs):
+        raise PolicySearchIncompleteError(f"no accepted best policy for {user_id}")
+
+    fake_runner = types.ModuleType("src.training.runner")
+    fake_runner.run_window_sweep_for_user = _raise_incomplete
+    monkeypatch.setitem(sys.modules, "src.processing.pipeline", fake_pipeline)
+    monkeypatch.setitem(sys.modules, "src.training.runner", fake_runner)
+
+    manager = training_manager.TrainingManager(max_concurrent=1, check_interval_sec=1)
+    await manager.submit_if_ready("user1", force=True)
+    task = manager._tasks.get("user1")
+    assert task is not None
+    await task
+
+    payload = json.loads((tmp_path / "models" / "user1" / "training_state.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert "no accepted best policy" in payload["last_error"]

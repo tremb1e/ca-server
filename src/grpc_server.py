@@ -213,11 +213,21 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         min_bytes = readiness.min_bytes
         total_mb = readiness.total_bytes / (1024 * 1024)
         min_mb = min_bytes / (1024 * 1024)
-        if readiness.has_enough_data and str(readiness.status) == "completed":
-            reason = f"model_not_ready: {model_error or 'trained artifacts incomplete'}"
-        elif readiness.total_bytes >= min_bytes:
+        if readiness.total_bytes >= min_bytes:
+            # Not ready but enough data → (re)train. This covers both "never
+            # trained / interrupted" AND "status=completed but the model fails
+            # validation" (stale/corrupted/legacy artifacts). force=True so a
+            # persisted completed/in_progress status cannot block the retrain;
+            # otherwise a completed-but-invalid model would dead-end the app on
+            # "model_not_ready" with no recovery path.
             await self.training_manager.submit_if_ready(device_id_hash, force=True)
             reason = "training_in_progress"
+            if str(readiness.status) == "completed":
+                logger.warning(
+                    "Completed model failed validation; forcing retrain: device=%s detail=%s",
+                    device_id_hash,
+                    model_error or "trained artifacts incomplete",
+                )
         else:
             reason = f"data_insufficient: {total_mb:.1f}MB/{min_mb:.0f}MB"
 
