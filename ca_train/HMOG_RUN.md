@@ -1,6 +1,6 @@
 # HMOG / Server Window VQGAN 训练与认证说明
 
-本文档描述当前服务端代码的训练、策略搜索和离线认证流程。旧版 HMOG 实验文档中“五个固定 HMOG 用户、12 轴输入、CUDA-only”的说明已经过期；当前主链路以服务端生成的 window CSV 为输入，VQGAN 输入统一为 9 轴。
+本文档描述当前服务端代码的训练、策略搜索和离线认证流程。旧版 HMOG 实验文档中“五个固定 HMOG 用户、12 轴输入、CUDA-only”的说明已经过期；当前主链路以服务端生成的 window CSV 为输入，VQGAN 输入统一为 6 轴（2026-06-29 起由 9 轴改为 6 轴，移除磁力计）。
 
 ## 数据来源
 
@@ -23,18 +23,17 @@
 当前 VQGAN 输入为：
 
 ```text
-(batch, 1, 9, T)
+(batch, 1, 6, T)
 ```
 
-9 个通道为：
+6 个通道为：
 
 ```text
 acc_x, acc_y, acc_z,
-gyr_x, gyr_y, gyr_z,
-mag_x, mag_y, mag_z
+gyr_x, gyr_y, gyr_z
 ```
 
-不再拼接 `acc_magnitude`、`gyr_magnitude`、`mag_magnitude`。因此旧的 12 轴 checkpoint、阈值和策略文件不能继续作为线上模型使用，必须重新训练并重新运行 `policy_search` 标定。
+2026-06-29 起移除磁力计 `mag_x/y/z`（`input_height` 由 9 改为 6，`image_channels` 仍为 1），也不再拼接 `acc_magnitude`、`gyr_magnitude`、`mag_magnitude`。因此旧的 9 轴 / 12 轴 checkpoint、scaler、阈值和策略文件不能继续作为线上模型使用，必须重新生成 6 轴窗口数据、重新训练并重新运行 `policy_search` 标定。
 
 ## 推荐主入口
 
@@ -150,7 +149,7 @@ python3 ca_train/hmog_token_auth_inference.py \
 - `hmog_metrics.txt`：人类可读指标。
 - `hmog_metrics.jsonl`：逐 epoch 机器可读指标。
 - `best_windows.json`：窗口 sweep 摘要。
-- checkpoint 和 config：包含 `input_height = 9`。
+- checkpoint 和 config：包含 `input_height = 6`。
 
 策略搜索会输出：
 

@@ -19,9 +19,6 @@ AXIS_COLUMNS = (
     "gyr_x",
     "gyr_y",
     "gyr_z",
-    "mag_x",
-    "mag_y",
-    "mag_z",
 )
 
 
@@ -63,8 +60,8 @@ def load_vqgan(checkpoint: Path, *, device: torch.device, config_path: Path) -> 
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(cfg, dict):
         raise ValueError(f"Unexpected VQGAN config format: {config_path}")
-    if int(cfg.get("input_height", 9)) != 9:
-        raise ValueError(f"VQGAN config {config_path} uses input_height={cfg.get('input_height')}; retrain with 9-axis input.")
+    if int(cfg.get("input_height", 6)) != 6:
+        raise ValueError(f"VQGAN config {config_path} uses input_height={cfg.get('input_height')}; retrain with 6-axis input.")
     args = argparse.Namespace(**cfg)
     args.use_nonlocal = bool(cfg.get("use_nonlocal", True))
     model = VQGAN(args).to(device)
@@ -107,7 +104,7 @@ def windowize_dataframe(
     target_width: int,
 ) -> Tuple[List[int], np.ndarray]:
     if df.empty:
-        return [], np.empty((0, 1, 9, target_width), dtype=np.float32)
+        return [], np.empty((0, 1, 6, target_width), dtype=np.float32)
 
     window_points = max(1, int(round(window_size_sec * sampling_rate_hz)))
     step_points = max(1, int(round(window_points * (1.0 - float(overlap)))))
@@ -126,6 +123,6 @@ def windowize_dataframe(
         window_id += 1
 
     if not windows:
-        return [], np.empty((0, 1, 9, target_width), dtype=np.float32)
+        return [], np.empty((0, 1, 6, target_width), dtype=np.float32)
 
     return window_ids, np.stack(windows, axis=0).astype(np.float32, copy=False)

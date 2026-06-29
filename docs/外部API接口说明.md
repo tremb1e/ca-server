@@ -273,7 +273,7 @@ curl -H "X-Management-API-Key: ${API_KEY}" \
 | `processed.windows` | 各窗口尺寸下的 train/val/test 文件信息 |
 | `inference.sessions` | inference 目录下 session 数 |
 | `training.status` | `pending`、`in_progress`、`completed`、`failed` |
-| `model.ready` | policy、checkpoint、config 是否齐全 |
+| `model.ready` | 模型是否通过就绪校验（policy、checkpoint、config、scaler 齐全且阈值/策略字段合法，`input_height == 6`）|
 | `active_auth_sessions` | 当前内存中的活跃认证会话 |
 
 ### 2.5 获取 raw session 文件列表
@@ -465,11 +465,15 @@ curl -H "X-Management-API-Key: ${API_KEY}" \
 | 字段 | 说明 |
 | --- | --- |
 | `window_id` | 认证窗口 ID |
-| `score` | 原始模型分数或决策分数 |
-| `threshold` | 判定阈值 |
+| `result_stage` | 结果阶段，当前恒为 `"primary"` |
+| `score` | 决策分数（兼容字段）|
+| `threshold` | 判定阈值（兼容字段）|
 | `accept` | 是否接受 |
 | `interrupt` | 是否触发打断 |
-| `normalized_score` | 归一化分数 |
+| `normalized_score` | 归一化分数（兼容字段）|
+| `raw_score` / `raw_threshold` | 原始分数尺度 |
+| `ema_score` / `ema_threshold` | EMA 尺度 |
+| `display_score` / `display_threshold` | 0~1 可视化尺度 |
 | `k_rejects` | 连拒阈值 |
 | `vote_recent_windows` | 最近投票窗口数量 |
 | `vote_recent_rejects` | 最近投票拒绝数量 |
@@ -478,6 +482,11 @@ curl -H "X-Management-API-Key: ${API_KEY}" \
 | `server_written_timestamp` | 结果写入时间 |
 | `device_id_hash` | 管理 API 补充的设备 ID |
 | `session_id` | 管理 API 补充的 session ID |
+
+分组与兼容映射说明：
+
+- 响应默认按 `result_stage` 分组返回 `by_stage` 字段（当前只有 `"primary"` 一个分组）；顶层 `results` 列表保留为兼容字段。
+- 读取历史 `results.jsonl` 时，会把记录中的 `decision_score` / `decision_threshold` / `decision_accept` 归一映射到 `score` / `threshold` / `accept`。
 
 ### 2.10 获取全局最近认证结果
 
@@ -497,6 +506,8 @@ GET /api/v1/management/auth/results/latest
 curl -H "X-Management-API-Key: ${API_KEY}" \
   "${BASE_URL}/api/v1/management/auth/results/latest?limit=100"
 ```
+
+结果字段与 `2.9 获取单设备认证结果` 一致：默认按 `result_stage` 分组返回 `by_stage` 字段（当前只有 `"primary"`），每条结果带 `raw_*` / `ema_*` / `display_*` 拆分字段，`score` / `threshold` / `normalized_score` 保留为兼容字段。
 
 ### 2.11 获取客户端上报指标
 
@@ -715,8 +726,14 @@ rpc StartAuthentication(AuthSessionRequest) returns (AuthSessionResponse)
 | --- | --- |
 | `data_insufficient: <current>MB/<required>MB` | 数据不足，不能训练/认证 |
 | `training_in_progress` | 数据已足够，服务端已触发或正在训练 |
-| `model_not_ready: ...` | policy/checkpoint/config 缺失或不可用 |
+| `model_not_ready: ...` | 模型未通过 `check_trained_model` 校验（policy/checkpoint/config/scaler 缺失或不可用、阈值异常、策略字段缺失、`input_height != 6` 等）|
 | `invalid_identifier: ...` | 设备 ID 或 session ID 不符合路径安全规则 |
+
+模型就绪判定说明：
+
+- `StartAuthentication` 通过 `check_trained_model` 取得 `(是否就绪, 原因)`。校验内容包括 `best_lock_policy.json` / `vqgan_checkpoint` / `vqgan_config` / `processed_data/z-score/<user>/scaler.json` 是否齐全可解析、VQGAN 配置 `input_height == 6`、阈值为有限值（拒绝 `inf`/`nan`/`sys.float_info.max` 及 `|阈值| >= 1e6`）、策略含 `threshold_strategy`/`decision_strategy`/`score_metric`/`score_scale` 四字段、阈值落在训练/验证集 genuine 分数分位范围附近（带 margin）；会话启动时把校验详情写入 `inference/<device>/<session>/model_validation.json`。
+- 认证启动默认只接受正式策略（`policy_status="ready"` 且 `policy_search_completed=true`）；当 `auth.allow_training_fallback_policy=true`（默认 `false`）时，缺少正式策略才允许回退到 `training_fallback_policy.json` 降级运行。
+- 当某设备没有可用模型（从未训练 / 训练中断 / 已完成但校验不通过）时，`StartAuthentication` 会以 `force=True` 触发（重）训练，绕过节流与“持久化 `in_progress` 但无存活任务”的死锁判定。
 
 ### 4.3 StreamSensorData
 
@@ -782,16 +799,27 @@ payload 解密解压后应为 `SerializedSensorBatch` protobuf：
 | `device_id_hash` | 设备哈希 ID |
 | `session_id` | 认证 session ID |
 | `server_timestamp_ms` | 服务端结果时间 |
-| `score` | 决策分数 |
-| `threshold` | 决策阈值 |
+| `score` | 决策分数（兼容字段，等于 `display_score`）|
+| `threshold` | 决策阈值（兼容字段，等于 `display_threshold`）|
 | `accept` | 是否接受当前窗口/投票结果 |
 | `interrupt` | 是否触发打断 |
 | `window_size_sec` | 窗口秒数 |
 | `window_id` | 窗口 ID |
-| `normalized_score` | 归一化分数 |
+| `normalized_score` | 归一化分数（兼容字段）|
 | `k_rejects` | K 连拒阈值 |
 | `model_version` | 模型版本 |
 | `message` | 投票状态说明 |
+
+返回 payload 与管理接口还会附带按尺度拆分的字段，避免不同量纲被混读：
+
+| 字段 | 说明 |
+| --- | --- |
+| `result_stage` | 结果阶段，当前恒为 `"primary"` |
+| `raw_score` / `raw_threshold` | 原始分数尺度 |
+| `ema_score` / `ema_threshold` | EMA 尺度 |
+| `display_score` / `display_threshold` | 0~1 可视化尺度 |
+
+`score` / `threshold` / `normalized_score` 保留为兼容字段。
 
 ### 4.4 SendHeartbeat
 

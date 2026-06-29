@@ -18,6 +18,18 @@ from ..utils.runtime import app_root
 logger = logging.getLogger(__name__)
 
 
+class TrainingCommandError(RuntimeError):
+    """Raised when the CA-train subprocess exits with a non-zero status."""
+
+
+class PolicySearchIncompleteError(RuntimeError):
+    """Raised when a window sweep finished but produced no auth-accepted policy.
+
+    Treated as a (retriable) training failure so the user can be re-trained
+    instead of being stuck behind a fallback-only / empty policy.
+    """
+
+
 @dataclass(frozen=True)
 class TrainingRunResult:
     window_size: float
@@ -50,6 +62,10 @@ def _pick_workers() -> Tuple[int, int]:
     return max(0, int(num_workers)), max(1, int(cpu_threads))
 
 
+# 当前模型输入高度（传感器轴数）：6 = 加速度计(x,y,z) + 陀螺仪(x,y,z)，已移除磁力计。
+VQGAN_INPUT_HEIGHT = 6
+
+
 def _vqgan_config(target_width: int, *, base_channels: int, latent_dim: int, codebook_vectors: int, beta: float) -> Dict:
     return {
         "base_channels": int(base_channels),
@@ -57,7 +73,7 @@ def _vqgan_config(target_width: int, *, base_channels: int, latent_dim: int, cod
         "num_codebook_vectors": int(codebook_vectors),
         "beta": float(beta),
         "image_channels": 1,
-        "input_height": 9,
+        "input_height": int(VQGAN_INPUT_HEIGHT),
         "input_width": int(target_width),
         "use_nonlocal": True,
     }
@@ -69,20 +85,68 @@ def _write_vqgan_config(cfg: Dict, checkpoint: Path) -> Path:
     return config_path
 
 
-def _extract_last_training_error(log_dir: Path) -> Optional[str]:
-    log_path = log_dir / "hmog_vqgan.log"
+_TRAINING_ERROR_PATTERNS = (
+    "[ERROR]",
+    "Traceback",
+    "ValueError:",
+    "RuntimeError:",
+    "FileNotFoundError:",
+    "ModuleNotFoundError:",
+    "ImportError:",
+    "error:",
+    "unrecognized arguments",
+    "usage:",
+)
+
+
+def _extract_last_error_line(log_path: Path) -> Optional[str]:
     if not log_path.exists():
         return None
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception:
         return None
-    patterns = ("[ERROR]", "Traceback", "ValueError:", "RuntimeError:")
     for raw in reversed(lines):
         line = raw.strip()
-        if line and any(p in line for p in patterns):
+        if line and any(p in line for p in _TRAINING_ERROR_PATTERNS):
             return line
     return None
+
+
+def _extract_last_training_error(log_dir: Path) -> Optional[str]:
+    for name in ("hmog_vqgan.log", "hmog_vqgan_subprocess.log"):
+        line = _extract_last_error_line(log_dir / name)
+        if line:
+            return line
+    return None
+
+
+def _run_training_command(cmd: Sequence[str], *, log_dir: Path) -> None:
+    """Run the CA-train subprocess, tee combined output to a log file, and raise
+    :class:`TrainingCommandError` (with exit code + last error line) on failure."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    subprocess_log = log_dir / "hmog_vqgan_subprocess.log"
+    try:
+        completed = subprocess.run(
+            list(cmd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception as exc:  # pragma: no cover - launch failure is environment specific
+        raise TrainingCommandError(f"Failed to launch CA-train subprocess: {exc}") from exc
+    try:
+        subprocess_log.write_text(completed.stdout or "", encoding="utf-8")
+    except Exception:
+        pass
+    if completed.returncode != 0:
+        last_line = _extract_last_training_error(log_dir)
+        detail = f" last_error={last_line}" if last_line else ""
+        raise TrainingCommandError(
+            f"CA-train subprocess failed with exit code {completed.returncode}.{detail}"
+        )
 
 
 def _read_best_window(log_dir: Path, user_id: str) -> Dict:
@@ -142,7 +206,9 @@ def _write_vqgan_policy(
     vqgan_checkpoint: Path,
     vqgan_config: Path,
 ) -> Path:
-    policy_path = user_output_dir / "best_lock_policy.json"
+    # 训练阶段仅写“训练兜底策略”，不直接产出正式 best_lock_policy.json；
+    # 正式策略由 policy_search 成功后原子写入。
+    policy_path = user_output_dir / "training_fallback_policy.json"
     policy = {
         "user": str(user_id),
         "window": float(window_size),
@@ -156,12 +222,37 @@ def _write_vqgan_policy(
         "vote_min_rejects": 0,
         "ema_alpha": float(get_ca_config().auth.ema_alpha),
         "auth_method": "vqgan-only",
+        "policy_search_completed": False,
+        "policy_status": "training_fallback",
+        "score_metric": "mse",
+        "score_scale": "negative_reconstruction_error",
+        "threshold_strategy": "training_val_genuine_threshold",
         "vqgan_checkpoint": serialize_policy_path(vqgan_checkpoint, relative_to=policy_path.parent),
         "vqgan_config": serialize_policy_path(vqgan_config, relative_to=policy_path.parent),
         "model_version": vqgan_checkpoint.name,
     }
     policy_path.write_text(json.dumps({str(user_id): policy}, indent=2, ensure_ascii=False), encoding="utf-8")
     return policy_path
+
+
+def _has_accepted_best_policy(user_id: str, models_root: Path) -> bool:
+    """Return True iff a ready, policy_search-produced best_lock_policy.json exists.
+
+    "Accepted" means the authoritative best policy (policy_source=="best") that is
+    marked policy_status=="ready" and policy_search_completed==True. A training
+    fallback policy alone does NOT count.
+    """
+    try:
+        from ..authentication.runner import load_best_policy
+
+        cfg = load_best_policy(user_id, models_root=models_root, allow_training_fallback=False)
+    except Exception:
+        return False
+    return (
+        str(getattr(cfg, "policy_source", "")) == "best"
+        and str(getattr(cfg, "policy_status", "")) == "ready"
+        and bool(getattr(cfg, "policy_search_completed", False))
+    )
 
 
 def run_window_sweep_for_user(
@@ -219,6 +310,24 @@ def run_window_sweep_for_user(
         if reuse_checkpoints and best_summary_path.exists():
             try:
                 summary = _read_best_window(log_dir, user_id)
+                # 防止复用旧通道数（如历史 9 轴）的检查点：若缓存检查点的 input_height
+                # 与当前模型 (VQGAN_INPUT_HEIGHT) 不一致或缺失，则放弃复用、从头重训。
+                cached_ckpt = Path(str((summary or {}).get("checkpoint") or ""))
+                cached_cfg = cached_ckpt.with_suffix(".json")
+                cached_height: Optional[int] = None
+                if cached_cfg.exists():
+                    try:
+                        cached_height = int(
+                            json.loads(cached_cfg.read_text(encoding="utf-8")).get("input_height", -1)
+                        )
+                    except Exception:
+                        cached_height = None
+                if cached_height != int(VQGAN_INPUT_HEIGHT):
+                    summary = None
+                    reuse_error = (
+                        f"cached checkpoint input_height={cached_height} != {VQGAN_INPUT_HEIGHT}; "
+                        "retraining from scratch"
+                    )
             except Exception as exc:
                 reuse_error = str(exc)
 
@@ -234,8 +343,7 @@ def run_window_sweep_for_user(
                 *ca_train_command("hmog_vqgan_experiment.py", override=ca_train_override),
                 "--dataset-path",
                 str(dataset_path),
-                "--users",
-                str(user_id),
+                f"--users={user_id}",
                 "--window-sizes",
                 f"{ws_f:.1f}",
                 "--overlap",
@@ -272,7 +380,7 @@ def run_window_sweep_for_user(
             if max_eval_per_split is not None:
                 cmd.extend(["--max-eval-per-split", str(int(max_eval_per_split))])
 
-            subprocess.run(cmd, check=True)
+            _run_training_command(cmd, log_dir=log_dir)
             summary = _read_best_window(log_dir, user_id)
 
         if not isinstance(summary, dict):
@@ -326,6 +434,7 @@ def run_window_sweep_for_user(
         )
 
     if bool(getattr(training_cfg, "run_policy_search", True)) and results:
+        policy_search_error: Optional[str] = None
         try:
             from ..policy_search.runner import run_policy_grid_search
 
@@ -340,6 +449,18 @@ def run_window_sweep_for_user(
             )
             logger.info("Policy search completed for user=%s", user_id)
         except Exception as exc:
-            logger.warning("Policy search failed for user=%s; keeping training fallback policy: %s", user_id, exc)
+            policy_search_error = str(exc)
+            logger.warning("Policy search failed for user=%s: %s", user_id, exc)
+
+        # 模型不可用时不能假装训练成功：若未产出认证可接受的正式策略，
+        # 且未显式开启降级开关，则抛出可重试错误（由训练管理器标记为 failed）。
+        allow_fb = bool(getattr(ca_cfg.auth, "allow_training_fallback_policy", False))
+        if not allow_fb and not _has_accepted_best_policy(str(user_id), models_root):
+            raise PolicySearchIncompleteError(
+                "Training finished but produced no auth-accepted best policy for "
+                f"user={user_id} (only training_fallback_policy.json is available; set "
+                "auth.allow_training_fallback_policy=true to accept it). "
+                f"policy_search_error={policy_search_error or 'no best_lock_policy.json written'}"
+            )
 
     return results

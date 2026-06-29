@@ -101,6 +101,13 @@ target_window_frr = 0.05
 # 上线链路当前执行 VQGAN-only 分数，因此 policy_search 默认也使用 VQGAN-only，避免离线/线上策略不一致。
 policy_search_auth_method = "vqgan-only"
 
+# 策略降级开关（默认 false）：
+# - false：认证启动仅接受 policy_search 产出的正式策略（best_lock_policy.json 且
+#   policy_status=ready、policy_search_completed=true）；训练阶段写出的
+#   training_fallback_policy.json 不会被用于上线。
+# - true：当正式策略缺失/未就绪时，允许回退使用 training_fallback_policy.json（降级运行）。
+allow_training_fallback_policy = false
+
 [training]
 # 模型最大训练轮数。实际训练会受 early_stop_patience 控制提前停止。
 max_epochs = 50

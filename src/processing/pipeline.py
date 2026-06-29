@@ -36,9 +36,6 @@ FEATURE_COLUMNS = [
     "gyr_x",
     "gyr_y",
     "gyr_z",
-    "mag_x",
-    "mag_y",
-    "mag_z",
 ]
 
 
@@ -349,7 +346,7 @@ def _resample_records(records: Dict[str, List[Dict]], session_label: str, user_i
     )
 
     combined = pd.DataFrame(index=base_index)
-    for sensor in ("acc", "gyr", "mag"):
+    for sensor in ("acc", "gyr"):
         data = records.get(sensor, [])
         if not data:
             logger.warning("Missing %s data in session %s (user %s)", sensor, session_label, user_id)
@@ -375,7 +372,7 @@ def _resample_records(records: Dict[str, List[Dict]], session_label: str, user_i
     combined.insert(1, "session", session_label)
     combined = combined[
         ["subject", "session", "timestamp"]
-        + [f"{prefix}_{axis}" for prefix in ("acc", "gyr", "mag") for axis in ("x", "y", "z")]
+        + [f"{prefix}_{axis}" for prefix in ("acc", "gyr") for axis in ("x", "y", "z")]
     ]
     return combined
 

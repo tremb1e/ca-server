@@ -4,24 +4,31 @@ import argparse
 import logging
 from pathlib import Path
 
+from ..utils.cli_args import normalize_option_value_args
 from .runner import load_best_policy, run_auth_inference
 
 logger = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = normalize_option_value_args(argv, options={"--user"})
     parser = argparse.ArgumentParser(description="Run Continuous Authentication inference from a window CSV")
     parser.add_argument("--user", required=True, help="Target device_id_hash.")
     parser.add_argument(
         "--policy-json",
         default=None,
-        help="Optional policy json path; defaults to data_storage/models/<device_id_hash>/best_lock_policy.json.",
+        help=(
+            "Optional policy json path; defaults to the authoritative "
+            "data_storage/models/<device_id_hash>/best_lock_policy.json. Authentication "
+            "falls back to training_fallback_policy.json only when the degrade switch "
+            "(auth.allow_training_fallback_policy) is enabled."
+        ),
     )
     parser.add_argument("--csv-path", required=True, help="Input window CSV path (server processed_data/window/*/*/*.csv).")
     parser.add_argument("--device", default="auto", help="Inference device, e.g. auto / npu:0 / cuda:0 / cpu.")
     parser.add_argument("--output-csv", default=None, help="Optional output CSV path; defaults under data_storage/models/<device_id_hash>/inference/.")
     parser.add_argument("--max-windows", type=int, default=None, help="Debug: stop after N windows (avoid scanning huge CSVs).")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:

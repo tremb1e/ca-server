@@ -111,6 +111,8 @@ class AuthSessionsResponse(FlexibleModel):
 class AuthResultsResponse(FlexibleModel):
     results: List[Dict[str, Any]]
     total: int
+    # 管理结果默认按 result_stage 分组（当前仅 "primary"）；旧字段 results 保留为兼容字段。
+    by_stage: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
 
 class ClientMetricsResponse(FlexibleModel):

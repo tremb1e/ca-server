@@ -13,9 +13,6 @@ FEATURE_COLUMNS = [
     "gyr_x",
     "gyr_y",
     "gyr_z",
-    "mag_x",
-    "mag_y",
-    "mag_z",
 ]
 
 

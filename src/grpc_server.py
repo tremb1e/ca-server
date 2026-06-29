@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import uuid
+import warnings
 from typing import Optional, Tuple
 
 import grpc
@@ -54,6 +55,61 @@ def _message_to_dict(message, include_defaults: bool = False) -> dict:
         kwargs.pop("including_default_value_fields", None)
         kwargs.pop("always_print_fields_with_no_presence", None)
         return json_format.MessageToDict(message, **kwargs)
+
+
+def _metrics_report_to_dict(report) -> dict:
+    """Convert a MetricsReport proto to a dict with NUMERIC (not string) values.
+
+    json_format.MessageToDict serializes int64 fields as JSON strings; the
+    management API needs real numeric types. We read each field directly off the
+    message via its descriptor and coerce by CPP type so the surfaced metrics keep
+    their numeric kind across protobuf versions.
+    """
+    from google.protobuf.descriptor import FieldDescriptor
+
+    try:
+        fields = report.DESCRIPTOR.fields
+    except Exception:
+        return _message_to_dict(report, include_defaults=True)
+
+    int_types = {
+        FieldDescriptor.CPPTYPE_INT32,
+        FieldDescriptor.CPPTYPE_INT64,
+        FieldDescriptor.CPPTYPE_UINT32,
+        FieldDescriptor.CPPTYPE_UINT64,
+    }
+    float_types = {FieldDescriptor.CPPTYPE_FLOAT, FieldDescriptor.CPPTYPE_DOUBLE}
+
+    def _is_repeated(f) -> bool:
+        checker = getattr(f, "is_repeated", None)
+        if callable(checker):
+            return bool(checker())
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            return f.label == FieldDescriptor.LABEL_REPEATED
+
+    out: dict = {}
+    for field in fields:
+        name = field.name
+        try:
+            value = getattr(report, name)
+        except Exception:
+            continue
+        if _is_repeated(field):
+            out[name] = list(value)
+        elif field.cpp_type in int_types:
+            out[name] = int(value)
+        elif field.cpp_type in float_types:
+            out[name] = float(value)
+        elif field.cpp_type == FieldDescriptor.CPPTYPE_BOOL:
+            out[name] = bool(value)
+        elif field.cpp_type == FieldDescriptor.CPPTYPE_STRING:
+            out[name] = str(value)
+        elif field.cpp_type == FieldDescriptor.CPPTYPE_MESSAGE:
+            out[name] = _message_to_dict(value, include_defaults=True)
+        else:
+            out[name] = value
+    return out
 
 
 class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
@@ -137,7 +193,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         )
 
     async def StartAuthentication(self, request, context):
-        device_id_hash = getattr(request, "device_id_hash", "") or "unknown_device"
+        device_id_hash = getattr(request, "device_id_hash", "")
         session_id = getattr(request, "session_id", "") or f"auth_{uuid.uuid4().hex}"
         try:
             device_id_hash = validate_storage_id(device_id_hash, field_name="device_id_hash")
@@ -153,7 +209,8 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
                 decision_time_sec=0.0,
             )
         ca_cfg = get_ca_config()
-        if self.auth_manager.has_trained_model(device_id_hash):
+        model_ready, model_error = self.auth_manager.check_trained_model(device_id_hash)
+        if model_ready:
             accepted, message, policy = self.auth_manager.start_session(device_id_hash, session_id)
             logger.info(
                 "Auth session start: device=%s session=%s accepted=%s message=%s model=%s",
@@ -177,8 +234,16 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         total_mb = readiness.total_bytes / (1024 * 1024)
         min_mb = min_bytes / (1024 * 1024)
         if readiness.total_bytes >= min_bytes:
+            # 数据足够但模型不可用（从未训练 / 被中断 / 已完成但校验不通过）→ 强制(重)训练。
+            # force=True 确保持久化的 completed/in_progress 状态不会阻塞重训（修复死锁）。
             await self.training_manager.submit_if_ready(device_id_hash, force=True)
             reason = "training_in_progress"
+            if str(readiness.status) == "completed":
+                logger.warning(
+                    "Completed model failed validation; forcing retrain: device=%s detail=%s",
+                    device_id_hash,
+                    model_error or "trained artifacts incomplete",
+                )
         else:
             reason = f"data_insufficient: {total_mb:.1f}MB/{min_mb:.0f}MB"
 
@@ -208,7 +273,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         )
 
     async def ReportMetrics(self, request, context):
-        metric_payload = _message_to_dict(request, include_defaults=True)
+        metric_payload = _metrics_report_to_dict(request)
         self.metrics.record_client_metrics(metric_payload)
         logger.info(
             "Metrics received: device=%s, period_ms=%s, uploads_success=%s, uploads_failed=%s",
@@ -252,7 +317,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
         response_queue: asyncio.Queue,
         pending_inference: set[asyncio.Task],
     ) -> sensor_data_pb2.ServerDirective:
-        device_id_hash = packet.device_id_hash or "unknown_device"
+        device_id_hash = packet.device_id_hash
         session_id = "default"
         metadata_dict = None
         decryption_status = "skipped"
@@ -303,12 +368,12 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
                         for sample in parsed_batch.get("samples", []):
                             for axis in ("x", "y", "z"):
                                 sample.setdefault(axis, 0.0)
-                        session_id = batch.session_id or session_id
                         try:
-                            session_id = validate_storage_id(session_id, field_name="session_id")
+                            session_id = validate_storage_id(batch.session_id, field_name="session_id")
                             decryption_status = "parsed_sensor_batch"
                         except UnsafePathSegmentError as exc:
                             parsed_batch = None
+                            session_id = "default"
                             decryption_status = "invalid_identifier"
                             error_detail = str(exc)
                             logger.warning("Invalid session id for packet %s: %s", packet.packet_id, exc)

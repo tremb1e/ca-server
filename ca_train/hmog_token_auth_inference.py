@@ -42,9 +42,9 @@ def load_vqgan(vqgan_ckpt: Path, *, device: torch.device, cfg_path: Optional[Pat
     if not cfg_path.exists():
         raise FileNotFoundError(f"Missing VQGAN config json: {cfg_path}")
     cfg = _load_json(cfg_path)
-    input_height = int(cfg.get("input_height", 9))
-    if input_height != 9:
-        raise ValueError(f"VQGAN config {cfg_path} has input_height={input_height}; 9-axis input is required.")
+    input_height = int(cfg.get("input_height", 6))
+    if input_height != 6:
+        raise ValueError(f"VQGAN config {cfg_path} has input_height={input_height}; 6-axis input is required.")
     args = argparse.Namespace(**cfg)
     # The VQGAN module expects these attribute names.
     args.use_nonlocal = bool(cfg.get("use_nonlocal", True))

@@ -73,8 +73,8 @@ decision_strategy = "ema"
 # 最近连续 N 个窗口中，若 reject>=M，则判定为恶意用户并触发打断（如锁屏等）。
 #
 # 当前策略：连续 7 个窗口内，若至少 6 个窗口为恶意，则判定为恶意并触发打断。
-vote_window_size = 7
-vote_min_rejects = 6
+vote_window_size = 30
+vote_min_rejects = 20
 
 # EMA 默认值和 policy_search 候选值。最终每个用户会在验证集上搜索并写入 models/<user>/best_lock_policy.json。
 ema_alpha = 0.25
@@ -93,13 +93,20 @@ k_rejects_mode = "by_window"
 # 本轮需求：在尽可能少打断正常用户的前提下提升恶意用户检测率，
 # 因此把窗口级误打断率（FRR）上限收紧到 0.05。
 # 注意：这里的 FRR 以“窗口”为粒度统计，并会排除每个 session 末尾 (N-1) 个窗口（无法组成完整 N 窗投票窗口）。
-target_window_frr = 0.05
+target_window_frr = 0.10
 
 # 限制真实用户会话在 max_decision_time_sec 内被误打断的概率；不填时沿用 target_window_frr。
 # max_genuine_first_interrupt_p = 0.005
 
 # 上线链路当前执行 VQGAN-only 分数，因此 policy_search 默认也使用 VQGAN-only，避免离线/线上策略不一致。
 policy_search_auth_method = "vqgan-only"
+
+# 策略降级开关（默认 false）：
+# - false：认证启动仅接受 policy_search 产出的正式策略（best_lock_policy.json 且
+#   policy_status=ready、policy_search_completed=true）；训练阶段写出的
+#   training_fallback_policy.json 不会被用于上线。
+# - true：当正式策略缺失/未就绪时，允许回退使用 training_fallback_policy.json（降级运行）。
+allow_training_fallback_policy = false
 
 [training]
 # 模型最大训练轮数。实际训练会受 early_stop_patience 控制提前停止。

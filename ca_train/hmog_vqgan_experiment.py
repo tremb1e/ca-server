@@ -389,7 +389,7 @@ def train_single_window(
         args.input_height = int(train_x.shape[2])
         args.input_width = int(train_x.shape[3])
     else:
-        args.input_height = 9
+        args.input_height = 6
         args.input_width = int(args.target_width) if args.target_width > 0 else int(round(window_size * 100))
 
     # VQGAN blocks read `use_nonlocal`; CLI exposes `--no-nonlocal` for convenience.
@@ -413,6 +413,7 @@ def train_single_window(
     best_state: Optional[Dict[str, torch.Tensor]] = None
     no_improve = 0
     trained_epochs = 0
+    nonfinite_loss_detail: Optional[str] = None
 
     for epoch in range(epochs):
         model.train()
@@ -421,6 +422,7 @@ def train_single_window(
         rec_sum = 0.0
         q_sum = 0.0
         batch_count = 0
+        abort_epoch = False
         for batch, _ in pbar:
             optimizer.zero_grad(set_to_none=True)
             loss, rec_loss, q_loss = reconstruction_step(
@@ -432,6 +434,17 @@ def train_single_window(
                 input_noise_std=args.input_noise_std,
                 rec_loss_metric=args.train_rec_loss,
             )
+            if not bool(torch.isfinite(loss.detach()).all().item()):
+                abort_epoch = True
+                nonfinite_loss_detail = (
+                    f"user={user_id} ws={window_size:.1f} epoch={epoch + 1}/{epochs} "
+                    f"batch={batch_count + 1} loss={float(loss.detach().cpu().item())}"
+                )
+                logging.error(
+                    "[TRAIN] non-finite loss detected; stop current epoch and restore best checkpoint if available. %s",
+                    nonfinite_loss_detail,
+                )
+                break
             scaler.scale(loss).backward()
             if args.grad_clip_norm and args.grad_clip_norm > 0:
                 scaler.unscale_(optimizer)
@@ -447,6 +460,18 @@ def train_single_window(
                 rec=f"{rec_loss.item():.4f}",
                 q=f"{q_loss.item():.4f}",
             )
+        if abort_epoch:
+            if best_state is None:
+                raise RuntimeError(
+                    "Training produced non-finite loss before any valid best checkpoint was available: "
+                    f"{nonfinite_loss_detail}"
+                )
+            logging.warning(
+                "[TRAIN] aborting remaining epochs after non-finite loss; restoring best_epoch=%d best_auc=%.6f",
+                best_epoch,
+                best_auc,
+            )
+            break
         trained_epochs = int(epoch + 1)
 
         train_payload = {

@@ -772,9 +772,9 @@ def run_single_window(
             seed=args.seed,
             max_train_windows=args.max_train_per_user,
         )
-        val_x = np.empty((0, 1, 9, target_width), dtype=np.float32)
+        val_x = np.empty((0, 1, 6, target_width), dtype=np.float32)
         val_y = np.empty((0,), dtype=np.int64)
-        test_x = np.empty((0, 1, 9, target_width), dtype=np.float32)
+        test_x = np.empty((0, 1, 6, target_width), dtype=np.float32)
         test_y = np.empty((0,), dtype=np.int64)
     else:
         train_x, train_y, val_x, val_y, test_x, test_y = prepare_user_datasets(
@@ -831,7 +831,7 @@ def run_single_window(
         train_x = train_x[idx]
         train_y = train_y[idx]
 
-    args.input_height = int(train_x.shape[2]) if train_x.size else 9
+    args.input_height = int(train_x.shape[2]) if train_x.size else 6
     args.input_width = int(train_x.shape[3]) if train_x.size else int(target_width)
     args.use_nonlocal = not getattr(args, "no_nonlocal", False)
 

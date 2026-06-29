@@ -17,14 +17,14 @@ from torch.utils.data import Dataset
 #   /data/code/server/data_storage/processed_data/window/<t>/<user>/{train,val,test}.csv
 #
 # CSV columns (per-row, per-window):
-#   subject, session, timestamp, acc_x..mag_z, window_id
+#   subject, session, timestamp, acc_x..gyr_z, window_id
 #
 # Each window is stored as `window_points` consecutive rows where:
 #   window_points = round(window_size_sec * 100Hz)
 # and windows do NOT cross sessions.
 #
-# For VQGAN we build samples shaped as (1, 9, T):
-#   9 raw axes (acc/gyr/mag x/y/z). Magnitude rows are intentionally omitted.
+# For VQGAN we build samples shaped as (1, 6, T):
+#   6 raw axes (acc/gyr x/y/z). Magnetometer rows are intentionally dropped.
 # =============================================================================
 
 logger = logging.getLogger(__name__)
@@ -40,9 +40,6 @@ AXIS_COLUMNS = (
     "gyr_x",
     "gyr_y",
     "gyr_z",
-    "mag_x",
-    "mag_y",
-    "mag_z",
 )
 
 SENSOR_ORDER = AXIS_COLUMNS
@@ -146,7 +143,7 @@ def _iter_windows_from_csv(
     keep_all_subjects: bool,
 ) -> Iterator[Tuple[np.ndarray, int]]:
     """
-    Yield (window, label) where window is float32 shaped (1, 9, target_width).
+    Yield (window, label) where window is float32 shaped (1, 6, target_width).
 
     Window boundaries are determined by `window_id` (produced by the server pipeline).
     We also validate that all rows in a window share the same `subject` to avoid
@@ -175,9 +172,6 @@ def _iter_windows_from_csv(
             idx_gyr_x = lookup["gyr_x"]
             idx_gyr_y = lookup["gyr_y"]
             idx_gyr_z = lookup["gyr_z"]
-            idx_mag_x = lookup["mag_x"]
-            idx_mag_y = lookup["mag_y"]
-            idx_mag_z = lookup["mag_z"]
         except KeyError as exc:
             raise ValueError(f"Unexpected CSV header for {csv_path}: {header}") from exc
 
@@ -185,7 +179,7 @@ def _iter_windows_from_csv(
         current_subject: Optional[str] = None
         skip_window = False
         filled = 0
-        window_raw = np.empty((9, window_points), dtype=np.float32)
+        window_raw = np.empty((6, window_points), dtype=np.float32)
 
         def _flush_current() -> Optional[Tuple[np.ndarray, int]]:
             nonlocal filled
@@ -249,9 +243,6 @@ def _iter_windows_from_csv(
             gyr_x = float(row[idx_gyr_x])
             gyr_y = float(row[idx_gyr_y])
             gyr_z = float(row[idx_gyr_z])
-            mag_x = float(row[idx_mag_x])
-            mag_y = float(row[idx_mag_y])
-            mag_z = float(row[idx_mag_z])
 
             window_raw[0, filled] = acc_x
             window_raw[1, filled] = acc_y
@@ -259,9 +250,6 @@ def _iter_windows_from_csv(
             window_raw[3, filled] = gyr_x
             window_raw[4, filled] = gyr_y
             window_raw[5, filled] = gyr_z
-            window_raw[6, filled] = mag_x
-            window_raw[7, filled] = mag_y
-            window_raw[8, filled] = mag_z
             filled += 1
 
 
@@ -275,7 +263,7 @@ def iter_windows_from_csv_unlabeled(
     Iterate windows from a server-formatted CSV without assigning labels.
 
     Yields: (window_id, subject, window) where:
-      - window is float32 shaped (1, 9, target_width)
+      - window is float32 shaped (1, 6, target_width)
 
     Notes:
       - Window boundaries are determined by `window_id`.
@@ -303,9 +291,6 @@ def iter_windows_from_csv_unlabeled(
             idx_gyr_x = lookup["gyr_x"]
             idx_gyr_y = lookup["gyr_y"]
             idx_gyr_z = lookup["gyr_z"]
-            idx_mag_x = lookup["mag_x"]
-            idx_mag_y = lookup["mag_y"]
-            idx_mag_z = lookup["mag_z"]
         except KeyError as exc:
             raise ValueError(f"Unexpected CSV header for {csv_path}: {header}") from exc
 
@@ -313,7 +298,7 @@ def iter_windows_from_csv_unlabeled(
         current_subject: Optional[str] = None
         skip_window = False
         filled = 0
-        window_raw = np.empty((9, window_points), dtype=np.float32)
+        window_raw = np.empty((6, window_points), dtype=np.float32)
 
         def _flush_current() -> Optional[Tuple[str, str, np.ndarray]]:
             nonlocal filled
@@ -374,9 +359,6 @@ def iter_windows_from_csv_unlabeled(
             gyr_x = float(row[idx_gyr_x])
             gyr_y = float(row[idx_gyr_y])
             gyr_z = float(row[idx_gyr_z])
-            mag_x = float(row[idx_mag_x])
-            mag_y = float(row[idx_mag_y])
-            mag_z = float(row[idx_mag_z])
 
             window_raw[0, filled] = acc_x
             window_raw[1, filled] = acc_y
@@ -384,9 +366,6 @@ def iter_windows_from_csv_unlabeled(
             window_raw[3, filled] = gyr_x
             window_raw[4, filled] = gyr_y
             window_raw[5, filled] = gyr_z
-            window_raw[6, filled] = mag_x
-            window_raw[7, filled] = mag_y
-            window_raw[8, filled] = mag_z
             filled += 1
 
 
@@ -489,7 +468,7 @@ def _load_split_windows(
             neg_windows = [neg_windows[i] for i in idx]
 
     if not pos_windows and not neg_windows:
-        empty_x = np.empty((0, 1, 9, target_width), dtype=np.float32)
+        empty_x = np.empty((0, 1, 6, target_width), dtype=np.float32)
         empty_y = np.empty((0,), dtype=np.int64)
         return empty_x, empty_y
 
@@ -515,7 +494,7 @@ def iter_windows_from_csv_unlabeled_with_session(
     Iterate windows from a server-formatted CSV without assigning labels, keeping session metadata.
 
     Yields: (window_id, subject, session, window) where:
-      - window is float32 shaped (1, 9, target_width)
+      - window is float32 shaped (1, 6, target_width)
 
     Notes:
       - Window boundaries are determined by `window_id`.
@@ -544,9 +523,6 @@ def iter_windows_from_csv_unlabeled_with_session(
             idx_gyr_x = lookup["gyr_x"]
             idx_gyr_y = lookup["gyr_y"]
             idx_gyr_z = lookup["gyr_z"]
-            idx_mag_x = lookup["mag_x"]
-            idx_mag_y = lookup["mag_y"]
-            idx_mag_z = lookup["mag_z"]
         except KeyError as exc:
             raise ValueError(f"Unexpected CSV header for {csv_path}: {header}") from exc
 
@@ -555,7 +531,7 @@ def iter_windows_from_csv_unlabeled_with_session(
         current_session: Optional[str] = None
         skip_window = False
         filled = 0
-        window_raw = np.empty((9, window_points), dtype=np.float32)
+        window_raw = np.empty((6, window_points), dtype=np.float32)
 
         def _flush_current() -> Optional[Tuple[str, str, str, np.ndarray]]:
             nonlocal filled
@@ -622,9 +598,6 @@ def iter_windows_from_csv_unlabeled_with_session(
             gyr_x = float(row[idx_gyr_x])
             gyr_y = float(row[idx_gyr_y])
             gyr_z = float(row[idx_gyr_z])
-            mag_x = float(row[idx_mag_x])
-            mag_y = float(row[idx_mag_y])
-            mag_z = float(row[idx_mag_z])
 
             window_raw[0, filled] = acc_x
             window_raw[1, filled] = acc_y
@@ -632,9 +605,6 @@ def iter_windows_from_csv_unlabeled_with_session(
             window_raw[3, filled] = gyr_x
             window_raw[4, filled] = gyr_y
             window_raw[5, filled] = gyr_z
-            window_raw[6, filled] = mag_x
-            window_raw[7, filled] = mag_y
-            window_raw[8, filled] = mag_z
             filled += 1
 
 

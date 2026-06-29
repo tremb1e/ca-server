@@ -157,24 +157,36 @@ class TrainingManager:
     async def submit_if_ready(self, user_id: str, *, force: bool = False) -> None:
         now = time.time()
         last = self._last_checked.get(user_id, 0.0)
-        if (now - last) < self._check_interval_sec:
+        # 强制触发（StartAuthentication / “开始认证”）不受节流限制。
+        if not force and (now - last) < self._check_interval_sec:
             return
         self._last_checked[user_id] = now
 
-        state = load_state(self._models_root, user_id)
-        if state.status == "in_progress":
-            return
-        if user_id in self._tasks and not self._tasks[user_id].done():
+        # 进程内存在未结束的训练任务，才是“正在训练”的权威信号。
+        existing = self._tasks.get(user_id)
+        if existing is not None and not existing.done():
             return
 
         raw_total = _user_total_bytes(self._raw_root, user_id)
         ca_cfg = get_ca_config()
         if raw_total < int(ca_cfg.processing.min_total_mb * 1024 * 1024):
             return
+
+        state = load_state(self._models_root, user_id)
+        # 持久化为 in_progress 但没有存活任务 = 被中断的训练：被动路径等待，
+        # 强制触发负责恢复（修复“模型不可用时训练状态死锁”）。
+        if state.status == "in_progress" and not force:
+            return
         if state.status == "completed" and not force:
             return
 
-        logger.info("Training trigger: user=%s total_bytes=%d", user_id, raw_total)
+        logger.info(
+            "Training trigger: user=%s total_bytes=%d force=%s prev_status=%s",
+            user_id,
+            raw_total,
+            force,
+            state.status,
+        )
         self._tasks[user_id] = asyncio.create_task(self._run_training(user_id, raw_total))
 
     async def _run_training(self, user_id: str, raw_total: int) -> None:

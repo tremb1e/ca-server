@@ -131,11 +131,13 @@ docker compose run --rm ca-server auth --user <device_id_hash> --csv-path /app/d
 
 - 数据触发阈值默认 `300MB`。若记为 `100x`，预处理会按 `train=75x`、`val=12.5x`、`test=12.5x` 动态切分。
 - HMOG 只填充 `val/test`，默认让真实用户与 HMOG 攻击者数据量约为 `1:1`；val 使用排序靠前 HMOG 用户，test 使用排序靠后 HMOG 用户，每侧至少 10 个用户。
-- VQGAN 输入已统一为 `(batch, 1, 9, T)`，不再使用 3 个模长通道；旧 12 轴模型会被就绪检查拒绝，必须重训。
+- VQGAN 输入已改为 `(batch, 1, 6, T)`：6 行 = 加速度计 + 陀螺仪，移除磁力计；模型 config 的 `input_height` 由 9 改为 6。旧 9 轴 / 12 轴模型会被就绪检查拒绝，必须重新生成窗口数据并重训。
 - 训练默认最多 50 epoch，验证集性能连续 3 次不提升早停；训练完成后默认运行 `policy_search`。
-- `policy_search` 会把用户最终阈值、EMA 参数和投票参数写入 `/app/data_storage/models/<user>/best_lock_policy.json`，线上推理直接消费该文件。
+- 训练阶段先写兜底策略 `training_fallback_policy.json`；`policy_search` 成功后“原子写入”正式 `best_lock_policy.json`（标记 `policy_status="ready"`、`policy_search_completed=true`，并落盘 `genuine_score_stats`），线上推理直接消费该文件。
+- 认证启动默认只接受正式策略（`policy_status="ready"` 且 `policy_search_completed=true`）。新增配置开关 `auth.allow_training_fallback_policy`（默认 `false`），置 `true` 时缺少正式策略才允许回退到 `training_fallback_policy.json` 降级运行。
 - 默认认证决策为 `EMA`；原 y-of-x 投票机制仍可通过配置或用户策略选择。
-- 模型就绪检查同时要求 policy、checkpoint、config 和 `processed_data/z-score/<user>/scaler.json` 完整可读。
+- 模型就绪检查 `check_trained_model` 同时要求 policy、checkpoint、config 和 `processed_data/z-score/<user>/scaler.json` 完整可读，并校验阈值有限、策略含必要字段、`input_height == 6`，校验详情写入 `inference/<device>/<session>/model_validation.json`。
+- 认证结果按尺度拆分写出 `raw_*` / `ema_*` / `display_*`，并带 `result_stage="primary"`；`score` / `threshold` / `normalized_score` 保留为兼容字段。
 - 在 Ascend 910B 8 卡机器上，`device=auto` 会优先使用 NPU，训练管理器会把并行用户任务分配到可见 NPU 设备池。
 
 ## 数据字段说明

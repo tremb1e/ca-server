@@ -8,7 +8,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from src.config import settings
-from src.grpc_server import SensorDataService
+from src.grpc_server import SensorDataService, _metrics_report_to_dict
 from src.management.runtime import RuntimeMetrics
 from src.protos import sensor_data_pb2
 
@@ -130,3 +130,168 @@ async def test_stream_packet_uses_device_hash_as_batch_id(tmp_path):
     assert "foreground_app_hash" not in sample
     assert service.storage.records[0]["device_id_hash"] == "device-a"
     assert service.storage.records[0]["session_id"] == "auth-session"
+
+
+class _ReadyTrainingManager:
+    def __init__(self, *, status="pending", total=10_000_000, min_bytes=1_000_000):
+        self.submitted = []
+        self._status = status
+        self._total = total
+        self._min = min_bytes
+
+    def get_readiness(self, device_id_hash):
+        return SimpleNamespace(
+            status=self._status,
+            total_bytes=self._total,
+            min_bytes=self._min,
+            has_enough_data=self._total >= self._min,
+            is_ready=False,
+            last_error="",
+        )
+
+    async def submit_if_ready(self, device_id_hash, *, force=False):
+        self.submitted.append((device_id_hash, force))
+
+
+class _GateAuthManager:
+    def __init__(self, *, ready=False, error="missing policy"):
+        self._ready = ready
+        self._error = error
+
+    def check_trained_model(self, user_id):
+        return self._ready, ("" if self._ready else self._error)
+
+    def start_session(self, user_id, session_id):
+        return True, "ok", SimpleNamespace(model_version="v1", window_size=0.2)
+
+
+def _service_with(tmp_path, training_mgr, auth_mgr) -> SensorDataService:
+    ctx = SimpleNamespace(
+        storage=_Storage(),
+        training_manager=training_mgr,
+        auth_manager=auth_mgr,
+        metrics=RuntimeMetrics(),
+        models_root=tmp_path / "models",
+    )
+    return SensorDataService(ctx)
+
+
+@pytest.mark.asyncio
+async def test_start_authentication_force_retrains_when_completed_model_invalid(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "data_storage_path", tmp_path / "raw")
+    tm = _ReadyTrainingManager(status="completed", total=10_000_000, min_bytes=1_000_000)
+    am = _GateAuthManager(ready=False, error="threshold out of genuine score band")
+    service = _service_with(tmp_path, tm, am)
+
+    resp = await service.StartAuthentication(
+        sensor_data_pb2.AuthSessionRequest(device_id_hash="device-a", session_id="s1"), None
+    )
+    assert resp.accepted is False
+    assert resp.message == "training_in_progress"
+    assert tm.submitted == [("device-a", True)]  # forced retrain, no deadlock
+
+
+@pytest.mark.asyncio
+async def test_start_authentication_triggers_training_when_untrained(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "data_storage_path", tmp_path / "raw")
+    tm = _ReadyTrainingManager(status="pending", total=10_000_000, min_bytes=1_000_000)
+    am = _GateAuthManager(ready=False)
+    service = _service_with(tmp_path, tm, am)
+
+    resp = await service.StartAuthentication(
+        sensor_data_pb2.AuthSessionRequest(device_id_hash="device-a", session_id="s1"), None
+    )
+    assert resp.message == "training_in_progress"
+    assert tm.submitted == [("device-a", True)]
+
+
+@pytest.mark.asyncio
+async def test_start_authentication_reports_data_insufficient(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "data_storage_path", tmp_path / "raw")
+    tm = _ReadyTrainingManager(status="pending", total=10, min_bytes=1_000_000)
+    am = _GateAuthManager(ready=False)
+    service = _service_with(tmp_path, tm, am)
+
+    resp = await service.StartAuthentication(
+        sensor_data_pb2.AuthSessionRequest(device_id_hash="device-a", session_id="s1"), None
+    )
+    assert resp.message.startswith("data_insufficient")
+    assert tm.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_start_authentication_accepts_ready_model(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "data_storage_path", tmp_path / "raw")
+    tm = _ReadyTrainingManager()
+    am = _GateAuthManager(ready=True)
+    service = _service_with(tmp_path, tm, am)
+
+    resp = await service.StartAuthentication(
+        sensor_data_pb2.AuthSessionRequest(device_id_hash="device-a", session_id="s1"), None
+    )
+    assert resp.accepted is True
+    assert resp.message == "ok"
+    assert resp.model_version == "v1"
+    assert tm.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_start_authentication_rejects_empty_device_id(tmp_path):
+    service = _service_with(tmp_path, _ReadyTrainingManager(), _GateAuthManager(ready=True))
+    resp = await service.StartAuthentication(
+        sensor_data_pb2.AuthSessionRequest(device_id_hash="", session_id="s1"), None
+    )
+    assert resp.accepted is False
+    assert resp.message.startswith("invalid_identifier")
+
+
+def test_metrics_report_to_dict_keeps_numeric_types():
+    report = sensor_data_pb2.MetricsReport(
+        device_id_hash="device-a",
+        timestamp_ms=123,
+        reporting_period_ms=1000,
+        uploads_success=5,
+        avg_upload_latency_ms=12.5,
+        upload_success_rate=0.99,
+    )
+    d = _metrics_report_to_dict(report)
+    assert d["device_id_hash"] == "device-a"
+    assert d["timestamp_ms"] == 123 and isinstance(d["timestamp_ms"], int)
+    assert d["uploads_success"] == 5 and isinstance(d["uploads_success"], int)
+    assert isinstance(d["avg_upload_latency_ms"], float) and d["avg_upload_latency_ms"] == 12.5
+    assert d["upload_success_rate"] == pytest.approx(0.99)
+
+
+@pytest.mark.asyncio
+async def test_report_metrics_returns_ok(tmp_path):
+    service = _service(tmp_path)
+    report = sensor_data_pb2.MetricsReport(device_id_hash="device-a", timestamp_ms=456)
+    resp = await service.ReportMetrics(report, None)
+    assert resp.accepted is True
+
+
+@pytest.mark.asyncio
+async def test_stream_packet_resets_unsafe_batch_session_id(tmp_path):
+    service = _service(tmp_path)
+    batch = sensor_data_pb2.SerializedSensorBatch(
+        session_id="../outside",
+        samples=[
+            sensor_data_pb2.SensorSample(
+                type=sensor_data_pb2.ACCELEROMETER, event_timestamp_ns=1, x=1.0, y=2.0, z=3.0, seq_no=1
+            )
+        ],
+    )
+    compressed = lz4.frame.compress(batch.SerializeToString())
+    packet = sensor_data_pb2.DataPacket(
+        packet_id="packet-x",
+        device_id_hash="device-a",
+        packet_seq_no=3,
+        encrypted_sensor_payload=_encrypt(compressed),
+        metadata=sensor_data_pb2.Metadata(compression="lz4", uncompressed_size_bytes=len(batch.SerializeToString())),
+    )
+    directive = await service._handle_packet(packet, response_queue=None, pending_inference=set())
+    assert directive.ack.success is False
+    assert directive.ack.error_code == "INVALID_IDENTIFIER"
+    stored = service.storage.records[0]
+    assert stored["session_id"] == "default"
+    assert stored["packet_data"]["decryption_status"] == "invalid_identifier"

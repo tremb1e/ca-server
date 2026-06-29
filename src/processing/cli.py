@@ -1,15 +1,19 @@
+from __future__ import annotations
+
 import argparse
 import logging
 
+from ..utils.cli_args import normalize_option_value_args
 from .pipeline import build_config, process_all_users, process_user
 
 logger = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = normalize_option_value_args(argv, options={"--user"})
     parser = argparse.ArgumentParser(description="Run dataset processing pipeline")
     parser.add_argument("--user", help="Process a single device_id_hash. When omitted, all devices are processed.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:

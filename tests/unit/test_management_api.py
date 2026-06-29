@@ -48,7 +48,7 @@ def _seed_device(tmp_path, monkeypatch, device_id: str = "device123") -> str:
     ckpt.parent.mkdir(parents=True, exist_ok=True)
     ckpt.write_bytes(b"model-bytes")
     cfg.write_text(
-        json.dumps({"base_channels": 96, "latent_dim": 256, "input_height": 9, "input_width": 20}),
+        json.dumps({"base_channels": 96, "latent_dim": 256, "input_height": 6, "input_width": 20}),
         encoding="utf-8",
     )
     (user_dir / "best_lock_policy.json").write_text(
@@ -180,3 +180,55 @@ def test_runtime_context_uses_configured_models_root(tmp_path, monkeypatch) -> N
 
     assert ctx.models_root == settings.data_storage_path.parent / "models"
     assert ctx.auth_manager._models_root == ctx.models_root
+
+
+def test_management_auth_results_grouped_by_stage(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    device_id = _seed_device(tmp_path, monkeypatch)
+    headers = {"X-Management-API-Key": "secret-token"}
+
+    results = client.get(
+        f"/api/v1/management/devices/{device_id}/auth/results?limit=10", headers=headers
+    ).json()
+    assert "by_stage" in results
+    assert "primary" in results["by_stage"]
+    assert len(results["by_stage"]["primary"]) == results["total"]
+    for row in results["results"]:
+        assert row["result_stage"] == "primary"
+        # API-contract stable fields are always present after normalisation.
+        assert "vote_recent_windows" in row
+        assert "device_id_hash" in row
+
+
+def test_management_latest_auth_results_honors_large_limit(tmp_path, monkeypatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    device_id = "dev-large"
+    rdir = settings.inference_storage_path / device_id / "sess-x"
+    rdir.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for i in range(150):
+        lines.append(
+            json.dumps(
+                {
+                    "window_id": i,
+                    # Only legacy decision_* keys -> must be normalised onto score/threshold/accept.
+                    "decision_score": round(i / 1000, 3),
+                    "decision_threshold": 0.5,
+                    "decision_accept": True,
+                    "server_written_timestamp": f"2026-01-01T00:00:00.{i:04d}+00:00",
+                }
+            )
+        )
+    (rdir / "results.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    headers = {"X-Management-API-Key": "secret-token"}
+    res = client.get("/api/v1/management/auth/results/latest?limit=125", headers=headers).json()
+    assert res["total"] == 125  # >100 cap is gone
+    newest = res["results"][0]
+    assert newest["window_id"] == 149
+    assert newest["score"] == 0.149
+    assert newest["threshold"] == 0.5
+    assert newest["accept"] is True
+    assert newest["device_id_hash"] == device_id
+    assert newest["session_id"] == "sess-x"
+    assert "by_stage" in res and "primary" in res["by_stage"]

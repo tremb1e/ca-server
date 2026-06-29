@@ -5,7 +5,7 @@ from helper import ResidualBlock, NonLocalBlock, DownSampleBlock, UpSampleBlock,
 class Encoder(nn.Module):
     def __init__(self, args):
         super(Encoder, self).__init__()
-        # Sensor windows are treated as a "1×H×T image" (H=9 sensor rows, T=time axis).
+        # Sensor windows are treated as a "1×H×T image" (H=6 sensor rows, T=time axis).
         # Keep more spatial resolution early to avoid collapsing the sensor rows too aggressively.
         base_channels = int(getattr(args, "base_channels", 128))
         channels = [
@@ -17,7 +17,7 @@ class Encoder(nn.Module):
         use_nonlocal = bool(getattr(args, "use_nonlocal", True))
         attn_resolutions = []  # 依赖瓶颈处的 NonLocal 即可
         num_res_blocks = 2
-        resolution = int(getattr(args, "input_height", 9))  # 粗略跟踪特征维度高度
+        resolution = int(getattr(args, "input_height", 6))  # 粗略跟踪特征维度高度
         layers = [nn.Conv2d(args.image_channels, channels[0], 3, 1, 1)]
         downsample_plan = [
             {"stride": (2, 2), "pad": (0, 1, 0, 1)},  # HxT -> ceil(H/2)xceil(T/2)

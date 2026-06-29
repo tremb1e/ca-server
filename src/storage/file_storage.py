@@ -97,6 +97,7 @@ class FileStorage:
                 "base_path": str(self.base_path),
                 "total_devices": total_devices,
                 "total_sessions": total_sessions,
+                "total_size_bytes": total_size_bytes,
                 "total_size_mb": round(total_size_bytes / (1024 * 1024), 2)
             }
         except Exception as e:

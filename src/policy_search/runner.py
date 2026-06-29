@@ -746,6 +746,7 @@ def run_policy_grid_search(
     )
 
     rows: List[Dict[str, object]] = []
+    genuine_stats_by_ws: Dict[float, dict] = {}
 
     max_t = float(cfg.max_decision_time_sec)
     overlap = float(cfg.overlap)
@@ -798,6 +799,11 @@ def run_policy_grid_search(
             use_amp=bool(cfg.use_amp),
             cache_dir=cache_dir,
         )
+
+        # 落盘真实用户(genuine)分数统计，供认证启动时做阈值越界校验。
+        stats = _genuine_score_stats(val_arrays.scores, val_arrays.labels)
+        if stats is not None:
+            genuine_stats_by_ws[float(ws_f)] = stats
 
         stride_sec = float(ws_f) * (1.0 - float(overlap))
         strategies = {_normalize_decision_strategy(s) for s in (getattr(cfg, "decision_strategies", []) or ["ema", "vote"])}
@@ -1179,6 +1185,11 @@ def run_policy_grid_search(
             "vqgan_checkpoint": serialize_policy_path(vqgan_checkpoint, relative_to=policy_dir),
             "vqgan_config": serialize_policy_path(vqgan_config, relative_to=policy_dir),
             "model_version": vqgan_checkpoint.name,
+            "policy_search_completed": True,
+            "policy_status": "ready",
+            "score_metric": "mse",
+            "score_scale": "negative_reconstruction_error",
+            "genuine_score_stats": genuine_stats_by_ws.get(float(best["window_size_sec"])),
             "grid_search": {
                 "grid_results_csv": serialize_policy_path(grid_csv, relative_to=policy_dir),
                 "pareto_frontier_csv": serialize_policy_path(pareto_csv, relative_to=policy_dir),
@@ -1189,10 +1200,10 @@ def run_policy_grid_search(
         policy = {
             str(user): policy_payload
         }
-        best_json.write_text(json.dumps(policy, indent=2, ensure_ascii=False), encoding="utf-8")
+        _atomic_write_json(best_json, policy)
         method_best_json = out_dir / f"best_lock_policy_{method_tag}.json"
         if method_best_json != best_json:
-            method_best_json.write_text(json.dumps(policy, indent=2, ensure_ascii=False), encoding="utf-8")
+            _atomic_write_json(method_best_json, policy)
 
     return {"grid_csv": grid_csv, "pareto_csv": pareto_csv, "best_policy_json": best_json}
 
@@ -1261,6 +1272,40 @@ def _pick_best_policy(ca_cfg: CAConfig, rows: Sequence[Dict[str, object]]) -> Op
             candidates = within
 
     return sorted(candidates, key=_key)[0]
+
+
+def _atomic_write_json(path: Path, obj) -> None:
+    """Atomically write JSON: write to a sibling .tmp file, flush+fsync, then os.replace."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(obj, indent=2, ensure_ascii=False))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _genuine_score_stats(scores, labels) -> Optional[dict]:
+    """Summary statistics of genuine (label==1) per-window scores.
+
+    Scores are negative reconstruction error (higher = more genuine). Used by
+    authentication startup to reject thresholds that fall far outside the
+    training/validation genuine score band.
+    """
+    g = np.asarray(scores)[np.asarray(labels) == 1]
+    if g.size == 0:
+        return None
+    quantile_keys = ["0.001", "0.01", "0.05", "0.5", "0.95", "0.99", "0.999"]
+    return {
+        "source": "val",
+        "count": int(g.size),
+        "min": float(g.min()),
+        "max": float(g.max()),
+        "mean": float(g.mean()),
+        "std": float(g.std()),
+        "quantiles": {q: float(np.quantile(g, float(q))) for q in quantile_keys},
+    }
 
 
 def _write_csv(rows: Sequence[Dict[str, object]], path: Path) -> None:

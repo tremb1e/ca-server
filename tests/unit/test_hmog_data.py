@@ -4,7 +4,7 @@ from ca_train.hmog_data import _resample_time_axis
 
 
 def test_resample_time_axis_same_width_returns_detached_copy() -> None:
-    src = np.arange(9 * 20, dtype=np.float32).reshape(9, 20)
+    src = np.arange(6 * 20, dtype=np.float32).reshape(6, 20)
     out = _resample_time_axis(src, target_width=20)
 
     assert out.shape == src.shape

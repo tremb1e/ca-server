@@ -65,6 +65,10 @@ class AuthConfig:
     target_window_frr: float = 0.10
     max_genuine_first_interrupt_p: Optional[float] = None
     policy_search_auth_method: Literal["vqgan-only", "vqgan+transformer"] = "vqgan-only"
+    # 策略降级开关：默认 False —— 认证启动仅接受 policy_search 产出的正式策略
+    # (best_lock_policy.json 且 policy_status=ready、policy_search_completed=true)。
+    # 置 True 时，缺少正式策略才允许回退到训练兜底策略 training_fallback_policy.json。
+    allow_training_fallback_policy: bool = False
 
     def __post_init__(self) -> None:
         if self.ema_alpha_candidates is None:
@@ -182,6 +186,9 @@ def load_ca_config(path: Optional[Path] = None) -> CAConfig:
         target_window_frr=float(target_window_frr_raw),
         max_genuine_first_interrupt_p=None if max_genuine_raw is None else float(max_genuine_raw),
         policy_search_auth_method=policy_search_auth_method,  # type: ignore[arg-type]
+        allow_training_fallback_policy=bool(
+            auth_raw.get("allow_training_fallback_policy", AuthConfig.allow_training_fallback_policy)
+        ),
     )
 
     training = TrainingConfig(
