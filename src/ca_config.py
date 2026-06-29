@@ -54,6 +54,11 @@ class WindowConfig:
 @dataclass(frozen=True)
 class AuthConfig:
     max_decision_time_sec: float = 2.0
+    # 认证结果发布延迟（秒）：服务端累计该时长对应的滑窗后，才向 App 发布一次聚合认证结果。
+    # 端侧每 ~1s 上送一个数据包；默认 0.2s 窗 + 50% overlap => stride 0.1s（约每秒 10 个窗口），
+    # 因此 5.0 表示综合这 5s 内约 50 个窗口、用该用户的 EMA / y-of-x 策略聚合后再回包。
+    # 0 表示不延迟（每个数据包都回结果，兼容旧行为）。折算窗口数见 reject_trackers.windows_for_delay。
+    result_delay_sec: float = 0.0
     k_rejects_mode: Literal["by_window"] = "by_window"
     decision_strategy: Literal["ema", "vote", "k"] = "ema"
     # 投票规则：最近连续 N 个窗口中，若 reject>=M，则判定为恶意并触发打断。
@@ -177,6 +182,7 @@ def load_ca_config(path: Optional[Path] = None) -> CAConfig:
 
     auth = AuthConfig(
         max_decision_time_sec=float(auth_raw.get("max_decision_time_sec", AuthConfig.max_decision_time_sec)),
+        result_delay_sec=max(0.0, float(auth_raw.get("result_delay_sec", AuthConfig.result_delay_sec))),
         k_rejects_mode=str(auth_raw.get("k_rejects_mode", AuthConfig.k_rejects_mode)),  # type: ignore[arg-type]
         decision_strategy=decision_strategy,  # type: ignore[arg-type]
         vote_window_size=int(auth_raw.get("vote_window_size", AuthConfig.vote_window_size)),

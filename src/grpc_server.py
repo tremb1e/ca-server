@@ -209,6 +209,19 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
                 decision_time_sec=0.0,
             )
         ca_cfg = get_ca_config()
+        result_delay_sec = max(0.0, float(getattr(ca_cfg.auth, "result_delay_sec", 0.0) or 0.0))
+        max_decision_time_sec = float(ca_cfg.auth.max_decision_time_sec)
+        # App 拿到认证结论的最坏时延 = 决策时间与“认证结果发布延迟”的较大者；
+        # 回报给客户端用于设置等待上限，避免节流后误判超时。
+        effective_decision_time_sec = max(max_decision_time_sec, result_delay_sec)
+        if result_delay_sec > max_decision_time_sec:
+            logger.warning(
+                "auth.result_delay_sec=%.3fs 超过 auth.max_decision_time_sec=%.3fs；"
+                "App 将每约 %.3fs 才收到一次聚合认证结果",
+                result_delay_sec,
+                max_decision_time_sec,
+                result_delay_sec,
+            )
         model_ready, model_error = self.auth_manager.check_trained_model(device_id_hash)
         if model_ready:
             accepted, message, policy = self.auth_manager.start_session(device_id_hash, session_id)
@@ -226,7 +239,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
                 message=str(message),
                 model_version=str(policy.model_version if policy else ""),
                 window_size_sec=float(policy.window_size if policy else 0.0),
-                decision_time_sec=float(ca_cfg.auth.max_decision_time_sec),
+                decision_time_sec=float(effective_decision_time_sec),
             )
 
         readiness = self.training_manager.get_readiness(device_id_hash)
@@ -261,7 +274,7 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
             message=reason,
             model_version="",
             window_size_sec=0.0,
-            decision_time_sec=float(ca_cfg.auth.max_decision_time_sec),
+            decision_time_sec=float(effective_decision_time_sec),
         )
 
     async def SendHeartbeat(self, request, context):

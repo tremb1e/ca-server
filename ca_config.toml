@@ -63,6 +63,16 @@ sampling_rate_hz = 100
 # 当前需求：T=2s。
 max_decision_time_sec = 2.0
 
+# 认证结果发布延迟（秒）：服务端每累积该时长对应的滑窗后，才向 App 发布一次“聚合认证结果”。
+# - 端侧约每 1s 上送一个数据包；服务端按 [windows] 的 sizes/overlap 切窗
+#   （默认 0.2s 窗 + 50% overlap => stride 0.1s，即每秒约 10 个窗口）。
+# - 折算窗口数 target_windows = round(result_delay_sec / stride_sec)，例如 5.0s => 50 个窗口。
+# - 发布时综合这 target_windows 个窗口、按该用户策略（EMA 或 y-of-x 投票）得到的最新聚合结果回包；
+#   发布间隔内的数据包只回 Ack，不回 AuthResult（全量窗口仍照常落盘到 inference 结果）。
+# - 0 表示不延迟（每个数据包都回结果，兼容旧行为）；值越大结果越平滑、抖动越低，但 App 收到结论的时延越高。
+# - 建议不超过 max_decision_time_sec 太多；若超过，StartAuthentication 会按两者较大值回报 decision_time_sec 并打日志告警。
+result_delay_sec = 5.0
+
 # 认证决策策略：
 # - "ema"：默认策略，对 VQGAN 分数做指数滑动平均后与 policy_search 选出的阈值比较，降低短时抖动造成的 FRR。
 # - "vote"：保留 y-of-x 投票机制，即最近 N 窗中 reject>=M 触发。

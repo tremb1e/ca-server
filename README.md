@@ -136,6 +136,7 @@ docker compose run --rm ca-server auth --user <device_id_hash> --csv-path /app/d
 - 训练阶段先写兜底策略 `training_fallback_policy.json`；`policy_search` 成功后“原子写入”正式 `best_lock_policy.json`（标记 `policy_status="ready"`、`policy_search_completed=true`，并落盘 `genuine_score_stats`），线上推理直接消费该文件。
 - 认证启动默认只接受正式策略（`policy_status="ready"` 且 `policy_search_completed=true`）。新增配置开关 `auth.allow_training_fallback_policy`（默认 `false`），置 `true` 时缺少正式策略才允许回退到 `training_fallback_policy.json` 降级运行。
 - 默认认证决策为 `EMA`；原 y-of-x 投票机制仍可通过配置或用户策略选择。
+- 新增 `auth.result_delay_sec` 认证结果发布延迟（默认 `0`，部署配置示例 `5.0`）：服务端按该延迟折算窗口数（`stride=window×(1-overlap)`，默认 0.2s 窗 + 0.5 overlap => 每秒约 10 窗，故 5s≈50 窗）累积后，每个周期才向 App 发布一次按该用户策略（EMA / y-of-x）聚合的 `AuthResult`，期间数据包只回 `Ack`；全量窗口仍逐窗落盘到 `inference` 结果。`StartAuthentication.decision_time_sec` 回报 `max(max_decision_time_sec, result_delay_sec)`。`0` 表示不延迟（每个数据包都回结果，兼容旧行为）。
 - 模型就绪检查 `check_trained_model` 同时要求 policy、checkpoint、config 和 `processed_data/z-score/<user>/scaler.json` 完整可读，并校验阈值有限、策略含必要字段、`input_height == 6`，校验详情写入 `inference/<device>/<session>/model_validation.json`。
 - 认证结果按尺度拆分写出 `raw_*` / `ema_*` / `display_*`，并带 `result_stage="primary"`；`score` / `threshold` / `normalized_score` 保留为兼容字段。
 - 在 Ascend 910B 8 卡机器上，`device=auto` 会优先使用 NPU，训练管理器会把并行用户任务分配到可见 NPU 设备池。

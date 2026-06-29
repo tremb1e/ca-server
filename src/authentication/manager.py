@@ -14,7 +14,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from ..ca_config import get_ca_config
 from ..config import settings
 from ..storage.inference_storage import InferenceStorage
-from ..utils.reject_trackers import ConsecutiveRejectTracker, EMAScoreTracker, VoteRejectTracker
+from ..utils.reject_trackers import (
+    ConsecutiveRejectTracker,
+    EMAScoreTracker,
+    ResultEmitGate,
+    VoteRejectTracker,
+    windows_for_delay,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -57,6 +63,8 @@ class AuthSessionState:
     last_activity: float = field(default_factory=time.time)
     tail_records: Dict[str, List[Dict[str, Any]]] = field(default_factory=lambda: {"acc": [], "gyr": [], "mag": []})
     window_index: int = 0
+    # 认证结果发布节流闸门：按 auth.result_delay_sec 折算窗口数累积，满一个周期才发布一次结果。
+    emit_gate: ResultEmitGate = field(default_factory=ResultEmitGate)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     consecutive_rejects: Any = None
     vote_rejects: Any = None
@@ -412,11 +420,17 @@ class AuthSessionManager:
 
     def snapshot_sessions(self) -> List[Dict[str, Any]]:
         self._prune_sessions()
+        ca_cfg = get_ca_config()
         sessions: List[Dict[str, Any]] = []
         for state in self._sessions.values():
             consecutive = state.consecutive_rejects
             vote = state.vote_rejects
             ema = state.ema_rejects
+            target_windows = windows_for_delay(
+                ca_cfg.auth.result_delay_sec,
+                window_size_sec=state.policy.window_size,
+                overlap=state.policy.overlap,
+            )
             sessions.append(
                 {
                     "device_id_hash": str(state.user_id),
@@ -425,6 +439,10 @@ class AuthSessionManager:
                     "last_activity": self._iso_from_epoch(state.last_activity),
                     "idle_seconds": max(0.0, float(time.time() - state.last_activity)),
                     "window_index": int(state.window_index),
+                    # 认证结果发布节流观测：延迟秒数、折算窗口数、当前已累积未发布窗口数。
+                    "result_delay_sec": float(ca_cfg.auth.result_delay_sec),
+                    "result_emit_windows": int(target_windows),
+                    "windows_since_emit": int(getattr(state.emit_gate, "pending", 0)),
                     "tail_records": {k: len(v) for k, v in state.tail_records.items()},
                     "policy": self._policy_snapshot(state.policy),
                     "consecutive_rejects": {
@@ -520,7 +538,18 @@ class AuthSessionManager:
                     use_amp=True,
                 )
 
-            final_payload: Optional[AuthResultPayload] = None
+            # 认证结果发布延迟：把 auth.result_delay_sec 折算成需累积的窗口数。
+            # 例：window=0.2s、overlap=0.5 => stride=0.1s（每秒约 10 窗），delay=5s => 50 窗。
+            # target_windows<=0 表示不延迟（每个数据包都发布最近窗口结果，兼容旧行为）。
+            ca_cfg = get_ca_config()
+            target_windows = windows_for_delay(
+                ca_cfg.auth.result_delay_sec,
+                window_size_sec=state.policy.window_size,
+                overlap=state.policy.overlap,
+            )
+            state.emit_gate.target_windows = int(target_windows)
+
+            emit_payload: Optional[AuthResultPayload] = None
             for offset, score in zip(window_ids, scores):
                 window_id = state.window_index + int(offset)
                 raw_score = float(score)
@@ -622,7 +651,7 @@ class AuthSessionManager:
                     },
                 )
 
-                final_payload = AuthResultPayload(
+                window_payload = AuthResultPayload(
                     user=user_id,
                     session_id=session_id,
                     window_id=window_id,
@@ -646,9 +675,16 @@ class AuthSessionManager:
                     display_threshold=decision_threshold,
                 )
 
+                # 发布节流：累计满 target_windows 个窗口才把最近一次（已聚合）结果回给 App，
+                # 期间数据包只回 Ack。target_windows<=0 时不节流（每个数据包都发布）。
+                if target_windows <= 0:
+                    emit_payload = window_payload
+                elif state.emit_gate.feed():
+                    emit_payload = window_payload
+
             state.window_index += len(window_ids)
             self._trim_tail(state, combined_records)
-            return final_payload
+            return emit_payload
 
     def _trim_tail(self, state: AuthSessionState, records: Dict[str, List[Dict[str, Any]]]) -> None:
         tail_ms = int(round(float(state.policy.window_size) * float(state.policy.overlap) * 1000))
