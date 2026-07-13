@@ -4,6 +4,7 @@ set -euo pipefail
 export APP_ROOT="${APP_ROOT:-/app}"
 export CA_APP_ROOT="${CA_APP_ROOT:-${APP_ROOT}}"
 export CA_CONFIG_PATH="${CA_CONFIG_PATH:-${APP_ROOT}/ca_config.toml}"
+export VIRTUAL_ENV="${VIRTUAL_ENV:-/opt/venv}"
 export ASCEND_DRIVER_HOME="${ASCEND_DRIVER_HOME:-/usr/local/Ascend/driver}"
 export ASCEND_INSTALL_INFO="${ASCEND_INSTALL_INFO:-/etc/ascend_install.info}"
 export ASCEND_TOOLKIT_ROOT="${ASCEND_TOOLKIT_ROOT:-/usr/local/Ascend/ascend-toolkit}"
@@ -48,6 +49,14 @@ ascend_ld_library_path="${bundle_ld_library_path}:${ASCEND_TOOLKIT_HOME}/tools/a
 export PYTHONPATH="${app_pythonpath}:${ascend_pythonpath}${PYTHONPATH:+:${PYTHONPATH}}"
 
 case ":${PATH:-}:" in
+  *:"${VIRTUAL_ENV}/bin":*)
+    ;;
+  *)
+    export PATH="${VIRTUAL_ENV}/bin${PATH:+:${PATH}}"
+    ;;
+esac
+
+case ":${PATH:-}:" in
   *:"${ASCEND_TOOLKIT_HOME}/bin":*)
     ;;
   *)
@@ -80,7 +89,11 @@ if [ "${runtime_mode}" = "auto" ]; then
 fi
 
 if [ "${runtime_mode}" = "python" ]; then
-  cli_cmd=(python -m src.cli)
+  python_bin="${VIRTUAL_ENV}/bin/python"
+  if [ ! -x "${python_bin}" ]; then
+    python_bin="python"
+  fi
+  cli_cmd=("${python_bin}" -m src.cli)
 else
   cli_cmd=(/app/bin/ca-server)
 fi
@@ -109,7 +122,7 @@ case "$1" in
   ca-train-vqgan)
     shift
     if [ "${runtime_mode}" = "python" ] && [ -f "/app/ca_train/hmog_vqgan_experiment.py" ]; then
-      set -- python /app/ca_train/hmog_vqgan_experiment.py "$@"
+      set -- "${python_bin:-python}" /app/ca_train/hmog_vqgan_experiment.py "$@"
     else
       set -- "${cli_cmd[@]}" ca-train-vqgan "$@"
     fi

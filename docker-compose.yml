@@ -6,15 +6,15 @@ x-ca-common-env: &ca-common-env
   - CA_CONFIG_PATH=/app/ca_config.toml
   - HOST=0.0.0.0
   - PORT=${CA_SERVER_HTTP_PORT:-18000}
-  - HTTP_ENABLED=${HTTP_ENABLED:-false}
+  - HTTP_ENABLED=${HTTP_ENABLED:-true}
   - GRPC_HOST=0.0.0.0
   - GRPC_PORT=${CA_SERVER_GRPC_PORT:-10500}
   - DATA_STORAGE_PATH=/app/data_storage/raw_data
   - PROCESSED_DATA_PATH=/app/data_storage/processed_data
   - INFERENCE_STORAGE_PATH=/app/data_storage/inference
   - HMOG_DATA_PATH=/app/data_storage/hmog_preprocessed
-  - MANAGEMENT_API_ENABLED
-  - MANAGEMENT_API_KEY
+  - MANAGEMENT_API_ENABLED=${MANAGEMENT_API_ENABLED:-true}
+  - MANAGEMENT_API_KEY=${MANAGEMENT_API_KEY:-ca-server-api-test-key}
   - MAX_DECOMPRESSED_SIZE=${MAX_DECOMPRESSED_SIZE:-10485760}
   - CA_TRAIN_WINDOW_CACHE_DIR=/app/runtime/ca_train/cached_windows
   - CA_TRAIN_TOKEN_CACHE_DIR=/app/runtime/ca_train/token_caches

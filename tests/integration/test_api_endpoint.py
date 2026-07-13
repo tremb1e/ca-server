@@ -113,6 +113,7 @@ class TestSensorDataEndpoint:
 
         runtime = client.get("/health").json()
         assert runtime["storage_stats"]["total_devices"] == 1
+        assert runtime["storage_stats"]["total_size_bytes"] > 0
 
     def test_successful_packet_submission_with_string_identifiers(self, client):
         device_id_hash = "device-abc"
@@ -325,6 +326,7 @@ class TestSensorDataEndpoint:
         assert response_data["status"] == "healthy"
         assert "storage_stats" in response_data
         assert response_data["storage_stats"]["total_devices"] >= 0
+        assert "total_size_bytes" in response_data["storage_stats"]
 
     def test_root_endpoint(self, client):
         response = client.get("/")
