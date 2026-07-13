@@ -6,7 +6,7 @@ import sys
 import pytest
 
 from src.training import runner as training_runner
-from src.training.runner import _resolve_user_input_height, _vqgan_config
+from src.training.runner import _explicit_accelerator_index, _resolve_user_input_height, _vqgan_config
 from src.training.runner import _read_best_window, run_window_sweep_for_user
 
 
@@ -215,3 +215,11 @@ def test_sensor_mode_controls_vqgan_input_height(tmp_path) -> None:
         beta=0.25,
     )
     assert cfg["input_height"] == 9
+
+
+@pytest.mark.parametrize(
+    ("device", "expected"),
+    [("npu:0", 0), ("npu:7", 7), ("cuda:2", 2), ("cpu", None), ("auto", None)],
+)
+def test_explicit_accelerator_index_is_forwarded_to_worker_pool(device, expected) -> None:
+    assert _explicit_accelerator_index(device) == expected

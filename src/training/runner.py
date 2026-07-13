@@ -63,6 +63,22 @@ def _pick_workers() -> Tuple[int, int]:
     return max(0, int(num_workers)), max(1, int(cpu_threads))
 
 
+def _explicit_accelerator_index(device: str) -> Optional[int]:
+    """Return an explicitly requested NPU/CUDA index for CA-train workers.
+
+    ``hmog_vqgan_experiment`` otherwise builds its device pool from zero and can
+    silently run an outer ``--device npu:1`` request on worker ``npu:0``.
+    """
+    text = str(device or "").strip().lower()
+    if not (text.startswith("npu:") or text.startswith("cuda:")):
+        return None
+    try:
+        index = int(text.split(":", 1)[1])
+    except (TypeError, ValueError):
+        return None
+    return index if index >= 0 else None
+
+
 def _vqgan_config(
     target_width: int,
     *,
@@ -398,6 +414,10 @@ def run_window_sweep_for_user(
                 str(log_dir),
                 "--use-amp",
             ]
+
+            accelerator_index = _explicit_accelerator_index(str(resolved_device))
+            if accelerator_index is not None:
+                cmd.extend(["--gpu-ids", str(accelerator_index)])
 
             if max_train_per_user is not None:
                 cmd.extend(["--max-train-per-user", str(int(max_train_per_user))])
