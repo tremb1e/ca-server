@@ -246,6 +246,7 @@ def _score_split_vqgan_transformer_inprocess(
     torch_device = resolve_torch_device(device)
     vqgan = load_vqgan(Path(vqgan_ckpt), device=torch_device, cfg_path=None)
     lm = load_lm(Path(lm_ckpt), device=torch_device, cfg_path=None)
+    input_height = _resolve_input_height(Path(vqgan_ckpt))
 
     batch_windows: List[np.ndarray] = []
     batch_labels: List[int] = []
@@ -284,6 +285,7 @@ def _score_split_vqgan_transformer_inprocess(
         Path(csv_path),
         window_size_sec=float(window_size),
         target_width=int(target_width),
+        input_height=input_height,
     ):
         subject_s = str(subject).strip()
         session_s = str(session).strip()
@@ -332,6 +334,7 @@ def _score_split_vqgan_only_inprocess(
 
     torch_device = resolve_torch_device(device)
     vqgan = load_vqgan(Path(vqgan_ckpt), device=torch_device, cfg_path=None)
+    input_height = _resolve_input_height(Path(vqgan_ckpt))
 
     batch_windows: List[np.ndarray] = []
     batch_labels: List[int] = []
@@ -365,6 +368,7 @@ def _score_split_vqgan_only_inprocess(
         Path(csv_path),
         window_size_sec=float(window_size),
         target_width=int(target_width),
+        input_height=input_height,
     ):
         subject_s = str(subject).strip()
         session_s = str(session).strip()
@@ -409,6 +413,15 @@ def _resolve_target_width(*checkpoint_paths: Path, default: int = 50) -> int:
         except Exception:
             continue
     return int(default)
+
+
+def _resolve_input_height(checkpoint_path: Path) -> int:
+    cfg_path = Path(checkpoint_path).with_suffix(".json")
+    payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+    height = int(payload.get("input_height", 0))
+    if height not in (6, 9):
+        raise ValueError(f"Unsupported input_height={height} in {cfg_path}; expected 6 or 9")
+    return height
 
 
 @dataclass(frozen=True)
@@ -1170,6 +1183,7 @@ def run_policy_grid_search(
             "window": float(best["window_size_sec"]),
             "overlap": float(best["overlap"]),
             "target_width": int(best.get("target_width", _resolve_target_width(vqgan_checkpoint, default=50)) or 50),
+            "input_height": _resolve_input_height(vqgan_checkpoint),
             "interrupt_rule": strategy,
             "decision_strategy": strategy,
             "threshold_strategy": "interrupt_window_frr",

@@ -38,6 +38,13 @@ class ProcessingConfig:
     # - max_rows_total: 单次合并（val 或 test）总共最多读取多少行（跨多个 HMOG 用户合计）。
     hmog_max_rows_per_subject: int = 0
     hmog_max_rows_total: int = 0
+    # 磁力计环境干扰判定：对三轴模长 sqrt(x^2+y^2+z^2) 做固定阈值检测。
+    # 参考用户 300MB 样本中 >120uT 比例约 0.682%，因此允许至多 1% 的
+    # 瞬时尖峰；超过该比例、有效覆盖不足或样本太少时改用 6 轴模型。
+    magnetometer_max_magnitude_ut: float = 120.0
+    magnetometer_max_outlier_ratio: float = 0.01
+    magnetometer_min_coverage_ratio: float = 0.95
+    magnetometer_min_samples: int = 100
 
 
 @dataclass(frozen=True)
@@ -149,6 +156,18 @@ def load_ca_config(path: Optional[Path] = None) -> CAConfig:
         hmog_balance_ratio=float(proc_raw.get("hmog_balance_ratio", ProcessingConfig.hmog_balance_ratio)),
         hmog_max_rows_per_subject=int(proc_raw.get("hmog_max_rows_per_subject", ProcessingConfig.hmog_max_rows_per_subject)),
         hmog_max_rows_total=int(proc_raw.get("hmog_max_rows_total", ProcessingConfig.hmog_max_rows_total)),
+        magnetometer_max_magnitude_ut=float(
+            proc_raw.get("magnetometer_max_magnitude_ut", ProcessingConfig.magnetometer_max_magnitude_ut)
+        ),
+        magnetometer_max_outlier_ratio=float(
+            proc_raw.get("magnetometer_max_outlier_ratio", ProcessingConfig.magnetometer_max_outlier_ratio)
+        ),
+        magnetometer_min_coverage_ratio=float(
+            proc_raw.get("magnetometer_min_coverage_ratio", ProcessingConfig.magnetometer_min_coverage_ratio)
+        ),
+        magnetometer_min_samples=int(
+            proc_raw.get("magnetometer_min_samples", ProcessingConfig.magnetometer_min_samples)
+        ),
     )
 
     sizes = win_raw.get("sizes", None)

@@ -140,6 +140,7 @@ def processed_summary(device_id: str) -> Dict[str, Any]:
     z_dir = processed_root / "z-score" / device_id
     split_files = {name: _file_info(z_dir / f"{name}.csv") for name in ("train", "val", "test")}
     scaler = _file_info(z_dir / "scaler.json")
+    sensor_mode = _file_info(z_dir / "sensor_mode.json")
     windows: Dict[str, Dict[str, Any]] = {}
     window_root = processed_root / "window"
     for window_dir in _iter_dirs(window_root):
@@ -153,6 +154,8 @@ def processed_summary(device_id: str) -> Dict[str, Any]:
     files = [Path(info["path"]) for info in split_files.values()]
     if scaler["exists"]:
         files.append(Path(scaler["path"]))
+    if sensor_mode["exists"]:
+        files.append(Path(sensor_mode["path"]))
     for window_payload in windows.values():
         files.extend(Path(info["path"]) for info in window_payload.values())
     total = _sum_files([path for path in files if path.exists()])
@@ -161,6 +164,7 @@ def processed_summary(device_id: str) -> Dict[str, Any]:
         "z_score_dir": str(z_dir),
         "splits": split_files,
         "scaler": scaler,
+        "sensor_mode": sensor_mode,
         "windows": windows,
         "total_size_bytes": int(total["total_size_bytes"]),
         "total_size_mb": float(total["total_size_mb"]),
@@ -228,6 +232,7 @@ def model_info(device_id: str) -> Dict[str, Any]:
             "user": str(cfg.user),
             "window_size": float(cfg.window_size),
             "target_width": int(cfg.target_width),
+            "input_height": int(cfg.input_height),
             "overlap": float(cfg.overlap),
             "threshold": float(cfg.threshold),
             "interrupt_rule": str(cfg.interrupt_rule),
@@ -270,13 +275,22 @@ def model_info(device_id: str) -> Dict[str, Any]:
 
     model_cfg = _safe_json(Path(str((policy_payload or {}).get("vqgan_config", ""))), {}) if policy_payload else {}
     scaler_payload = _safe_json(Path(settings.processed_data_path) / "z-score" / device_id / "scaler.json", None)
+    sensor_mode_payload = _safe_json(
+        Path(settings.processed_data_path) / "z-score" / device_id / "sensor_mode.json", None
+    )
+    model_height = int(model_cfg.get("input_height", 0) if isinstance(model_cfg, dict) else 0)
+    mode_matches = bool(
+        sensor_mode_payload is None
+        or int(sensor_mode_payload.get("input_height", 0)) == model_height
+    )
     ready = bool(
         policy_payload
         and files.get("vqgan_checkpoint", {}).get("exists")
         and files.get("vqgan_config", {}).get("exists")
         and files.get("scaler", {}).get("exists")
         and scaler_payload is not None
-        and int(model_cfg.get("input_height", 6) if isinstance(model_cfg, dict) else 0) == 6
+        and model_height in (6, 9)
+        and mode_matches
     )
     return {
         "device_id_hash": str(device_id),

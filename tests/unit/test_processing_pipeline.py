@@ -203,6 +203,9 @@ def test_load_hmog_attackers_keeps_only_requested_session_range(tmp_path: Path) 
                 "gyr_x": [0.1, 0.2, 0.3],
                 "gyr_y": [0.1, 0.2, 0.3],
                 "gyr_z": [0.1, 0.2, 0.3],
+                "mag_x": [30.0, 31.0, 32.0],
+                "mag_y": [10.0, 11.0, 12.0],
+                "mag_z": [20.0, 21.0, 22.0],
             }
         )
         df.to_csv(subject_dir / f"{sid}_train.csv", index=False)
@@ -234,6 +237,9 @@ def test_load_hmog_attackers_balances_to_target_rows(tmp_path: Path) -> None:
                 "gyr_x": [0.1] * rows,
                 "gyr_y": [0.1] * rows,
                 "gyr_z": [0.1] * rows,
+                "mag_x": [30.0] * rows,
+                "mag_y": [10.0] * rows,
+                "mag_z": [20.0] * rows,
             }
         )
         df.to_csv(subject_dir / f"{sid}_train.csv", index=False)

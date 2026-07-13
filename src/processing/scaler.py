@@ -6,14 +6,9 @@ from typing import Dict
 
 import pandas as pd
 
-FEATURE_COLUMNS = [
-    "acc_x",
-    "acc_y",
-    "acc_z",
-    "gyr_x",
-    "gyr_y",
-    "gyr_z",
-]
+from .magnetometer import NINE_AXIS_COLUMNS
+
+FEATURE_COLUMNS = list(NINE_AXIS_COLUMNS)
 
 
 def load_scaler(path: Path) -> Dict[str, Dict[str, float]]:
@@ -27,7 +22,12 @@ def apply_scaler(df: pd.DataFrame, scaler: Dict[str, Dict[str, float]]) -> pd.Da
     mean = scaler.get("mean", {})
     std = scaler.get("std", {})
     out = df.copy()
-    for col in FEATURE_COLUMNS:
+    # The scaler itself is the source of truth: a 6-axis user has six mean/std
+    # entries, while a healthy 9-axis user has nine. This keeps legacy scaler
+    # files compatible and prevents unused abnormal magnetometer values from
+    # being normalized in 6-axis mode.
+    columns = [str(col) for col in mean.keys()] or FEATURE_COLUMNS
+    for col in columns:
         if col not in out.columns:
             continue
         col_mean = float(mean.get(col, 0.0))

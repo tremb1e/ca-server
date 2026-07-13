@@ -38,6 +38,7 @@ class AuthRunConfig:
     policy_source: str = ""               # "best" | "training_fallback"
     policy_file: str = ""                 # absolute path of the loaded json
     genuine_score_stats: Optional[Dict[str, Any]] = None
+    input_height: int = 6
 
 
 def _server_root() -> Path:
@@ -141,6 +142,11 @@ def load_best_policy(
     genuine_score_stats = policy.get("genuine_score_stats")
     if not isinstance(genuine_score_stats, dict):
         genuine_score_stats = None
+    try:
+        model_cfg = json.loads(vqgan_config.read_text(encoding="utf-8"))
+        input_height = int(model_cfg.get("input_height", 0))
+    except Exception:
+        input_height = 0
     return AuthRunConfig(
         user=str(policy.get("user", user)),
         window_size=float(policy.get("window", 0.0)),
@@ -164,6 +170,7 @@ def load_best_policy(
         policy_source=policy_source,
         policy_file=str(policy_path),
         genuine_score_stats=genuine_score_stats,
+        input_height=input_height,
     )
 
 
@@ -326,6 +333,7 @@ def run_auth_inference(
                 csv_path,
                 window_size_sec=float(policy.window_size),
                 target_width=int(policy.target_width),
+                input_height=int(policy.input_height),
             )
         ):
             windows_batch.append(window)
@@ -345,6 +353,7 @@ def run_auth_inference(
         "window": float(policy.window_size),
         "overlap": float(policy.overlap),
         "target_width": int(policy.target_width),
+        "input_height": int(policy.input_height),
         "threshold": float(policy.threshold),
         "interrupt_rule": str(policy.interrupt_rule),
         "decision_strategy": str(policy.decision_strategy),

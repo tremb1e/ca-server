@@ -771,10 +771,11 @@ def run_single_window(
             base_path=Path(args.dataset_path),
             seed=args.seed,
             max_train_windows=args.max_train_per_user,
+            input_height=int(args.input_height),
         )
-        val_x = np.empty((0, 1, 6, target_width), dtype=np.float32)
+        val_x = np.empty((0, 1, int(args.input_height), target_width), dtype=np.float32)
         val_y = np.empty((0,), dtype=np.int64)
-        test_x = np.empty((0, 1, 6, target_width), dtype=np.float32)
+        test_x = np.empty((0, 1, int(args.input_height), target_width), dtype=np.float32)
         test_y = np.empty((0,), dtype=np.int64)
     else:
         train_x, train_y, val_x, val_y, test_x, test_y = prepare_user_datasets(
@@ -788,6 +789,7 @@ def run_single_window(
             base_path=Path(args.dataset_path),
             full_scan_eval=args.full_scan_eval,
             seed=args.seed,
+            input_height=int(args.input_height),
         )
     prep_dur = time.time() - prep_start
     logger.info(
@@ -831,7 +833,7 @@ def run_single_window(
         train_x = train_x[idx]
         train_y = train_y[idx]
 
-    args.input_height = int(train_x.shape[2]) if train_x.size else 6
+    args.input_height = int(train_x.shape[2]) if train_x.size else int(args.input_height)
     args.input_width = int(train_x.shape[3]) if train_x.size else int(target_width)
     args.use_nonlocal = not getattr(args, "no_nonlocal", False)
 
@@ -1596,6 +1598,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-codebook-vectors", type=int, default=512)
     parser.add_argument("--beta", type=float, default=0.25)
     parser.add_argument("--image-channels", type=int, default=1)
+    parser.add_argument("--input-height", type=int, choices=(6, 9), default=6)
     parser.add_argument("--no-nonlocal", action="store_true")
     parser.add_argument("--q-loss-weight", type=float, default=1.0)
     parser.add_argument("--train-rec-loss", choices=["l1", "mse"], default="l1")

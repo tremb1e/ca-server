@@ -131,13 +131,13 @@ docker compose run --rm ca-server auth --user <device_id_hash> --csv-path /app/d
 
 - 数据触发阈值默认 `300MB`。若记为 `100x`，预处理会按 `train=75x`、`val=12.5x`、`test=12.5x` 动态切分。
 - HMOG 只填充 `val/test`，默认让真实用户与 HMOG 攻击者数据量约为 `1:1`；val 使用排序靠前 HMOG 用户，test 使用排序靠后 HMOG 用户，每侧至少 10 个用户。
-- VQGAN 输入已改为 `(batch, 1, 6, T)`：6 行 = 加速度计 + 陀螺仪，移除磁力计；模型 config 的 `input_height` 由 9 改为 6。旧 9 轴 / 12 轴模型会被就绪检查拒绝，必须重新生成窗口数据并重训。
+- VQGAN 输入按用户磁力计质量自动选择 `(batch, 1, H, T)`：`H=6` 为加速度计+陀螺仪，`H=9` 再加入磁力计。预处理对磁场模长使用 `120µT` 固定阈值；超限比例大于 `1%`、有效覆盖率低于 `95%` 或有效样本少于 `100` 时选择 6 轴，否则选择 9 轴。判定与统计持久化到 `processed_data/z-score/<user>/sensor_mode.json`，训练、策略搜索和推理全程使用同一轴数。
 - 训练默认最多 50 epoch，验证集性能连续 3 次不提升早停；训练完成后默认运行 `policy_search`。
 - 训练阶段先写兜底策略 `training_fallback_policy.json`；`policy_search` 成功后“原子写入”正式 `best_lock_policy.json`（标记 `policy_status="ready"`、`policy_search_completed=true`，并落盘 `genuine_score_stats`），线上推理直接消费该文件。
 - 认证启动默认只接受正式策略（`policy_status="ready"` 且 `policy_search_completed=true`）。新增配置开关 `auth.allow_training_fallback_policy`（默认 `false`），置 `true` 时缺少正式策略才允许回退到 `training_fallback_policy.json` 降级运行。
 - 认证决策的聚合策略 / 投票窗口以 `ca_config.toml [auth]` 为运行时权威来源，覆盖 per-user `best_lock_policy.json` 中的同名字段（per-user 策略仅提供该用户“单窗口原始分数阈值 `threshold`”与模型工件路径）。当前部署为 `decision_strategy="vote"`、`vote_window_size=50`、`vote_min_rejects=30`，与 `result_delay_sec=5.0` 折算的 50 窗对齐，故 App 端 `AuthResult.message` 展示 “30 of 50”；`ema`、`k` 仍可通过配置选择。仍是单一 primary 阶段，不引入二次迟滞/二次投票。
 - 新增 `auth.result_delay_sec` 认证结果发布延迟（默认 `0`，部署配置示例 `5.0`）：服务端按该延迟折算窗口数（`stride=window×(1-overlap)`，默认 0.2s 窗 + 0.5 overlap => 每秒约 10 窗，故 5s≈50 窗）累积后，每个周期才向 App 发布一次按 `[auth]` 配置聚合策略得到的 `AuthResult`，期间数据包只回 `Ack`；全量窗口仍逐窗落盘到 `inference` 结果。`StartAuthentication.decision_time_sec` 回报 `max(max_decision_time_sec, result_delay_sec)`。`0` 表示不延迟（每个数据包都回结果，兼容旧行为）。vote 聚合窗口数应与发布窗口数一致（均为 50）。
-- 模型就绪检查 `check_trained_model` 同时要求 policy、checkpoint、config 和 `processed_data/z-score/<user>/scaler.json` 完整可读，并校验阈值有限、策略含必要字段、`input_height == 6`，校验详情写入 `inference/<device>/<session>/model_validation.json`。
+- 模型就绪检查 `check_trained_model` 同时要求 policy、checkpoint、config 和 `processed_data/z-score/<user>/scaler.json` 完整可读，并校验阈值有限、策略含必要字段、`input_height ∈ {6,9}`；存在 `sensor_mode.json` 时还要求其与模型轴数一致。校验详情写入 `inference/<device>/<session>/model_validation.json`。
 - 认证结果按尺度拆分写出 `raw_*` / `ema_*` / `display_*`，并带 `result_stage="primary"`；`score` / `threshold` / `normalized_score` 保留为兼容字段。
 - 在 Ascend 910B 8 卡机器上，`device=auto` 会优先使用 NPU，训练管理器会把并行用户任务分配到可见 NPU 设备池。
 - 并发能力（按“支持 100 并发用户”配置）：服务端为 asyncio + `grpc.aio`。训练对用户“无限接纳 + 队列”，真正同时在 NPU 上执行的训练数由 `TRAINING_MAX_CONCURRENT`（默认 `8`，每卡约 1 个）限制，其余在 `asyncio.Semaphore` 上排队——既支持 100 并发用户又不 OOM；可在 `server.env` 调大（前提是单卡显存能容纳 `ceil(值/卡数)` 个训练）。推理由 `AUTH_MAX_CONCURRENT`（默认 `100`，NPU 前向信号量）+ per-user 模型 LRU 缓存 `AUTH_MAX_CACHED_MODELS`（默认 `100`）+ `GRPC_MAX_CONCURRENT_RPCS`（默认 `512`，每条 `StreamSensorData` 长流计 1 个 RPC）共同约束。注意：`ca_config.toml [training] max_parallel_train` 只用于离线 / CLI 多用户 sweep，不是 server 的并发开关；推理模型缓存当前都在 `npu:0`，与 round-robin 占用 `npu:0..7` 的训练在 `npu:0` 上共享，属可接受的已知现象。

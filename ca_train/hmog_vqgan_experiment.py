@@ -324,6 +324,7 @@ def train_single_window(
         base_path=base_path,
         full_scan_eval=args.full_scan_eval,
         seed=args.seed,
+        input_height=int(args.input_height),
     )
 
     # Sanity checks: the task defines labels by `subject == target_user`.
@@ -389,7 +390,7 @@ def train_single_window(
         args.input_height = int(train_x.shape[2])
         args.input_width = int(train_x.shape[3])
     else:
-        args.input_height = 6
+        args.input_height = int(args.input_height)
         args.input_width = int(args.target_width) if args.target_width > 0 else int(round(window_size * 100))
 
     # VQGAN blocks read `use_nonlocal`; CLI exposes `--no-nonlocal` for convenience.
@@ -861,6 +862,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-codebook-vectors", type=int, default=512)
     parser.add_argument("--beta", type=float, default=0.25)
     parser.add_argument("--image-channels", type=int, default=1)
+    parser.add_argument(
+        "--input-height",
+        type=int,
+        choices=(6, 9),
+        default=6,
+        help="每用户持久化的传感器轴数：磁力计异常为6，正常为9。",
+    )
     parser.add_argument("--no-nonlocal", action="store_true", help="禁用 NonLocalBlock（更快/更省显存）")
     parser.add_argument("--q-loss-weight", type=float, default=1.0, help="VQ codebook loss 的权重")
     parser.add_argument("--train-rec-loss", choices=["l1", "mse"], default="l1", help="训练时重建损失类型")

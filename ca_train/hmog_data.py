@@ -17,14 +17,14 @@ from torch.utils.data import Dataset
 #   /data/code/server/data_storage/processed_data/window/<t>/<user>/{train,val,test}.csv
 #
 # CSV columns (per-row, per-window):
-#   subject, session, timestamp, acc_x..gyr_z, window_id
+#   subject, session, timestamp, acc_x..mag_z, window_id
 #
 # Each window is stored as `window_points` consecutive rows where:
 #   window_points = round(window_size_sec * 100Hz)
 # and windows do NOT cross sessions.
 #
-# For VQGAN we build samples shaped as (1, 6, T):
-#   6 raw axes (acc/gyr x/y/z). Magnetometer rows are intentionally dropped.
+# For VQGAN we build samples shaped as (1, H, T), where H is persisted per
+# user: H=6 for acc/gyr when magnetometer quality is abnormal, otherwise H=9.
 # =============================================================================
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ SAMPLING_RATE_HZ = 100
 DEFAULT_OVERLAP = 0.5  # the server pipeline uses 50% stride
 WINDOW_SIZES = [round(x * 0.1, 1) for x in range(1, 11)]  # 0.1s -> 1.0s
 
-AXIS_COLUMNS = (
+SIX_AXIS_COLUMNS = (
     "acc_x",
     "acc_y",
     "acc_z",
@@ -41,8 +41,19 @@ AXIS_COLUMNS = (
     "gyr_y",
     "gyr_z",
 )
+NINE_AXIS_COLUMNS = SIX_AXIS_COLUMNS + ("mag_x", "mag_y", "mag_z")
 
-SENSOR_ORDER = AXIS_COLUMNS
+AXIS_COLUMNS = SIX_AXIS_COLUMNS  # backwards-compatible public alias
+SENSOR_ORDER = NINE_AXIS_COLUMNS
+
+
+def axis_columns(input_height: int) -> Tuple[str, ...]:
+    height = int(input_height)
+    if height == 6:
+        return SIX_AXIS_COLUMNS
+    if height == 9:
+        return NINE_AXIS_COLUMNS
+    raise ValueError(f"Unsupported input_height={height}; expected 6 or 9")
 
 
 def format_window_dir_name(window_size: float) -> str:
@@ -141,9 +152,10 @@ def _iter_windows_from_csv(
     target_user: str,
     target_width: int,
     keep_all_subjects: bool,
+    input_height: int = 6,
 ) -> Iterator[Tuple[np.ndarray, int]]:
     """
-    Yield (window, label) where window is float32 shaped (1, 6, target_width).
+    Yield (window, label) where window is float32 shaped (1, H, target_width).
 
     Window boundaries are determined by `window_id` (produced by the server pipeline).
     We also validate that all rows in a window share the same `subject` to avoid
@@ -153,6 +165,7 @@ def _iter_windows_from_csv(
         raise FileNotFoundError(f"Missing window CSV: {csv_path}")
 
     target_user_norm = str(target_user).strip()
+    selected_axes = axis_columns(input_height)
 
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
@@ -166,12 +179,7 @@ def _iter_windows_from_csv(
         try:
             idx_subject = lookup["subject"]
             idx_window_id = lookup["window_id"]
-            idx_acc_x = lookup["acc_x"]
-            idx_acc_y = lookup["acc_y"]
-            idx_acc_z = lookup["acc_z"]
-            idx_gyr_x = lookup["gyr_x"]
-            idx_gyr_y = lookup["gyr_y"]
-            idx_gyr_z = lookup["gyr_z"]
+            axis_indices = [lookup[name] for name in selected_axes]
         except KeyError as exc:
             raise ValueError(f"Unexpected CSV header for {csv_path}: {header}") from exc
 
@@ -179,7 +187,7 @@ def _iter_windows_from_csv(
         current_subject: Optional[str] = None
         skip_window = False
         filled = 0
-        window_raw = np.empty((6, window_points), dtype=np.float32)
+        window_raw = np.empty((len(selected_axes), window_points), dtype=np.float32)
 
         def _flush_current() -> Optional[Tuple[np.ndarray, int]]:
             nonlocal filled
@@ -237,19 +245,8 @@ def _iter_windows_from_csv(
                 skip_window = True
                 continue
 
-            acc_x = float(row[idx_acc_x])
-            acc_y = float(row[idx_acc_y])
-            acc_z = float(row[idx_acc_z])
-            gyr_x = float(row[idx_gyr_x])
-            gyr_y = float(row[idx_gyr_y])
-            gyr_z = float(row[idx_gyr_z])
-
-            window_raw[0, filled] = acc_x
-            window_raw[1, filled] = acc_y
-            window_raw[2, filled] = acc_z
-            window_raw[3, filled] = gyr_x
-            window_raw[4, filled] = gyr_y
-            window_raw[5, filled] = gyr_z
+            for axis_idx, csv_idx in enumerate(axis_indices):
+                window_raw[axis_idx, filled] = float(row[csv_idx])
             filled += 1
 
 
@@ -258,18 +255,20 @@ def iter_windows_from_csv_unlabeled(
     *,
     window_size_sec: float,
     target_width: int,
+    input_height: int = 6,
 ) -> Iterator[Tuple[str, str, np.ndarray]]:
     """
     Iterate windows from a server-formatted CSV without assigning labels.
 
     Yields: (window_id, subject, window) where:
-      - window is float32 shaped (1, 6, target_width)
+      - window is float32 shaped (1, H, target_width)
 
     Notes:
       - Window boundaries are determined by `window_id`.
       - If a window mixes subjects or has extra/missing rows, it is skipped.
     """
     window_points = _window_points(window_size_sec)
+    selected_axes = axis_columns(input_height)
     if not csv_path.exists():
         raise FileNotFoundError(f"Missing window CSV: {csv_path}")
 
@@ -285,12 +284,7 @@ def iter_windows_from_csv_unlabeled(
         try:
             idx_subject = lookup["subject"]
             idx_window_id = lookup["window_id"]
-            idx_acc_x = lookup["acc_x"]
-            idx_acc_y = lookup["acc_y"]
-            idx_acc_z = lookup["acc_z"]
-            idx_gyr_x = lookup["gyr_x"]
-            idx_gyr_y = lookup["gyr_y"]
-            idx_gyr_z = lookup["gyr_z"]
+            axis_indices = [lookup[name] for name in selected_axes]
         except KeyError as exc:
             raise ValueError(f"Unexpected CSV header for {csv_path}: {header}") from exc
 
@@ -298,7 +292,7 @@ def iter_windows_from_csv_unlabeled(
         current_subject: Optional[str] = None
         skip_window = False
         filled = 0
-        window_raw = np.empty((6, window_points), dtype=np.float32)
+        window_raw = np.empty((len(selected_axes), window_points), dtype=np.float32)
 
         def _flush_current() -> Optional[Tuple[str, str, np.ndarray]]:
             nonlocal filled
@@ -353,19 +347,8 @@ def iter_windows_from_csv_unlabeled(
                 skip_window = True
                 continue
 
-            acc_x = float(row[idx_acc_x])
-            acc_y = float(row[idx_acc_y])
-            acc_z = float(row[idx_acc_z])
-            gyr_x = float(row[idx_gyr_x])
-            gyr_y = float(row[idx_gyr_y])
-            gyr_z = float(row[idx_gyr_z])
-
-            window_raw[0, filled] = acc_x
-            window_raw[1, filled] = acc_y
-            window_raw[2, filled] = acc_z
-            window_raw[3, filled] = gyr_x
-            window_raw[4, filled] = gyr_y
-            window_raw[5, filled] = gyr_z
+            for axis_idx, csv_idx in enumerate(axis_indices):
+                window_raw[axis_idx, filled] = float(row[csv_idx])
             filled += 1
 
 
@@ -377,6 +360,7 @@ def _load_split_windows(
     split: str,
     target_width: int,
     spec: _SplitLoadSpec,
+    input_height: int = 6,
 ) -> Tuple[np.ndarray, np.ndarray]:
     ws_dir = Path(base_path) / format_window_dir_name(window_size_sec) / user_id
     csv_path = ws_dir / f"{split}.csv"
@@ -422,6 +406,7 @@ def _load_split_windows(
         target_user=user_id,
         target_width=target_width,
         keep_all_subjects=keep_all_subjects,
+        input_height=input_height,
     )
 
     for window, label in iterator:
@@ -468,7 +453,7 @@ def _load_split_windows(
             neg_windows = [neg_windows[i] for i in idx]
 
     if not pos_windows and not neg_windows:
-        empty_x = np.empty((0, 1, 6, target_width), dtype=np.float32)
+        empty_x = np.empty((0, 1, int(input_height), target_width), dtype=np.float32)
         empty_y = np.empty((0,), dtype=np.int64)
         return empty_x, empty_y
 
@@ -489,18 +474,20 @@ def iter_windows_from_csv_unlabeled_with_session(
     *,
     window_size_sec: float,
     target_width: int,
+    input_height: int = 6,
 ) -> Iterator[Tuple[str, str, str, np.ndarray]]:
     """
     Iterate windows from a server-formatted CSV without assigning labels, keeping session metadata.
 
     Yields: (window_id, subject, session, window) where:
-      - window is float32 shaped (1, 6, target_width)
+      - window is float32 shaped (1, H, target_width)
 
     Notes:
       - Window boundaries are determined by `window_id`.
       - If a window mixes subjects/sessions or has extra/missing rows, it is skipped.
     """
     window_points = _window_points(window_size_sec)
+    selected_axes = axis_columns(input_height)
     if not csv_path.exists():
         raise FileNotFoundError(f"Missing window CSV: {csv_path}")
 
@@ -517,12 +504,7 @@ def iter_windows_from_csv_unlabeled_with_session(
             idx_subject = lookup["subject"]
             idx_session = lookup["session"]
             idx_window_id = lookup["window_id"]
-            idx_acc_x = lookup["acc_x"]
-            idx_acc_y = lookup["acc_y"]
-            idx_acc_z = lookup["acc_z"]
-            idx_gyr_x = lookup["gyr_x"]
-            idx_gyr_y = lookup["gyr_y"]
-            idx_gyr_z = lookup["gyr_z"]
+            axis_indices = [lookup[name] for name in selected_axes]
         except KeyError as exc:
             raise ValueError(f"Unexpected CSV header for {csv_path}: {header}") from exc
 
@@ -531,7 +513,7 @@ def iter_windows_from_csv_unlabeled_with_session(
         current_session: Optional[str] = None
         skip_window = False
         filled = 0
-        window_raw = np.empty((6, window_points), dtype=np.float32)
+        window_raw = np.empty((len(selected_axes), window_points), dtype=np.float32)
 
         def _flush_current() -> Optional[Tuple[str, str, str, np.ndarray]]:
             nonlocal filled
@@ -592,19 +574,8 @@ def iter_windows_from_csv_unlabeled_with_session(
                 skip_window = True
                 continue
 
-            acc_x = float(row[idx_acc_x])
-            acc_y = float(row[idx_acc_y])
-            acc_z = float(row[idx_acc_z])
-            gyr_x = float(row[idx_gyr_x])
-            gyr_y = float(row[idx_gyr_y])
-            gyr_z = float(row[idx_gyr_z])
-
-            window_raw[0, filled] = acc_x
-            window_raw[1, filled] = acc_y
-            window_raw[2, filled] = acc_z
-            window_raw[3, filled] = gyr_x
-            window_raw[4, filled] = gyr_y
-            window_raw[5, filled] = gyr_z
+            for axis_idx, csv_idx in enumerate(axis_indices):
+                window_raw[axis_idx, filled] = float(row[csv_idx])
             filled += 1
 
 
@@ -623,6 +594,7 @@ def prepare_user_datasets(
     base_path: Optional[Path] = None,
     full_scan_eval: bool = False,
     seed: int = 42,
+    input_height: int = 6,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Load train/val/test window tensors for a given *target_user*.
@@ -661,6 +633,7 @@ def prepare_user_datasets(
         split="train",
         target_width=target_width,
         spec=train_spec,
+        input_height=input_height,
     )
     val_x, val_y = _load_split_windows(
         base_path=base_path,
@@ -669,6 +642,7 @@ def prepare_user_datasets(
         split="val",
         target_width=target_width,
         spec=eval_spec,
+        input_height=input_height,
     )
     test_x, test_y = _load_split_windows(
         base_path=base_path,
@@ -677,12 +651,14 @@ def prepare_user_datasets(
         split="test",
         target_width=target_width,
         spec=eval_spec,
+        input_height=input_height,
     )
 
     logger.info(
-        "[DATA] user=%s ws=%s target_width=%s train=%d val(pos=%d,neg=%d) test(pos=%d,neg=%d)",
+        "[DATA] user=%s ws=%s input_height=%d target_width=%s train=%d val(pos=%d,neg=%d) test(pos=%d,neg=%d)",
         target_user,
         ws_tag,
+        int(input_height),
         target_width,
         len(train_y),
         int((val_y == 1).sum()),
@@ -702,6 +678,7 @@ def load_user_train_windows(
     base_path: Path,
     seed: int = 42,
     max_train_windows: Optional[int] = None,
+    input_height: int = 6,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Load **only** the train split windows (genuine-only) for a given target_user.
@@ -729,6 +706,7 @@ def load_user_train_windows(
         split="train",
         target_width=int(target_width),
         spec=train_spec,
+        input_height=input_height,
     )
 
     if max_train_windows is not None and int(max_train_windows) > 0 and int(train_x.shape[0]) > int(max_train_windows):

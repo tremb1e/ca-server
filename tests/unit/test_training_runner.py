@@ -6,6 +6,7 @@ import sys
 import pytest
 
 from src.training import runner as training_runner
+from src.training.runner import _resolve_user_input_height, _vqgan_config
 from src.training.runner import _read_best_window, run_window_sweep_for_user
 
 
@@ -194,3 +195,23 @@ def test_run_window_sweep_does_not_reuse_stale_channel_checkpoint(tmp_path, monk
         (models_root / user_id / "checkpoints" / f"vqgan_user_{user_id}_ws_0.2.json").read_text(encoding="utf-8")
     )
     assert cfg["input_height"] == 6
+
+
+def test_sensor_mode_controls_vqgan_input_height(tmp_path) -> None:
+    dataset = tmp_path / "processed" / "window"
+    mode_dir = tmp_path / "processed" / "z-score" / "u9"
+    dataset.mkdir(parents=True)
+    mode_dir.mkdir(parents=True)
+    (mode_dir / "sensor_mode.json").write_text(
+        json.dumps({"input_height": 9}), encoding="utf-8"
+    )
+    assert _resolve_user_input_height("u9", dataset) == 9
+    cfg = _vqgan_config(
+        20,
+        input_height=9,
+        base_channels=96,
+        latent_dim=256,
+        codebook_vectors=512,
+        beta=0.25,
+    )
+    assert cfg["input_height"] == 9

@@ -157,10 +157,17 @@ def test_missing_threshold_strategy_rejected(tmp_path, monkeypatch) -> None:
 
 def test_wrong_input_height_rejected(tmp_path, monkeypatch) -> None:
     mgr, models_root, processed_root, _ = _mgr(tmp_path, monkeypatch)
-    _seed(models_root, processed_root, "u1", extra=READY, input_height=9)
+    _seed(models_root, processed_root, "u1", extra=READY, input_height=12)
     ok, reason = mgr.check_trained_model("u1")
     assert ok is False
     assert "input_height" in reason
+
+
+def test_healthy_nine_axis_model_accepted(tmp_path, monkeypatch) -> None:
+    mgr, models_root, processed_root, _ = _mgr(tmp_path, monkeypatch)
+    _seed(models_root, processed_root, "u1", extra=READY, input_height=9)
+    ok, reason = mgr.check_trained_model("u1")
+    assert ok is True, reason
 
 
 def test_genuine_band_rejects_far_threshold(tmp_path, monkeypatch) -> None:

@@ -273,7 +273,7 @@ curl -H "X-Management-API-Key: ${API_KEY}" \
 | `processed.windows` | 各窗口尺寸下的 train/val/test 文件信息 |
 | `inference.sessions` | inference 目录下 session 数 |
 | `training.status` | `pending`、`in_progress`、`completed`、`failed` |
-| `model.ready` | 模型是否通过就绪校验（policy、checkpoint、config、scaler 齐全且阈值/策略字段合法，`input_height == 6`）|
+| `model.ready` | 模型是否通过就绪校验（policy、checkpoint、config、scaler 齐全且阈值/策略字段合法，`input_height` 为 6 或 9，且与可用的 `sensor_mode.json` 一致）|
 | `active_auth_sessions` | 当前内存中的活跃认证会话 |
 
 ### 2.5 获取 raw session 文件列表
@@ -728,12 +728,12 @@ rpc StartAuthentication(AuthSessionRequest) returns (AuthSessionResponse)
 | --- | --- |
 | `data_insufficient: <current>MB/<required>MB` | 数据不足，不能训练/认证 |
 | `training_in_progress` | 数据已足够，服务端已触发或正在训练 |
-| `model_not_ready: ...` | 模型未通过 `check_trained_model` 校验（policy/checkpoint/config/scaler 缺失或不可用、阈值异常、策略字段缺失、`input_height != 6` 等）|
+| `model_not_ready: ...` | 模型未通过 `check_trained_model` 校验（policy/checkpoint/config/scaler 缺失或不可用、阈值异常、策略字段缺失、`input_height` 不是 6/9、质量报告与模型轴数不一致等）|
 | `invalid_identifier: ...` | 设备 ID 或 session ID 不符合路径安全规则 |
 
 模型就绪判定说明：
 
-- `StartAuthentication` 通过 `check_trained_model` 取得 `(是否就绪, 原因)`。校验内容包括 `best_lock_policy.json` / `vqgan_checkpoint` / `vqgan_config` / `processed_data/z-score/<user>/scaler.json` 是否齐全可解析、VQGAN 配置 `input_height == 6`、阈值为有限值（拒绝 `inf`/`nan`/`sys.float_info.max` 及 `|阈值| >= 1e6`）、策略含 `threshold_strategy`/`decision_strategy`/`score_metric`/`score_scale` 四字段、阈值落在训练/验证集 genuine 分数分位范围附近（带 margin）；会话启动时把校验详情写入 `inference/<device>/<session>/model_validation.json`。
+- `StartAuthentication` 通过 `check_trained_model` 取得 `(是否就绪, 原因)`。校验内容包括 `best_lock_policy.json` / `vqgan_checkpoint` / `vqgan_config` / `processed_data/z-score/<user>/scaler.json` 是否齐全可解析、VQGAN 配置 `input_height ∈ {6,9}`、存在 `sensor_mode.json` 时轴数与模型一致、阈值为有限值（拒绝 `inf`/`nan`/`sys.float_info.max` 及 `|阈值| >= 1e6`）、策略含必要字段、阈值落在训练/验证集 genuine 分数分位范围附近（带 margin）；会话启动时把校验详情写入 `inference/<device>/<session>/model_validation.json`。
 - 认证启动默认只接受正式策略（`policy_status="ready"` 且 `policy_search_completed=true`）；当 `auth.allow_training_fallback_policy=true`（默认 `false`）时，缺少正式策略才允许回退到 `training_fallback_policy.json` 降级运行。
 - 当某设备没有可用模型（从未训练 / 训练中断 / 已完成但校验不通过）时，`StartAuthentication` 会以 `force=True` 触发（重）训练，绕过节流与“持久化 `in_progress` 但无存活任务”的死锁判定。
 

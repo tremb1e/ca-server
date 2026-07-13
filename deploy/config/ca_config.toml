@@ -46,6 +46,16 @@ hmog_max_rows_per_subject = 0
 # 0 表示不限制。
 hmog_max_rows_total = 0
 
+# 磁力计质量检测（单位：微特斯拉 uT）。对每条三轴数据计算模长：
+#   magnitude = sqrt(mag_x^2 + mag_y^2 + mag_z^2)
+# 参考用户 -OzOz6... 的前 300MB 数据：P99=113.93uT，>120uT 占 0.682%；
+# 因而使用 120uT 固定阈值并容忍至多 1% 瞬时尖峰。超过比例、有效覆盖低于
+# 95% 或有效样本少于 100 时，持久化 input_height=6；否则 input_height=9。
+magnetometer_max_magnitude_ut = 120.0
+magnetometer_max_outlier_ratio = 0.01
+magnetometer_min_coverage_ratio = 0.95
+magnetometer_min_samples = 100
+
 [windows]
 # 训练 / 认证 / 数据处理需要的时间窗口列表（秒）。
 # 当前需求：w=0.2s。

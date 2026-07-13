@@ -42,9 +42,9 @@ def load_vqgan(vqgan_ckpt: Path, *, device: torch.device, cfg_path: Optional[Pat
     if not cfg_path.exists():
         raise FileNotFoundError(f"Missing VQGAN config json: {cfg_path}")
     cfg = _load_json(cfg_path)
-    input_height = int(cfg.get("input_height", 6))
-    if input_height != 6:
-        raise ValueError(f"VQGAN config {cfg_path} has input_height={input_height}; 6-axis input is required.")
+    input_height = int(cfg.get("input_height", 0))
+    if input_height not in (6, 9):
+        raise ValueError(f"VQGAN config {cfg_path} has unsupported input_height={input_height}; expected 6 or 9.")
     args = argparse.Namespace(**cfg)
     # The VQGAN module expects these attribute names.
     args.use_nonlocal = bool(cfg.get("use_nonlocal", True))
@@ -154,6 +154,10 @@ def main() -> None:
     csv_path = Path(args.csv_path)
 
     target_width = int(args.target_width) if int(args.target_width) > 0 else int(round(float(args.window_size) * 100))
+    vqgan_cfg = _load_json(Path(args.vqgan_config) if args.vqgan_config else _default_config_path(Path(args.vqgan_checkpoint)))
+    input_height = int(vqgan_cfg.get("input_height", 0))
+    if input_height not in (6, 9):
+        raise ValueError(f"Unsupported input_height={input_height}; expected 6 or 9")
 
     vote_window_size = int(getattr(args, "vote_window_size", 0) or 0)
     vote_min_rejects = int(getattr(args, "vote_min_rejects", 0) or 0)
@@ -307,6 +311,7 @@ def main() -> None:
             csv_path,
             window_size_sec=float(args.window_size),
             target_width=target_width,
+            input_height=input_height,
         ),
         start=1,
     ):

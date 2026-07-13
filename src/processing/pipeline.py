@@ -14,6 +14,12 @@ import pandas as pd
 from ..ca_config import get_ca_config
 from ..config import settings
 from ..utils.runtime import app_root
+from .magnetometer import (
+    NINE_AXIS_COLUMNS,
+    assess_magnetometer,
+    axis_columns,
+    write_sensor_mode,
+)
 from .scaler import apply_scaler, write_scaler
 
 logger = logging.getLogger(__name__)
@@ -29,14 +35,7 @@ SENSOR_TYPE_TO_PREFIX = {
 }
 
 
-FEATURE_COLUMNS = [
-    "acc_x",
-    "acc_y",
-    "acc_z",
-    "gyr_x",
-    "gyr_y",
-    "gyr_z",
-]
+FEATURE_COLUMNS = list(NINE_AXIS_COLUMNS)
 
 
 # Windowing can generate very large intermediate outputs. Flush to disk in
@@ -74,6 +73,10 @@ class ProcessingConfig:
     hmog_balance_ratio: float
     hmog_max_rows_per_subject: Optional[int]
     hmog_max_rows_total: Optional[int]
+    magnetometer_max_magnitude_ut: float = 120.0
+    magnetometer_max_outlier_ratio: float = 0.01
+    magnetometer_min_coverage_ratio: float = 0.95
+    magnetometer_min_samples: int = 100
     acc_unit: str = "m/s^2"
     gyr_unit: str = "rad/s"
     mag_unit: str = "uT"
@@ -176,6 +179,10 @@ def build_config() -> ProcessingConfig:
         hmog_balance_ratio=hmog_balance_ratio,
         hmog_max_rows_per_subject=hmog_max_rows_per_subject,
         hmog_max_rows_total=hmog_max_rows_total,
+        magnetometer_max_magnitude_ut=float(ca_cfg.processing.magnetometer_max_magnitude_ut),
+        magnetometer_max_outlier_ratio=float(ca_cfg.processing.magnetometer_max_outlier_ratio),
+        magnetometer_min_coverage_ratio=float(ca_cfg.processing.magnetometer_min_coverage_ratio),
+        magnetometer_min_samples=int(ca_cfg.processing.magnetometer_min_samples),
         acc_unit=getattr(settings, "hmog_acc_unit", "m/s^2"),
         gyr_unit=getattr(settings, "hmog_gyr_unit", "rad/s"),
         mag_unit=getattr(settings, "hmog_mag_unit", "uT"),
@@ -346,11 +353,20 @@ def _resample_records(records: Dict[str, List[Dict]], session_label: str, user_i
     )
 
     combined = pd.DataFrame(index=base_index)
-    for sensor in ("acc", "gyr"):
+    for sensor in ("acc", "gyr", "mag"):
         data = records.get(sensor, [])
         if not data:
-            logger.warning("Missing %s data in session %s (user %s)", sensor, session_label, user_id)
-            return None
+            if sensor != "mag":
+                logger.warning("Missing %s data in session %s (user %s)", sensor, session_label, user_id)
+                return None
+            logger.info(
+                "Missing magnetometer data in session %s (user %s); retaining session for possible 6-axis mode",
+                session_label,
+                user_id,
+            )
+            for axis in ("x", "y", "z"):
+                combined[f"mag_{axis}"] = np.nan
+            continue
         df = pd.DataFrame(data)
         df = df.drop_duplicates(subset="timestamp")
         df["timestamp_dt"] = pd.to_datetime(df["timestamp"], unit="ms")
@@ -361,7 +377,10 @@ def _resample_records(records: Dict[str, List[Dict]], session_label: str, user_i
         combined[f"{sensor}_y"] = aligned["y"]
         combined[f"{sensor}_z"] = aligned["z"]
 
-    combined = combined.dropna()
+    # Acceleration and gyroscope are mandatory for both modes. Magnetometer
+    # NaNs are retained here so the per-user quality assessment can measure
+    # coverage and downgrade the complete training run to 6 axes when needed.
+    combined = combined.dropna(subset=list(axis_columns(6)))
     if combined.empty:
         logger.warning("Resampled data empty for session %s (user %s)", session_label, user_id)
         return None
@@ -372,7 +391,7 @@ def _resample_records(records: Dict[str, List[Dict]], session_label: str, user_i
     combined.insert(1, "session", session_label)
     combined = combined[
         ["subject", "session", "timestamp"]
-        + [f"{prefix}_{axis}" for prefix in ("acc", "gyr") for axis in ("x", "y", "z")]
+        + [f"{prefix}_{axis}" for prefix in ("acc", "gyr", "mag") for axis in ("x", "y", "z")]
     ]
     return combined
 
@@ -748,8 +767,11 @@ def _coerce_hmog_schema(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _compute_scaler(train_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    features = train_df[FEATURE_COLUMNS]
+def _compute_scaler(
+    train_df: pd.DataFrame,
+    feature_columns: Sequence[str] = FEATURE_COLUMNS,
+) -> Dict[str, Dict[str, float]]:
+    features = train_df[list(feature_columns)]
     mean = features.mean()
     # Match sklearn's StandardScaler (population std, ddof=0).
     std = features.std(ddof=0)
@@ -1036,6 +1058,28 @@ def process_user(user_id: str, cfg: Optional[ProcessingConfig] = None) -> None:
         logger.warning("No processed data for user %s", user_id)
         return
 
+    sensor_mode = assess_magnetometer(
+        user_df,
+        max_magnitude_ut=cfg.magnetometer_max_magnitude_ut,
+        max_outlier_ratio=cfg.magnetometer_max_outlier_ratio,
+        min_coverage_ratio=cfg.magnetometer_min_coverage_ratio,
+        min_samples=cfg.magnetometer_min_samples,
+    )
+    input_height = int(sensor_mode["input_height"])
+    selected_features = list(axis_columns(input_height))
+    if input_height == 9:
+        # The quality gate guarantees high coverage. Remove the small incomplete
+        # remainder so a 9-axis tensor can never contain NaN values.
+        user_df = user_df.dropna(subset=list(NINE_AXIS_COLUMNS)).reset_index(drop=True)
+    logger.info(
+        "Magnetometer quality user=%s input_height=%d outlier_ratio=%.6f coverage=%.6f reasons=%s",
+        user_id,
+        input_height,
+        float(sensor_mode["statistics"]["outlier_ratio"]),
+        float(sensor_mode["statistics"]["coverage_ratio"]),
+        sensor_mode["reasons"],
+    )
+
     splits = _split_by_ratio(user_df, cfg)
     if splits["train"].empty:
         logger.warning("User %s training split is empty, skipping", user_id)
@@ -1119,8 +1163,10 @@ def process_user(user_id: str, cfg: Optional[ProcessingConfig] = None) -> None:
     user_processed_dir = cfg.processed_root / user_id
     _write_split_csvs(splits, user_processed_dir)
 
-    scaler = _compute_scaler(splits["train"])
+    scaler = _compute_scaler(splits["train"], selected_features)
     _write_scaler(scaler, cfg.zscore_root / user_id)
+    mode_path = write_sensor_mode(sensor_mode, cfg.zscore_root / user_id)
+    logger.info("Saved sensor mode to %s", mode_path)
 
     normalized = {name: _apply_scaler(df, scaler) for name, df in splits.items()}
     _write_split_csvs(normalized, cfg.zscore_root / user_id)

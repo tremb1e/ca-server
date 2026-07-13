@@ -11,15 +11,9 @@ import torch
 
 from ..utils.accelerator import autocast_context
 from ..utils.ca_train import ensure_ca_train_on_path
+from ..processing.magnetometer import axis_columns
 
-AXIS_COLUMNS = (
-    "acc_x",
-    "acc_y",
-    "acc_z",
-    "gyr_x",
-    "gyr_y",
-    "gyr_z",
-)
+AXIS_COLUMNS = axis_columns(6)  # backwards-compatible public alias
 
 
 @dataclass(frozen=True)
@@ -38,6 +32,7 @@ class VQGANPolicy:
     vote_min_rejects: int = 0
     ema_alpha: float = 0.25
     model_version: str = ""
+    input_height: int = 6
 
 
 def _resample_time_axis(window: np.ndarray, target_width: int) -> np.ndarray:
@@ -60,8 +55,8 @@ def load_vqgan(checkpoint: Path, *, device: torch.device, config_path: Path) -> 
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(cfg, dict):
         raise ValueError(f"Unexpected VQGAN config format: {config_path}")
-    if int(cfg.get("input_height", 6)) != 6:
-        raise ValueError(f"VQGAN config {config_path} uses input_height={cfg.get('input_height')}; retrain with 6-axis input.")
+    input_height = int(cfg.get("input_height", 0))
+    axis_columns(input_height)
     args = argparse.Namespace(**cfg)
     args.use_nonlocal = bool(cfg.get("use_nonlocal", True))
     model = VQGAN(args).to(device)
@@ -102,13 +97,17 @@ def windowize_dataframe(
     overlap: float,
     sampling_rate_hz: int,
     target_width: int,
+    input_height: int = 6,
 ) -> Tuple[List[int], np.ndarray]:
+    selected_axes = axis_columns(input_height)
     if df.empty:
-        return [], np.empty((0, 1, 6, target_width), dtype=np.float32)
+        return [], np.empty((0, 1, int(input_height), target_width), dtype=np.float32)
 
     window_points = max(1, int(round(window_size_sec * sampling_rate_hz)))
     step_points = max(1, int(round(window_points * (1.0 - float(overlap)))))
-    values = df[list(AXIS_COLUMNS)].to_numpy(dtype=np.float32, copy=False)
+    values = df[list(selected_axes)].to_numpy(dtype=np.float32, copy=False)
+    if not np.isfinite(values).all():
+        raise ValueError(f"Non-finite sensor values for input_height={input_height}")
 
     window_ids: List[int] = []
     windows: List[np.ndarray] = []
@@ -123,6 +122,6 @@ def windowize_dataframe(
         window_id += 1
 
     if not windows:
-        return [], np.empty((0, 1, 6, target_width), dtype=np.float32)
+        return [], np.empty((0, 1, int(input_height), target_width), dtype=np.float32)
 
     return window_ids, np.stack(windows, axis=0).astype(np.float32, copy=False)

@@ -196,6 +196,7 @@ class AuthSessionManager:
             vote_min_rejects=vote_min_rejects,
             ema_alpha=ema_alpha,
             model_version=cfg.model_version or cfg.vqgan_checkpoint.name,
+            input_height=int(cfg.input_height),
         )
 
     @staticmethod
@@ -350,12 +351,24 @@ class AuthSessionManager:
         if cfg.vqgan_config:
             try:
                 model_cfg = json.loads(cfg.vqgan_config.read_text(encoding="utf-8"))
-                if int(model_cfg.get("input_height", 6)) != 6:
+                input_height = int(model_cfg.get("input_height", 0))
+                if input_height not in (6, 9):
                     return (
                         False,
-                        f"unsupported model input_height: {model_cfg.get('input_height')}",
+                        f"unsupported model input_height: {input_height}",
                         _build_details(threshold_finite=True, genuine_band_ok=True),
                     )
+                mode_path = scaler_path.parent / "sensor_mode.json"
+                if mode_path.exists():
+                    from ..processing.magnetometer import load_sensor_mode
+
+                    persisted_height = int(load_sensor_mode(mode_path)["input_height"])
+                    if persisted_height != input_height:
+                        return (
+                            False,
+                            f"sensor mode/model mismatch: sensor_mode={persisted_height}, model={input_height}",
+                            _build_details(threshold_finite=True, genuine_band_ok=True),
+                        )
             except Exception as exc:
                 return False, f"invalid config: {exc}", _build_details(threshold_finite=True, genuine_band_ok=True)
 
@@ -439,6 +452,7 @@ class AuthSessionManager:
             "window_size": float(policy.window_size),
             "overlap": float(policy.overlap),
             "target_width": int(policy.target_width),
+            "input_height": int(policy.input_height),
             "threshold": float(policy.threshold),
             "k_rejects": int(policy.k_rejects),
             "interrupt_rule": str(policy.interrupt_rule),
@@ -542,6 +556,19 @@ class AuthSessionManager:
                 self._trim_tail(state, combined_records)
                 return None
 
+            from ..processing.magnetometer import axis_columns
+
+            required_axes = list(axis_columns(state.policy.input_height))
+            # Real preprocessing returns a DataFrame with all sensor columns.
+            # Keep lightweight test/custom adapters compatible by only applying
+            # the completeness filter when that DataFrame contract is present.
+            columns = getattr(df, "columns", None)
+            if columns is not None and all(col in columns for col in required_axes):
+                df = df.dropna(subset=required_axes)
+                if df.empty:
+                    self._trim_tail(state, combined_records)
+                    return None
+
             scaler_path = Path(settings.processed_data_path) / "z-score" / user_id / "scaler.json"
             if not scaler_path.exists():
                 return None
@@ -554,6 +581,7 @@ class AuthSessionManager:
                 overlap=state.policy.overlap,
                 sampling_rate_hz=self._processing_cfg.sampling_rate_hz,
                 target_width=state.policy.target_width,
+                input_height=state.policy.input_height,
             )
 
             if windows.size == 0:

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..ca_config import CAConfig, get_ca_config
+from ..processing.magnetometer import infer_input_height_from_csv, load_sensor_mode
 from ..utils.accelerator import normalize_device
 from ..utils.ca_train import ca_train_command, ca_train_script
 from ..utils.policy_paths import serialize_policy_path
@@ -62,21 +63,43 @@ def _pick_workers() -> Tuple[int, int]:
     return max(0, int(num_workers)), max(1, int(cpu_threads))
 
 
-# 当前模型输入高度（传感器轴数）：6 = 加速度计(x,y,z) + 陀螺仪(x,y,z)，已移除磁力计。
-VQGAN_INPUT_HEIGHT = 6
-
-
-def _vqgan_config(target_width: int, *, base_channels: int, latent_dim: int, codebook_vectors: int, beta: float) -> Dict:
+def _vqgan_config(
+    target_width: int,
+    *,
+    input_height: int,
+    base_channels: int,
+    latent_dim: int,
+    codebook_vectors: int,
+    beta: float,
+) -> Dict:
     return {
         "base_channels": int(base_channels),
         "latent_dim": int(latent_dim),
         "num_codebook_vectors": int(codebook_vectors),
         "beta": float(beta),
         "image_channels": 1,
-        "input_height": int(VQGAN_INPUT_HEIGHT),
+        "input_height": int(input_height),
         "input_width": int(target_width),
         "use_nonlocal": True,
     }
+
+
+def _resolve_user_input_height(user_id: str, dataset_path: Path) -> int:
+    processed_root = Path(dataset_path).parent
+    mode_path = processed_root / "z-score" / str(user_id) / "sensor_mode.json"
+    if mode_path.exists():
+        return int(load_sensor_mode(mode_path)["input_height"])
+    # Compatibility with datasets created before sensor_mode.json. New
+    # preprocessing always writes the explicit report.
+    candidates = sorted(Path(dataset_path).glob(f"*/{user_id}/train.csv"))
+    if not candidates:
+        logger.warning(
+            "Missing sensor_mode.json/window CSV for user=%s under %s; using legacy 6-axis fallback",
+            user_id,
+            dataset_path,
+        )
+        return 6
+    return int(infer_input_height_from_csv(candidates[0]))
 
 
 def _write_vqgan_config(cfg: Dict, checkpoint: Path) -> Path:
@@ -297,6 +320,7 @@ def run_window_sweep_for_user(
     results: List[TrainingRunResult] = []
 
     resolved_device = normalize_device(device)
+    input_height = _resolve_user_input_height(str(user_id), dataset_path)
 
     for ws in window_sizes:
         ws_f = float(ws)
@@ -310,8 +334,8 @@ def run_window_sweep_for_user(
         if reuse_checkpoints and best_summary_path.exists():
             try:
                 summary = _read_best_window(log_dir, user_id)
-                # 防止复用旧通道数（如历史 9 轴）的检查点：若缓存检查点的 input_height
-                # 与当前模型 (VQGAN_INPUT_HEIGHT) 不一致或缺失，则放弃复用、从头重训。
+                # 用户的磁力计质量可能随重新采集而改变；轴数不一致时旧 checkpoint
+                # 结构不可复用，必须从头训练。
                 cached_ckpt = Path(str((summary or {}).get("checkpoint") or ""))
                 cached_cfg = cached_ckpt.with_suffix(".json")
                 cached_height: Optional[int] = None
@@ -322,10 +346,10 @@ def run_window_sweep_for_user(
                         )
                     except Exception:
                         cached_height = None
-                if cached_height != int(VQGAN_INPUT_HEIGHT):
+                if cached_height != int(input_height):
                     summary = None
                     reuse_error = (
-                        f"cached checkpoint input_height={cached_height} != {VQGAN_INPUT_HEIGHT}; "
+                        f"cached checkpoint input_height={cached_height} != {input_height}; "
                         "retraining from scratch"
                     )
             except Exception as exc:
@@ -350,6 +374,8 @@ def run_window_sweep_for_user(
                 str(float(ca_cfg.windows.overlap)),
                 "--target-width",
                 str(int(target_width)),
+                "--input-height",
+                str(int(input_height)),
                 "--device",
                 str(resolved_device),
                 "--batch-size",
@@ -392,6 +418,7 @@ def run_window_sweep_for_user(
 
         vqgan_cfg = _vqgan_config(
             target_width,
+            input_height=input_height,
             base_channels=int(summary.get("base_channels", 96) or 96),
             latent_dim=int(summary.get("latent_dim", 256) or 256),
             codebook_vectors=int(summary.get("num_codebook_vectors", 512) or 512),
@@ -409,6 +436,7 @@ def run_window_sweep_for_user(
         )
 
         summary["vqgan_config"] = str(vqgan_config)
+        summary["input_height"] = int(input_height)
         summary["threshold"] = threshold
         _write_training_summary(user_output_dir, summary)
         _write_vqgan_policy(
