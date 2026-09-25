@@ -7,6 +7,7 @@ from pathlib import Path
 
 import lz4.frame
 import pytest
+from ca_train.reconstruction import SENSOR_INPUT_MASKING_VERSION
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from fastapi import FastAPI
@@ -93,7 +94,14 @@ def _seed_contract_device(device_id: str = "contract-device") -> str:
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     checkpoint.write_bytes(b"contract-model")
     config.write_text(
-        json.dumps({"base_channels": 16, "latent_dim": 32, "input_height": 9, "input_width": 20}),
+        json.dumps({
+            "base_channels": 16,
+            "latent_dim": 32,
+            "input_height": 9,
+            "input_width": 20,
+            "sensor_weights": [0.5, 0.5, 0.0],
+            "sensor_input_masking_version": SENSOR_INPUT_MASKING_VERSION,
+        }),
         encoding="utf-8",
     )
     (model_dir / "best_lock_policy.json").write_text(

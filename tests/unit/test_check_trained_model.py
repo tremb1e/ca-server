@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ca_train.reconstruction import SENSOR_INPUT_MASKING_VERSION
 from src.authentication import manager as auth_manager_mod
 from src.authentication.manager import AuthSessionManager
 
@@ -35,7 +36,12 @@ def _seed(
     (user_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     (user_dir / "checkpoints" / "vqgan.pt").write_bytes(b"model")
     (user_dir / "checkpoints" / "vqgan.json").write_text(
-        json.dumps({"input_height": input_height, "input_width": 20}), encoding="utf-8"
+        json.dumps({
+            "input_height": input_height,
+            "input_width": 20,
+            "sensor_weights": [0.5, 0.5, 0.0],
+            "sensor_input_masking_version": SENSOR_INPUT_MASKING_VERSION,
+        }), encoding="utf-8"
     )
     policy = {
         "user": user,
@@ -69,6 +75,7 @@ def _mgr(tmp_path, monkeypatch, *, allow_fb: bool = False):
     monkeypatch.setattr(auth_manager_mod.settings, "inference_storage_path", inference_root)
     monkeypatch.setattr(auth_manager_mod.settings, "data_storage_path", tmp_path / "raw")
     ca_cfg = SimpleNamespace(
+        training=SimpleNamespace(sensor_weights=(0.5, 0.5, 0.0)),
         auth=SimpleNamespace(
             allow_training_fallback_policy=allow_fb,
             decision_strategy="ema",
@@ -168,6 +175,37 @@ def test_healthy_nine_axis_model_accepted(tmp_path, monkeypatch) -> None:
     _seed(models_root, processed_root, "u1", extra=READY, input_height=9)
     ok, reason = mgr.check_trained_model("u1")
     assert ok is True, reason
+
+
+def test_legacy_model_keeps_its_existing_policy(tmp_path, monkeypatch) -> None:
+    mgr, models_root, processed_root, _ = _mgr(tmp_path, monkeypatch)
+    _seed(models_root, processed_root, "u1", extra=READY, input_height=9)
+    config_path = models_root / "u1" / "checkpoints" / "vqgan.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.pop("sensor_weights")
+    config.pop("sensor_input_masking_version")
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    ok, reason = mgr.check_trained_model("u1")
+    assert ok is True, reason
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason_part"),
+    [
+        ("sensor_weights", [1.0, 0.0, 0.0], "sensor weights/model mismatch"),
+        ("sensor_input_masking_version", 0, "sensor input masking version/model mismatch"),
+    ],
+)
+def test_stale_sensor_model_rejected(tmp_path, monkeypatch, field, value, reason_part) -> None:
+    mgr, models_root, processed_root, _ = _mgr(tmp_path, monkeypatch)
+    _seed(models_root, processed_root, "u1", extra=READY)
+    config_path = models_root / "u1" / "checkpoints" / "vqgan.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config[field] = value
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    ok, reason = mgr.check_trained_model("u1")
+    assert ok is False
+    assert reason_part in reason
 
 
 def test_genuine_band_rejects_far_threshold(tmp_path, monkeypatch) -> None:

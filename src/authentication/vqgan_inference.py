@@ -9,6 +9,8 @@ from typing import Iterable, List, Sequence, Tuple
 import numpy as np
 import torch
 
+from ca_train.reconstruction import reconstruction_errors
+
 from ..utils.accelerator import autocast_context
 from ..utils.ca_train import ensure_ca_train_on_path
 from ..processing.magnetometer import axis_columns
@@ -82,11 +84,13 @@ def score_windows(
         batch = torch.from_numpy(batch_np).to(device=device, dtype=torch.float32, non_blocking=True)
         with autocast_context(device, enabled=bool(use_amp)):
             decoded, _, _ = model(batch)
-            if score_metric == "l1":
-                errors = torch.mean(torch.abs(batch - decoded), dim=(1, 2, 3))
-            else:
-                errors = torch.mean((batch - decoded) ** 2, dim=(1, 2, 3))
-        scores.append((-errors).detach().cpu().numpy())
+        if decoded.shape != batch.shape:
+            raise ValueError(f"Reconstruction shape mismatch: {decoded.shape} != {batch.shape}")
+        errors = reconstruction_errors(model, batch, decoded, metric=score_metric)
+        batch_scores = (-errors).detach().cpu().numpy()
+        if not np.isfinite(batch_scores).all():
+            raise ValueError("Model produced non-finite authentication scores")
+        scores.append(batch_scores)
     return np.concatenate(scores, axis=0).astype(np.float32, copy=False)
 
 

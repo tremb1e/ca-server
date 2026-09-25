@@ -30,6 +30,7 @@ common_hidden_imports=(
   hmog_vqgan_experiment
   hmog_vqgan_token_transformer_experiment
   platformdirs
+  reconstruction
   runtime_paths
   vqgan
 )

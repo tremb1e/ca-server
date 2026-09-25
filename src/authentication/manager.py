@@ -358,6 +358,22 @@ class AuthSessionManager:
                         f"unsupported model input_height: {input_height}",
                         _build_details(threshold_finite=True, genuine_band_ok=True),
                     )
+                from ca_train.reconstruction import SENSOR_INPUT_MASKING_VERSION, validate_sensor_weights
+
+                configured_weights = validate_sensor_weights(get_ca_config().training.sensor_weights)
+                model_weights = validate_sensor_weights(model_cfg.get("sensor_weights"))
+                if model_weights is not None and model_weights != configured_weights:
+                    return (
+                        False,
+                        f"sensor weights/model mismatch: configured={configured_weights}, model={model_weights}",
+                        _build_details(threshold_finite=True, genuine_band_ok=True),
+                    )
+                if model_weights is not None and model_cfg.get("sensor_input_masking_version") != SENSOR_INPUT_MASKING_VERSION:
+                    return (
+                        False,
+                        "sensor input masking version/model mismatch",
+                        _build_details(threshold_finite=True, genuine_band_ok=True),
+                    )
                 mode_path = scaler_path.parent / "sensor_mode.json"
                 if mode_path.exists():
                     from ..processing.magnetometer import load_sensor_mode

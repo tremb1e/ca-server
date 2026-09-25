@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from ca_train.reconstruction import DEFAULT_SENSOR_WEIGHTS, SENSOR_INPUT_MASKING_VERSION, validate_sensor_weights
+
 from ..ca_config import CAConfig, get_ca_config
 from ..processing.magnetometer import infer_input_height_from_csv, load_sensor_mode
 from ..utils.accelerator import normalize_device
@@ -87,6 +89,7 @@ def _vqgan_config(
     latent_dim: int,
     codebook_vectors: int,
     beta: float,
+    sensor_weights: Optional[Sequence[float]] = None,
 ) -> Dict:
     return {
         "base_channels": int(base_channels),
@@ -97,6 +100,8 @@ def _vqgan_config(
         "input_height": int(input_height),
         "input_width": int(target_width),
         "use_nonlocal": True,
+        "sensor_weights": validate_sensor_weights(sensor_weights),
+        "sensor_input_masking_version": SENSOR_INPUT_MASKING_VERSION,
     }
 
 
@@ -269,6 +274,7 @@ def _write_vqgan_policy(
         "vqgan_checkpoint": serialize_policy_path(vqgan_checkpoint, relative_to=policy_path.parent),
         "vqgan_config": serialize_policy_path(vqgan_config, relative_to=policy_path.parent),
         "model_version": vqgan_checkpoint.name,
+        "sensor_weights": json.loads(vqgan_config.read_text(encoding="utf-8")).get("sensor_weights"),
     }
     policy_path.write_text(json.dumps({str(user_id): policy}, indent=2, ensure_ascii=False), encoding="utf-8")
     return policy_path
@@ -328,6 +334,9 @@ def run_window_sweep_for_user(
     if vqgan_epochs is None:
         vqgan_epochs = int(getattr(training_cfg, "max_epochs", 50))
     effective_batch_size = int(batch_size) if batch_size is not None else int(getattr(training_cfg, "batch_size", 128))
+    sensor_weights = validate_sensor_weights(getattr(training_cfg, "sensor_weights", DEFAULT_SENSOR_WEIGHTS))
+    if sensor_weights is None:
+        raise ValueError("training.sensor_weights must contain three weights")
 
     user_output_dir = models_root / user_id
     user_output_dir.mkdir(parents=True, exist_ok=True)
@@ -337,6 +346,8 @@ def run_window_sweep_for_user(
 
     resolved_device = normalize_device(device)
     input_height = _resolve_user_input_height(str(user_id), dataset_path)
+    if input_height == 6 and sum(sensor_weights[:2]) <= 0:
+        raise ValueError("Active sensor weights must have a positive sum")
 
     for ws in window_sizes:
         ws_f = float(ws)
@@ -355,19 +366,30 @@ def run_window_sweep_for_user(
                 cached_ckpt = Path(str((summary or {}).get("checkpoint") or ""))
                 cached_cfg = cached_ckpt.with_suffix(".json")
                 cached_height: Optional[int] = None
+                cached_weights = None
+                cached_masking_version = None
                 if cached_cfg.exists():
                     try:
-                        cached_height = int(
-                            json.loads(cached_cfg.read_text(encoding="utf-8")).get("input_height", -1)
-                        )
+                        cached_config = json.loads(cached_cfg.read_text(encoding="utf-8"))
+                        cached_height = int(cached_config.get("input_height", -1))
+                        cached_weights = validate_sensor_weights(cached_config.get("sensor_weights"))
+                        cached_masking_version = cached_config.get("sensor_input_masking_version")
                     except Exception:
                         cached_height = None
+                        cached_weights = None
+                        cached_masking_version = None
                 if cached_height != int(input_height):
                     summary = None
                     reuse_error = (
                         f"cached checkpoint input_height={cached_height} != {input_height}; "
                         "retraining from scratch"
                     )
+                elif cached_weights != sensor_weights or validate_sensor_weights(summary.get("sensor_weights")) != sensor_weights:
+                    summary = None
+                    reuse_error = "cached sensor weights differ; retraining from scratch"
+                elif cached_masking_version != SENSOR_INPUT_MASKING_VERSION or summary.get("sensor_input_masking_version") != SENSOR_INPUT_MASKING_VERSION:
+                    summary = None
+                    reuse_error = "cached sensor input masking version differs; retraining from scratch"
             except Exception as exc:
                 reuse_error = str(exc)
 
@@ -413,6 +435,8 @@ def run_window_sweep_for_user(
                 "--log-dir",
                 str(log_dir),
                 "--use-amp",
+                "--sensor-weights",
+                *(str(weight) for weight in sensor_weights),
             ]
 
             accelerator_index = _explicit_accelerator_index(str(resolved_device))
@@ -431,6 +455,8 @@ def run_window_sweep_for_user(
 
         if not isinstance(summary, dict):
             raise ValueError(f"Unexpected summary format in {log_dir}")
+        if validate_sensor_weights(summary.get("sensor_weights")) != sensor_weights:
+            raise ValueError("Training summary sensor_weights differ from configured weights")
 
         vqgan_checkpoint = Path(str(summary.get("checkpoint") or ""))
         if not vqgan_checkpoint.exists():
@@ -443,6 +469,7 @@ def run_window_sweep_for_user(
             latent_dim=int(summary.get("latent_dim", 256) or 256),
             codebook_vectors=int(summary.get("num_codebook_vectors", 512) or 512),
             beta=float(summary.get("beta", 0.25) or 0.25),
+            sensor_weights=summary.get("sensor_weights"),
         )
         vqgan_config = _write_vqgan_config(vqgan_cfg, vqgan_checkpoint)
 

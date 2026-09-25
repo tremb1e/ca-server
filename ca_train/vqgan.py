@@ -4,10 +4,12 @@ import torch.nn as nn
 from encoder import Encoder
 from decoder import Decoder
 from codebook import Codebook
+from reconstruction import mask_inactive_sensor_inputs, validate_sensor_weights
 from torchsummary import summary
 class VQGAN(nn.Module):
     def __init__(self, args):
         super(VQGAN, self).__init__()
+        self.sensor_weights = validate_sensor_weights(getattr(args, "sensor_weights", None))
         # Do not pin submodules to a device here; let the caller control `.to(device)`
         # so CPU fallback / multi-GPU setups work reliably.
         self.encoder = Encoder(args)
@@ -28,7 +30,7 @@ class VQGAN(nn.Module):
         #self.post_quant_conv = torch.nn.DataParallel(self.post_quant_conv, device_ids=[0,1])
 
     def forward(self, imgs):
-        encoded_images = self.encoder(imgs)
+        encoded_images = self.encoder(mask_inactive_sensor_inputs(imgs, self.sensor_weights))
         quant_conv_encoded_images = self.quant_conv(encoded_images)
         codebook_mapping, codebook_indices, q_loss = self.codebook(quant_conv_encoded_images)
         post_quant_conv_mapping = self.post_quant_conv(codebook_mapping)
@@ -37,7 +39,7 @@ class VQGAN(nn.Module):
         return decoded_images, codebook_indices, q_loss
 
     def encode(self, imgs):
-        encoded_images = self.encoder(imgs)
+        encoded_images = self.encoder(mask_inactive_sensor_inputs(imgs, self.sensor_weights))
         quant_conv_encoded_images = self.quant_conv(encoded_images)
         codebook_mapping, codebook_indices, q_loss = self.codebook(quant_conv_encoded_images)
         return codebook_mapping, codebook_indices, q_loss

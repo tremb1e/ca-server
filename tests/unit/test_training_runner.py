@@ -5,6 +5,7 @@ import sys
 
 import pytest
 
+from ca_train.reconstruction import DEFAULT_SENSOR_WEIGHTS
 from src.training import runner as training_runner
 from src.training.runner import _explicit_accelerator_index, _resolve_user_input_height, _vqgan_config
 from src.training.runner import _read_best_window, run_window_sweep_for_user
@@ -57,7 +58,7 @@ def test_run_window_sweep_retrains_when_cached_summary_has_other_user(tmp_path, 
     fake_ca_cfg = SimpleNamespace(
         windows=SimpleNamespace(sizes=[ws], sampling_rate_hz=100, overlap=0.5),
         auth=SimpleNamespace(max_decision_time_sec=2.0, ema_alpha=0.25, allow_training_fallback_policy=False),
-        training=SimpleNamespace(run_policy_search=False),
+        training=SimpleNamespace(run_policy_search=False, sensor_weights=DEFAULT_SENSOR_WEIGHTS),
     )
 
     calls: list[list[str]] = []
@@ -79,6 +80,7 @@ def test_run_window_sweep_retrains_when_cached_summary_has_other_user(tmp_path, 
                 "window": run_ws,
                 "val": {"threshold": -0.12},
                 "checkpoint": str(ckpt),
+                "sensor_weights": list(DEFAULT_SENSOR_WEIGHTS),
             }
         }
         run_log_dir.mkdir(parents=True, exist_ok=True)
@@ -153,7 +155,7 @@ def test_run_window_sweep_does_not_reuse_stale_channel_checkpoint(tmp_path, monk
     fake_ca_cfg = SimpleNamespace(
         windows=SimpleNamespace(sizes=[ws], sampling_rate_hz=100, overlap=0.5),
         auth=SimpleNamespace(max_decision_time_sec=2.0, ema_alpha=0.25, allow_training_fallback_policy=False),
-        training=SimpleNamespace(run_policy_search=False),
+        training=SimpleNamespace(run_policy_search=False, sensor_weights=DEFAULT_SENSOR_WEIGHTS),
     )
 
     calls: list[list[str]] = []
@@ -169,7 +171,7 @@ def test_run_window_sweep_does_not_reuse_stale_channel_checkpoint(tmp_path, monk
         ckpt.write_text("fresh", encoding="utf-8")
         run_log_dir.mkdir(parents=True, exist_ok=True)
         (run_log_dir / "best_windows.json").write_text(
-            json.dumps({run_user: {"user": run_user, "window": run_ws, "val": {"threshold": -0.1}, "checkpoint": str(ckpt)}}),
+            json.dumps({run_user: {"user": run_user, "window": run_ws, "val": {"threshold": -0.1}, "checkpoint": str(ckpt), "sensor_weights": list(DEFAULT_SENSOR_WEIGHTS)}}),
             encoding="utf-8",
         )
         return SimpleNamespace(returncode=0, stdout="")

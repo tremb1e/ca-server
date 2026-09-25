@@ -37,6 +37,7 @@ from hmog_data import (
     prepare_user_datasets,
     precompute_all_user_windows,
 )
+from reconstruction import DEFAULT_SENSOR_WEIGHTS, SENSOR_INPUT_MASKING_VERSION, reconstruction_errors, validate_sensor_weights
 from runtime_paths import dataset_root as default_dataset_root, results_dir as default_results_dir, window_cache_dir as default_window_cache_dir
 from vqgan import VQGAN
 
@@ -115,11 +116,9 @@ def reconstruction_step(
         batch = batch + torch.randn_like(batch) * float(input_noise_std)
     with autocast_context(device, enabled=bool(use_amp)):
         decoded, _, q_loss = model(batch)
-        if rec_loss_metric == "mse":
-            rec_loss = torch.mean((batch - decoded) ** 2)
-        else:
-            rec_loss = torch.mean(torch.abs(batch - decoded))
-        q_loss = torch.mean(q_loss)
+    with autocast_context(device, enabled=False):
+        rec_loss = reconstruction_errors(model, batch, decoded, metric=rec_loss_metric).mean()
+        q_loss = torch.mean(q_loss.float())
         loss = rec_loss + float(q_loss_weight) * q_loss
     return loss, rec_loss.detach(), q_loss.detach()
 
@@ -187,11 +186,8 @@ def evaluate_model(
             labels = labels.cpu().numpy()
             with autocast_context(device, enabled=bool(use_amp)):
                 decoded, _, _ = model(batch)
-                # 传感器重建误差越小代表越接近合法用户
-                if score_metric == "l1":
-                    errors = torch.mean(torch.abs(batch - decoded), dim=(1, 2, 3))
-                else:
-                    errors = torch.mean((batch - decoded) ** 2, dim=(1, 2, 3))
+            with autocast_context(device, enabled=False):
+                errors = reconstruction_errors(model, batch, decoded, metric=score_metric)
             scores = (-errors).cpu().numpy()  # 分数越大越可信
             all_errors.append(errors.detach().cpu().numpy())
             all_scores.append(scores)
@@ -589,6 +585,18 @@ def train_single_window(
         "trained_epochs": int(trained_epochs),
         "best_epoch": int(best_epoch or trained_epochs),
         "early_stop_patience": int(early_stop_patience),
+        "sensor_weights": list(args.sensor_weights),
+        "sensor_input_masking_version": SENSOR_INPUT_MASKING_VERSION,
+        "base_channels": int(args.base_channels),
+        "latent_dim": int(args.latent_dim),
+        "num_codebook_vectors": int(args.num_codebook_vectors),
+        "beta": float(args.beta),
+        "use_nonlocal": bool(args.use_nonlocal),
+        "training_options": {
+            "use_amp": bool(args.use_amp),
+            "learning_rate": float(args.learning_rate),
+            "grad_clip_norm": float(args.grad_clip_norm),
+        },
     }
 
 
@@ -871,6 +879,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-nonlocal", action="store_true", help="禁用 NonLocalBlock（更快/更省显存）")
     parser.add_argument("--q-loss-weight", type=float, default=1.0, help="VQ codebook loss 的权重")
+    parser.add_argument(
+        "--sensor-weights",
+        type=float,
+        nargs=3,
+        default=DEFAULT_SENSOR_WEIGHTS,
+        metavar=("ACC", "GYRO", "MAG"),
+        help="重建误差权重，顺序为加速度计/陀螺仪/磁力计，必须非负且总和为1。",
+    )
     parser.add_argument("--train-rec-loss", choices=["l1", "mse"], default="l1", help="训练时重建损失类型")
     parser.add_argument("--input-noise-std", type=float, default=0.0, help="训练时输入噪声标准差（0 关闭）")
     parser.add_argument("--grad-clip-norm", type=float, default=0.0, help="梯度裁剪阈值（0 关闭）")
@@ -897,7 +913,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default=default_results_dir())
     parser.add_argument("--log-dir", type=str, default=str(Path(default_results_dir()) / "experiment_logs"), help="指标/文本日志输出目录")
     parser.add_argument("--seed", type=int, default=42)
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        args.sensor_weights = validate_sensor_weights(args.sensor_weights)
+        if args.input_height == 6 and sum(args.sensor_weights[:2]) <= 0:
+            raise ValueError("Active sensor weights must have a positive sum")
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 if __name__ == "__main__":

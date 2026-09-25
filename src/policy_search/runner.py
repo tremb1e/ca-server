@@ -143,6 +143,8 @@ def _load_or_score_split(
         "target_width": int(target_width),
         "csv": _file_fingerprint(csv_path),
         "vqgan_ckpt": _file_fingerprint(vqgan_ckpt),
+        "vqgan_config": _file_fingerprint(vqgan_ckpt.with_suffix(".json")),
+        "score_version": 3,
     }
     if auth_method == AUTH_METHOD_VQGAN_TRANSFORMER:
         expected["lm_ckpt"] = _file_fingerprint(lm_ckpt)
@@ -331,6 +333,7 @@ def _score_split_vqgan_only_inprocess(
     from ..utils.accelerator import autocast_context, resolve_torch_device
     from hmog_token_auth_inference import load_vqgan
     from hmog_data import iter_windows_from_csv_unlabeled_with_session
+    from reconstruction import reconstruction_errors
 
     torch_device = resolve_torch_device(device)
     vqgan = load_vqgan(Path(vqgan_ckpt), device=torch_device, cfg_path=None)
@@ -353,9 +356,10 @@ def _score_split_vqgan_only_inprocess(
             return
         windows_np = np.stack(batch_windows, axis=0).astype(np.float32, copy=False)
         batch = torch.from_numpy(windows_np).to(device=torch_device, dtype=torch.float32, non_blocking=True)
-        with autocast_context(torch_device, enabled=bool(use_amp)):
+        with torch.no_grad(), autocast_context(torch_device, enabled=bool(use_amp)):
             decoded, _, _ = vqgan(batch)
-            errors = torch.mean((batch - decoded) ** 2, dim=(1, 2, 3))
+        with torch.no_grad(), autocast_context(torch_device, enabled=False):
+            errors = reconstruction_errors(vqgan, batch, decoded, metric="mse")
         scores = (-errors).detach().cpu().numpy().astype(np.float32, copy=False)
         scores_chunks.append(scores)
         labels_chunks.append(np.asarray(batch_labels, dtype=np.int8))
@@ -1203,6 +1207,7 @@ def run_policy_grid_search(
             "policy_status": "ready",
             "score_metric": "mse",
             "score_scale": "negative_reconstruction_error",
+            "sensor_weights": json.loads(vqgan_config.read_text(encoding="utf-8")).get("sensor_weights"),
             "genuine_score_stats": genuine_stats_by_ws.get(float(best["window_size_sec"])),
             "grid_search": {
                 "grid_results_csv": serialize_policy_path(grid_csv, relative_to=policy_dir),

@@ -134,6 +134,11 @@ policy_search_auth_method = "vqgan-only"
 allow_training_fallback_policy = false
 
 [training]
+# 重建误差权重，顺序：加速度计、陀螺仪、磁力计。必须非负且总和为 1。
+# 同时用于训练、策略搜索和在线认证；权重为 0 的传感器不进入编码器或认证分数。
+# 修改后需重启服务并重新训练模型。
+sensor_weights = [0.5, 0.5, 0.0]
+
 # 模型最大训练轮数。实际训练会受 early_stop_patience 控制提前停止。
 max_epochs = 50
 

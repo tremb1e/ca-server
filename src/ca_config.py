@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Literal, Optional
 
+from ca_train.reconstruction import DEFAULT_SENSOR_WEIGHTS, validate_sensor_weights
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python < 3.11
@@ -94,7 +96,15 @@ class TrainingConfig:
     batch_size: int = 128
     max_parallel_train: int = 8
     device: str = "auto"
+    # 重建误差权重，顺序：加速度计、陀螺仪、磁力计。
+    sensor_weights: tuple[float, ...] = DEFAULT_SENSOR_WEIGHTS
     run_policy_search: bool = True
+
+    def __post_init__(self) -> None:
+        weights = validate_sensor_weights(self.sensor_weights)
+        if weights is None:
+            raise ValueError("training.sensor_weights must contain three weights")
+        object.__setattr__(self, "sensor_weights", weights)
 
 
 @dataclass(frozen=True)
@@ -222,6 +232,7 @@ def load_ca_config(path: Optional[Path] = None) -> CAConfig:
         batch_size=int(training_raw.get("batch_size", TrainingConfig.batch_size)),
         max_parallel_train=int(training_raw.get("max_parallel_train", TrainingConfig.max_parallel_train)),
         device=str(training_raw.get("device", TrainingConfig.device)),
+        sensor_weights=training_raw.get("sensor_weights", TrainingConfig.sensor_weights),
         run_policy_search=bool(training_raw.get("run_policy_search", TrainingConfig.run_policy_search)),
     )
 

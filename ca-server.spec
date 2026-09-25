@@ -6,7 +6,7 @@ from PyInstaller.utils.hooks import copy_metadata
 
 datas = []
 binaries = []
-hiddenimports = ['accelerator', 'hmog_consecutive_rejects', 'hmog_data', 'hmog_metrics', 'hmog_token_auth_inference', 'hmog_token_transformer', 'hmog_tokenizer', 'hmog_vqgan_experiment', 'hmog_vqgan_token_transformer_experiment', 'platformdirs', 'runtime_paths', 'vqgan']
+hiddenimports = ['accelerator', 'hmog_consecutive_rejects', 'hmog_data', 'hmog_metrics', 'hmog_token_auth_inference', 'hmog_token_transformer', 'hmog_tokenizer', 'hmog_vqgan_experiment', 'hmog_vqgan_token_transformer_experiment', 'platformdirs', 'reconstruction', 'runtime_paths', 'vqgan']
 datas += collect_data_files('torch_npu')
 datas += copy_metadata('torch')
 datas += copy_metadata('pandas')
