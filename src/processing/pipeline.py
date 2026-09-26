@@ -42,6 +42,9 @@ FEATURE_COLUMNS = list(NINE_AXIS_COLUMNS)
 # batches to avoid unbounded memory growth.
 WINDOW_BATCH_ROWS = 500_000
 
+# Sensor outages must not become synthetic training/authentication windows.
+MAX_INTERPOLATION_GAP_MS = 200
+
 # HMOG attacker session policy:
 # - keep session 1-24 for each selected attacker subject.
 HMOG_ATTACKER_SESSION_START = 1
@@ -325,83 +328,111 @@ def _extract_sensor_records(packets: Iterable[Dict]) -> Dict[str, List[Dict]]:
 
 def _resample_records(records: Dict[str, List[Dict]], session_label: str, user_id: str, cfg: ProcessingConfig) -> Optional[pd.DataFrame]:
     base_ms = int(1000 / cfg.sampling_rate_hz)
-    all_ts: List[int] = []
-    for sensor_values in records.values():
-        if sensor_values:
-            all_ts.extend([r["timestamp"] for r in sensor_values])
-    if not all_ts:
-        logger.warning("Session %s for user %s has no sensor timestamps", session_label, user_id)
-        return None
+    if base_ms <= 0:
+        raise ValueError("sampling_rate_hz must not exceed 1000")
 
-    min_ts, max_ts = min(all_ts), max(all_ts)
-    if min_ts == max_ts:
-        logger.warning("Session %s for user %s has a single timestamp", session_label, user_id)
-        return None
-
-    # Important: pandas `resample()` aligns bins to the epoch by default. If we
-    # build a base_index starting at an arbitrary (non-10ms-aligned) timestamp,
-    # reindexing will produce all-NaN rows and the session becomes empty after
-    # `dropna()`. We therefore floor/ceil to the 10ms grid so that:
-    #   base_index ∈ { ..., t0, t0+10ms, ... } matches resample bins.
-    start_ms = (int(min_ts) // base_ms) * base_ms
-    end_ms = ((int(max_ts) + base_ms - 1) // base_ms) * base_ms
-
-    base_index = pd.date_range(
-        start=pd.to_datetime(start_ms, unit="ms"),
-        end=pd.to_datetime(end_ms, unit="ms"),
-        freq=f"{base_ms}ms",
-    )
-
-    combined = pd.DataFrame(index=base_index)
+    # Resample each continuous sensor run separately. Building an index from a
+    # session's first to last timestamp can allocate days of synthetic samples
+    # after a pause; limiting interpolate() alone would still allocate that grid.
+    sensor_frames = {}
     for sensor in ("acc", "gyr", "mag"):
         data = records.get(sensor, [])
         if not data:
             if sensor != "mag":
                 logger.warning("Missing %s data in session %s (user %s)", sensor, session_label, user_id)
                 return None
-            logger.info(
-                "Missing magnetometer data in session %s (user %s); retaining session for possible 6-axis mode",
-                session_label,
-                user_id,
-            )
-            for axis in ("x", "y", "z"):
-                combined[f"mag_{axis}"] = np.nan
             continue
-        df = pd.DataFrame(data)
-        df = df.drop_duplicates(subset="timestamp")
-        df["timestamp_dt"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df = df.set_index("timestamp_dt")[["x", "y", "z"]].sort_index()
-        resampled = df.resample(f"{base_ms}ms").mean().interpolate(method="time", limit_direction="both")
-        aligned = resampled.reindex(base_index).interpolate(method="time", limit_direction="both")
-        combined[f"{sensor}_x"] = aligned["x"]
-        combined[f"{sensor}_y"] = aligned["y"]
-        combined[f"{sensor}_z"] = aligned["z"]
+        frame = pd.DataFrame(data).drop_duplicates(subset="timestamp").sort_values("timestamp")
+        frame[["x", "y", "z"]] = frame[["x", "y", "z"]].replace([np.inf, -np.inf], np.nan)
+        frame = frame.dropna(subset=["x", "y", "z"])
+        if frame.empty:
+            if sensor != "mag":
+                return None
+            continue
+        runs = frame["timestamp"].diff().gt(MAX_INTERPOLATION_GAP_MS).cumsum()
+        pieces = []
+        for _, run in frame.groupby(runs, sort=False):
+            run = run.copy()
+            run.index = pd.to_datetime(run["timestamp"], unit="ms")
+            pieces.append(run[["x", "y", "z"]].resample(f"{base_ms}ms").mean().interpolate(method="time"))
+        sensor_frames[sensor] = pd.concat(pieces).rename(columns=lambda axis: f"{sensor}_{axis}")
 
-    # Acceleration and gyroscope are mandatory for both modes. Magnetometer
-    # NaNs are retained here so the per-user quality assessment can measure
-    # coverage and downgrade the complete training run to 6 axes when needed.
+    # Both mandatory sensors must actually cover a grid point. Magnetometer
+    # gaps remain NaN so coverage checks can select a matching six-axis model.
+    combined = sensor_frames["acc"].join(sensor_frames["gyr"], how="inner")
+    if "mag" in sensor_frames:
+        combined = combined.join(sensor_frames["mag"], how="left")
+    else:
+        for axis in ("x", "y", "z"):
+            combined[f"mag_{axis}"] = np.nan
     combined = combined.dropna(subset=list(axis_columns(6)))
     if combined.empty:
-        logger.warning("Resampled data empty for session %s (user %s)", session_label, user_id)
         return None
-
-    combined = combined.reset_index(drop=False).rename(columns={"index": "timestamp"})
+    combined = combined.reset_index()
     combined["timestamp"] = combined["timestamp"].astype("int64") // 1_000_000
+    segments = combined["timestamp"].diff().gt(base_ms * 1.5).cumsum()
     combined.insert(0, "subject", user_id)
     combined.insert(1, "session", session_label)
-    combined = combined[
-        ["subject", "session", "timestamp"]
-        + [f"{prefix}_{axis}" for prefix in ("acc", "gyr", "mag") for axis in ("x", "y", "z")]
-    ]
-    return combined
+    if segments.max() > 0:
+        combined["session"] = [f"{session_label}__segment_{int(i)}" for i in segments]
+    return combined[["subject", "session", "timestamp"] + FEATURE_COLUMNS]
+
+
+def _clock_record_groups(packets: Iterable[Dict]) -> Iterable[Dict[str, List[Dict]]]:
+    """Preserve capture order across sensor-clock resets, including within a packet."""
+    current = {sensor: [] for sensor in ("acc", "gyr", "mag")}
+    latest = {}
+    seen = {sensor: set() for sensor in current}
+    last_wall_ms = 0
+    last_uptime_ns = 0
+    for packet in packets:
+        wall_ms = int(packet.get("base_wall_ms", 0) or 0)
+        uptime_ns = int(packet.get("device_uptime_ns", 0) or 0)
+        # Sensor timestamps can repeat after reboot. Deduplicate only within
+        # the same boot when packet metadata confirms a new clock domain.
+        if wall_ms > last_wall_ms > 0 and 0 < uptime_ns < last_uptime_ns:
+            if any(current.values()):
+                yield current
+            current = {sensor: [] for sensor in current}
+            latest = {}
+            seen = {sensor: set() for sensor in current}
+        if wall_ms > last_wall_ms:
+            last_wall_ms, last_uptime_ns = wall_ms, uptime_ns
+        samples = packet.get("sensor_data") or packet.get("sensor_batch", {}).get("samples") or []
+        for sample in samples:
+            extracted = _extract_sensor_records([{"sensor_data": [sample]}])
+            for sensor, rows in extracted.items():
+                if not rows:
+                    continue
+                record = rows[0]
+                timestamp = record["timestamp"]
+                # Retransmitted packets contain old timestamps too. They must
+                # not create extra clock domains or extra training examples.
+                if timestamp in seen[sensor]:
+                    continue
+                seen[sensor].add(timestamp)
+                if sensor in latest and timestamp < latest[sensor]:
+                    if any(current.values()):
+                        yield current
+                    current = {key: [] for key in current}
+                    latest = {}
+                current[sensor].append(record)
+                latest[sensor] = timestamp
+    if any(current.values()):
+        yield current
 
 
 def _load_and_resample_session(session_path: Path, cfg: ProcessingConfig) -> Optional[pd.DataFrame]:
     user_id = session_path.parent.name
-    session_label = session_path.stem
     packets = _read_session_file(session_path)
-    records = _extract_sensor_records(packets)
-    return _resample_records(records, session_label, user_id, cfg)
+    frames = []
+    for clock_index, records in enumerate(_clock_record_groups(packets)):
+        label = session_path.stem if clock_index == 0 else f"{session_path.stem}__clock_{clock_index}"
+        frame = _resample_records(records, label, user_id, cfg)
+        if frame is not None:
+            frame["_source_session"] = session_path.stem
+            frames.append(frame)
+    return pd.concat(frames, ignore_index=True) if frames else None
 
 
 def _assemble_user_dataframe(user_id: str, session_files: Sequence[Path], cfg: ProcessingConfig) -> Optional[pd.DataFrame]:
@@ -434,9 +465,10 @@ def _assemble_user_dataframe(user_id: str, session_files: Sequence[Path], cfg: P
         return None
 
     combined = pd.concat(frames, ignore_index=True)
-    combined["session_order"] = combined["session"].map(session_order).fillna(len(session_order)).astype(int)
-    combined = combined.sort_values(["session_order", "timestamp"]).reset_index(drop=True)
-    combined = combined.drop(columns=["session_order"])
+    combined["session_order"] = combined["_source_session"].map(session_order).fillna(len(session_order)).astype(int)
+    # Stable ordering retains capture order inside each source, including resets.
+    combined = combined.sort_values("session_order", kind="stable").reset_index(drop=True)
+    combined = combined.drop(columns=["session_order", "_source_session"])
     return combined
 
 
@@ -817,8 +849,16 @@ def _write_windows(
     total_rows = 0
     window_id = 0
 
-    for (subject, session), group in df.groupby(["subject", "session"], sort=False):
-        group = group.sort_values("timestamp").reset_index(drop=True)
+    def continuous_groups():
+        for _, session_group in df.groupby(["subject", "session"], sort=False):
+            # Do not sort clock resets into earlier observations or bridge dropped
+            # sensor rows. Keep the original acquisition order within every split.
+            delta = session_group["timestamp"].diff()
+            segments = (delta.le(0) | delta.gt(1500.0 / sampling_rate)).cumsum()
+            for _, group in session_group.groupby(segments, sort=False):
+                yield group.reset_index(drop=True)
+
+    for group in continuous_groups():
         if len(group) < window_points:
             continue
         start = 0

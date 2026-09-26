@@ -12,7 +12,6 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-from torch import amp
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -36,17 +35,16 @@ from hmog_token_transformer import build_token_lm
 from hmog_tokenizer import encode_windows_to_tokens
 from runtime_paths import dataset_root as default_dataset_root, results_dir as default_results_dir, token_cache_dir as default_token_cache_dir
 from vqgan import VQGAN
+from accelerator import autocast_context, make_grad_scaler, normalize_device, resolve_torch_device, seed_all
 
 
 logger = logging.getLogger(__name__)
 
 
-def set_seed(seed: int, cuda: bool = False) -> None:
+def set_seed(seed: int, device_type: Optional[str] = None) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    if cuda and torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    seed_all(seed, device_type=device_type)
 
 
 def setup_logging(log_dir: Path) -> Tuple[Path, Path]:
@@ -173,7 +171,7 @@ def vqgan_reconstruction_step(
     batch = batch.to(device, non_blocking=True)
     if input_noise_std and input_noise_std > 0:
         batch = batch + torch.randn_like(batch) * float(input_noise_std)
-    with amp.autocast(device_type=device.type, enabled=use_amp):
+    with autocast_context(device, enabled=bool(use_amp)):
         decoded, _, q_loss = model(batch)
         if rec_loss_metric == "mse":
             rec_loss = torch.mean((batch - decoded) ** 2)
@@ -204,7 +202,7 @@ def evaluate_vqgan(
     for batch, labels in loader:
         batch = batch.to(device, non_blocking=True)
         labels_np = labels.cpu().numpy()
-        with amp.autocast(device_type=device.type, enabled=use_amp):
+        with autocast_context(device, enabled=bool(use_amp)):
             decoded, _, _ = model(batch)
             if score_metric == "l1":
                 errors = torch.mean(torch.abs(batch - decoded), dim=(1, 2, 3))
@@ -266,7 +264,7 @@ def evaluate_token_lm(
     n = int(tokens.shape[0])
     for i in range(0, n, batch_size):
         batch_tokens = torch.from_numpy(tokens[i : i + batch_size]).to(device=device, dtype=torch.long, non_blocking=True)
-        with amp.autocast(device_type=device.type, enabled=use_amp):
+        with autocast_context(device, enabled=bool(use_amp)):
             # score = -NLL; larger -> more genuine
             scores = model.score(batch_tokens).detach().cpu().numpy()
         all_scores.append(scores)
@@ -384,7 +382,7 @@ def score_lm_from_csv_to_arrays(
             vqgan, windows_np, batch_size=int(token_batch_size), device=device, use_amp=use_amp
         )
         tokens = torch.from_numpy(tok.tokens).to(device=device, dtype=torch.long, non_blocking=True)
-        with amp.autocast(device_type=device.type, enabled=use_amp):
+        with autocast_context(device, enabled=bool(use_amp)):
             scores = lm.score(tokens).detach().cpu().numpy().astype(np.float32, copy=False)
         scores_chunks.append(scores)
         labels_chunks.append(np.asarray(batch_labels, dtype=np.int8))
@@ -487,7 +485,7 @@ def collect_lm_scores_from_csv(
             vqgan, windows_np, batch_size=int(token_batch_size), device=device, use_amp=use_amp
         )
         tokens = torch.from_numpy(tok.tokens).to(device=device, dtype=torch.long, non_blocking=True)
-        with amp.autocast(device_type=device.type, enabled=use_amp):
+        with autocast_context(device, enabled=bool(use_amp)):
             scores = lm.score(tokens).detach().cpu().numpy()
         for (subject, session, label), score in zip(batch_meta, scores):
             scored.append((subject, session, int(label), float(score)))
@@ -901,7 +899,7 @@ def run_single_window(
             betas=(args.beta1, args.beta2),
             weight_decay=float(args.vqgan_weight_decay),
         )
-        scaler = amp.GradScaler(device.type, enabled=args.use_amp)
+        scaler = make_grad_scaler(device, enabled=bool(args.use_amp))
         early_stop_patience = int(getattr(args, "early_stop_patience", 0) or 0)
         early_stop_enabled = early_stop_patience > 0
         best_auc = float("-inf")
@@ -1238,7 +1236,7 @@ def run_single_window(
             betas=(0.9, 0.95),
             weight_decay=float(args.lm_weight_decay),
         )
-        lm_scaler = amp.GradScaler(device.type, enabled=args.use_amp)
+        lm_scaler = make_grad_scaler(device, enabled=bool(args.use_amp))
         early_stop_patience = int(getattr(args, "early_stop_patience", 0) or 0)
         early_stop_enabled = early_stop_patience > 0
         best_auc = float("-inf")
@@ -1253,7 +1251,7 @@ def run_single_window(
             for batch_tokens in pbar:
                 lm_optim.zero_grad(set_to_none=True)
                 batch_tokens = batch_tokens.to(device=device, dtype=torch.long, non_blocking=True)
-                with amp.autocast(device_type=device.type, enabled=args.use_amp):
+                with autocast_context(device, enabled=bool(args.use_amp)):
                     loss = lm.loss(batch_tokens)
                 lm_scaler.scale(loss).backward()
                 if args.lm_grad_clip_norm and args.lm_grad_clip_norm > 0:
@@ -1571,7 +1569,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overlap", type=float, default=DEFAULT_OVERLAP)
     parser.add_argument("--target-width", type=int, default=50, help="重采样后的时间轴长度；设为 0 则使用该 window 的原始点数 (t*100Hz)")
 
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--cpu-threads", type=int, default=16)
@@ -1753,10 +1751,17 @@ def main() -> None:
 
     torch.set_num_threads(int(args.cpu_threads))
     torch.backends.cudnn.benchmark = True
-    set_seed(int(args.seed), cuda=torch.cuda.is_available())
-
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    logger.info("[START] device=%s cuda_available=%s", device, torch.cuda.is_available())
+    # Resolve NPU/CUDA/CPU uniformly.  The previous CUDA-only probe silently
+    # forced Ascend hosts onto CPU even when ``--device npu:<id>`` was given.
+    args.device = normalize_device(args.device)
+    device = resolve_torch_device(args.device)
+    set_seed(int(args.seed), device_type=device.type)
+    logger.info(
+        "[START] device=%s cuda_available=%s npu_available=%s",
+        device,
+        torch.cuda.is_available(),
+        bool(getattr(getattr(torch, "npu", None), "is_available", lambda: False)()),
+    )
 
     vote_window_size = int(getattr(args, "vote_window_size", 0) or 0)
     vote_min_rejects = int(getattr(args, "vote_min_rejects", 0) or 0)
@@ -1792,7 +1797,7 @@ def main() -> None:
     for user_id in users:
         for ws in args.window_sizes:
             # Avoid identical randomness across windows.
-            set_seed(int(args.seed) + int(float(ws) * 10), cuda=device.type.startswith("cuda"))
+            set_seed(int(args.seed) + int(float(ws) * 10), device_type=device.type)
             res = run_single_window(
                 args,
                 user_id=user_id,

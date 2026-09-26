@@ -1,5 +1,6 @@
 import os
 import hashlib
+import asyncio
 from types import SimpleNamespace
 
 import lz4.frame
@@ -90,8 +91,14 @@ async def test_stream_packet_rejects_declared_decompressed_size_above_limit(tmp_
 
 
 @pytest.mark.asyncio
-async def test_stream_packet_uses_device_hash_as_batch_id(tmp_path):
+async def test_stream_packet_uses_device_hash_as_batch_id(tmp_path, monkeypatch):
     service = _service(tmp_path)
+    inference_batches = []
+
+    async def capture_inference(**kwargs):
+        inference_batches.append(kwargs["parsed_batch"])
+
+    monkeypatch.setattr(service, "_run_auth_inference", capture_inference)
     batch = sensor_data_pb2.SerializedSensorBatch(
         session_id="auth-session",
         samples=[
@@ -112,6 +119,8 @@ async def test_stream_packet_uses_device_hash_as_batch_id(tmp_path):
         packet_id="packet-2",
         device_id_hash="device-a",
         packet_seq_no=2,
+        device_uptime_ns=123_000_000,
+        base_wall_ms=1_700_000_000_000,
         encrypted_sensor_payload=_encrypt(compressed),
         metadata=sensor_data_pb2.Metadata(
             compression="lz4",
@@ -119,7 +128,9 @@ async def test_stream_packet_uses_device_hash_as_batch_id(tmp_path):
         ),
     )
 
-    directive = await service._handle_packet(packet, response_queue=None, pending_inference=set())
+    pending = set()
+    directive = await service._handle_packet(packet, response_queue=None, pending_inference=pending)
+    await asyncio.gather(*pending)
 
     assert directive.ack.success is True
     stored = service.storage.records[0]["packet_data"]
@@ -130,6 +141,8 @@ async def test_stream_packet_uses_device_hash_as_batch_id(tmp_path):
     assert "foreground_app_hash" not in sample
     assert service.storage.records[0]["device_id_hash"] == "device-a"
     assert service.storage.records[0]["session_id"] == "auth-session"
+    assert inference_batches[0]["device_uptime_ns"] == packet.device_uptime_ns
+    assert inference_batches[0]["base_wall_ms"] == packet.base_wall_ms
 
 
 class _ReadyTrainingManager:

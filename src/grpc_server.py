@@ -453,7 +453,11 @@ class SensorDataService(sensor_data_pb2_grpc.SensorDataServiceServicer):
                 self._run_auth_inference(
                     device_id_hash=device_id_hash,
                     session_id=str(session_id),
-                    parsed_batch=parsed_batch,
+                    parsed_batch={
+                        **parsed_batch,
+                        "device_uptime_ns": int(packet.device_uptime_ns),
+                        "base_wall_ms": int(packet.base_wall_ms),
+                    },
                     response_queue=response_queue,
                 )
             )

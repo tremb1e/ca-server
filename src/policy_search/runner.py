@@ -145,6 +145,8 @@ def _load_or_score_split(
         "vqgan_ckpt": _file_fingerprint(vqgan_ckpt),
         "vqgan_config": _file_fingerprint(vqgan_ckpt.with_suffix(".json")),
         "score_version": 3,
+        "device": str(device),
+        "use_amp": bool(use_amp),
     }
     if auth_method == AUTH_METHOD_VQGAN_TRANSFORMER:
         expected["lm_ckpt"] = _file_fingerprint(lm_ckpt)
@@ -274,7 +276,7 @@ def _score_split_vqgan_transformer_inprocess(
             use_amp=bool(use_amp),
         )
         tokens = torch.from_numpy(tok.tokens).to(device=torch_device, dtype=torch.long, non_blocking=True)
-        with autocast_context(torch_device, enabled=bool(use_amp)):
+        with torch.inference_mode(), autocast_context(torch_device, enabled=bool(use_amp)):
             scores = lm.score(tokens).detach().cpu().numpy().astype(np.float32, copy=False)
         scores_chunks.append(scores)
         labels_chunks.append(np.asarray(batch_labels, dtype=np.int8))

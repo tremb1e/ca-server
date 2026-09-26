@@ -11,7 +11,7 @@ import torch
 
 from ca_train.reconstruction import reconstruction_errors
 
-from ..utils.accelerator import autocast_context
+from ..utils.accelerator import autocast_context, set_current_device
 from ..utils.ca_train import ensure_ca_train_on_path
 from ..processing.magnetometer import axis_columns
 
@@ -35,6 +35,7 @@ class VQGANPolicy:
     ema_alpha: float = 0.25
     model_version: str = ""
     input_height: int = 6
+    score_metric: str = "mse"
 
 
 def _resample_time_axis(window: np.ndarray, target_width: int) -> np.ndarray:
@@ -67,6 +68,7 @@ def load_vqgan(checkpoint: Path, *, device: torch.device, config_path: Path) -> 
     return model
 
 
+@torch.inference_mode()
 def score_windows(
     model: torch.nn.Module,
     windows: np.ndarray,
@@ -76,8 +78,13 @@ def score_windows(
     score_metric: str = "mse",
     batch_size: int = 256,
 ) -> np.ndarray:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     if windows.size == 0:
         return np.empty((0,), dtype=np.float32)
+    # NPU current-device state belongs to the executing thread; online calls
+    # reach this function through asyncio.to_thread after loading on another.
+    set_current_device(device)
     scores: List[np.ndarray] = []
     for i in range(0, len(windows), batch_size):
         batch_np = windows[i : i + batch_size]
@@ -116,14 +123,28 @@ def windowize_dataframe(
     window_ids: List[int] = []
     windows: List[np.ndarray] = []
     window_id = 0
-    for start in range(0, len(values) - window_points + 1, step_points):
-        window_slice = values[start : start + window_points]
-        window_raw = window_slice.T.astype(np.float32, copy=True)
-        if window_raw.shape[1] != target_width:
-            window_raw = _resample_time_axis(window_raw, target_width)
-        windows.append(window_raw[np.newaxis, :, :])
-        window_ids.append(window_id)
-        window_id += 1
+    # Missing rows (including unavailable sensor values dropped by the caller)
+    # must not join samples across an interruption into a synthetic window.
+    breaks = np.zeros(max(0, len(values) - 1), dtype=bool)
+    if "timestamp" in df.columns:
+        timestamps = df["timestamp"].to_numpy(dtype=np.float64, copy=False)
+        if not np.isfinite(timestamps).all():
+            raise ValueError("Non-finite sensor timestamps")
+        delta = np.diff(timestamps)
+        breaks |= (delta <= 0) | (delta > 1.5 * 1000.0 / sampling_rate_hz)
+    if "session" in df.columns:
+        sessions = df["session"].to_numpy()
+        breaks |= sessions[1:] != sessions[:-1]
+    boundaries = np.concatenate(([0], np.flatnonzero(breaks) + 1, [len(values)]))
+    for left, right in zip(boundaries[:-1], boundaries[1:]):
+        for start in range(int(left), int(right) - window_points + 1, step_points):
+            window_slice = values[start : start + window_points]
+            window_raw = window_slice.T.astype(np.float32, copy=True)
+            if window_raw.shape[1] != target_width:
+                window_raw = _resample_time_axis(window_raw, target_width)
+            windows.append(window_raw[np.newaxis, :, :])
+            window_ids.append(window_id)
+            window_id += 1
 
     if not windows:
         return [], np.empty((0, 1, int(input_height), target_width), dtype=np.float32)

@@ -193,6 +193,9 @@ def make_grad_scaler(device: torch.device, enabled: bool):
         scaler_cls = getattr(npu_amp, "GradScaler", None)
         if scaler_cls is not None:
             return scaler_cls(enabled=bool(enabled))
+        # torch.amp has no generic NPU implementation.  Running an enabled
+        # scaler here would fail later with an unsupported device type.
+        return amp.GradScaler("cpu", enabled=False)
     return amp.GradScaler(device.type, enabled=bool(enabled))
 
 
@@ -210,5 +213,11 @@ def autocast_context(device: torch.device, enabled: bool) -> Iterator[None]:
             with npu_autocast(enabled=True):
                 yield
             return
-    with amp.autocast(device_type=device.type, enabled=True):
-        yield
+    if device.type in {"cpu", "cuda"}:
+        with amp.autocast(device_type=device.type, enabled=True):
+            yield
+        return
+    # Unknown accelerator without a native autocast context: preserve correct
+    # execution in full precision instead of calling torch.amp with an invalid
+    # device type (notably relevant to stripped-down torch_npu runtimes).
+    yield

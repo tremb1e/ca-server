@@ -202,5 +202,10 @@ def autocast_context(device: torch.device, enabled: bool) -> Iterator[None]:
                 yield
             return
 
-    with amp.autocast(device_type=device.type, enabled=True):
-        yield
+    if device.type in {"cpu", "cuda"}:
+        with amp.autocast(device_type=device.type, enabled=True):
+            yield
+        return
+    # Keep unsupported accelerator fallbacks in full precision rather than
+    # passing an invalid device type to torch.amp.autocast.
+    yield

@@ -54,6 +54,124 @@ def _write_dummy_file(path: Path, size_bytes: int) -> None:
     path.write_bytes(b"0" * size_bytes)
 
 
+def _sensor_records(timestamps):
+    return {
+        sensor: [{"timestamp": timestamp, "x": 1.0, "y": 2.0, "z": 3.0} for timestamp in timestamps]
+        for sensor in ("acc", "gyr", "mag")
+    }
+
+
+def test_resampling_does_not_create_samples_during_long_outages(tmp_path):
+    from src.processing.pipeline import _resample_records
+
+    cfg = _make_cfg(tmp_path, min_total_bytes=0, target_total_bytes=0)
+    timestamps = list(range(1000, 1300, 10)) + list(range(86_401_000, 86_401_300, 10))
+    frame = _resample_records(_sensor_records(timestamps), "session", "u", cfg)
+    assert frame["timestamp"].tolist() == timestamps
+    assert frame["session"].nunique() == 2
+    output = tmp_path / "windows.csv"
+    assert _write_windows(frame, output, 0.2, 100, 0.5) == 80  # two windows per run
+
+
+def test_resampling_drops_missing_motion_but_preserves_magnetic_gaps(tmp_path):
+    from src.processing.pipeline import _resample_records
+
+    cfg = _make_cfg(tmp_path, min_total_bytes=0, target_total_bytes=0)
+    records = _sensor_records(range(1000, 2000, 10))
+    records["gyr"] = [row for row in records["gyr"] if not 1300 <= row["timestamp"] < 1600]
+    records["mag"] = [row for row in records["mag"] if not 1700 <= row["timestamp"] < 1990]
+    frame = _resample_records(records, "session", "u", cfg)
+    assert len(frame) == 70
+    assert not frame["timestamp"].between(1300, 1599).any()
+    assert frame.loc[frame["timestamp"].between(1700, 1989), "mag_x"].isna().all()
+
+
+def test_resampling_retains_short_interpolation_and_uses_common_coverage(tmp_path):
+    from src.processing.pipeline import _resample_records
+
+    cfg = _make_cfg(tmp_path, min_total_bytes=0, target_total_bytes=0)
+    records = _sensor_records([1001, 1021, 1041])
+    records["gyr"] = records["gyr"][1:]
+    frame = _resample_records(records, "session", "u", cfg)
+    assert frame["timestamp"].tolist() == [1020, 1030, 1040]
+    assert frame["acc_x"].tolist() == [1.0, 1.0, 1.0]
+
+
+def test_clock_reset_inside_packet_preserves_capture_order(tmp_path):
+    import json
+    from src.processing.pipeline import _assemble_user_dataframe
+
+    cfg = _make_cfg(tmp_path, min_total_bytes=0, target_total_bytes=0)
+    user_dir = cfg.raw_root / "u"
+    user_dir.mkdir()
+    samples = []
+    for start, value in [(10_000, 1.0), (1000, 2.0)]:
+        for timestamp in range(start, start + 300, 10):
+            for sensor in (1, 2, 3):
+                samples.append({"sensor_type": sensor, "timestamp_ns": timestamp * 1_000_000,
+                                "x": value, "y": value, "z": value})
+    path = user_dir / "session.jsonl"
+    path.write_text(json.dumps({"sensor_data": samples}) + "\n")
+    frame = _assemble_user_dataframe("u", [path], cfg)
+    assert len(frame) == 60
+    assert frame["acc_x"].tolist() == [1.0] * 30 + [2.0] * 30
+    assert frame["session"].nunique() == 2
+    assert "_source_session" not in frame
+
+
+def test_retransmitted_samples_do_not_create_clock_domains():
+    from src.processing.pipeline import _clock_record_groups
+
+    def packet(timestamps):
+        return {"sensor_data": [
+            {"sensor_type": sensor, "timestamp_ns": timestamp * 1_000_000,
+             "x": 1, "y": 2, "z": 3}
+            for timestamp in timestamps for sensor in (1, 2, 3)
+        ]}
+
+    groups = list(_clock_record_groups([packet([1000, 1010]), packet([1000, 1010, 1020])]))
+    assert len(groups) == 1
+    assert [row["timestamp"] for row in groups[0]["acc"]] == [1000, 1010, 1020]
+
+
+def test_reboot_metadata_preserves_repeated_timestamps_in_new_clock():
+    from src.processing.pipeline import _clock_record_groups
+
+    def packet(wall_ms, uptime_ns, value):
+        return {
+            "base_wall_ms": wall_ms, "device_uptime_ns": uptime_ns,
+            "sensor_data": [
+                {"sensor_type": sensor, "timestamp_ns": timestamp * 1_000_000,
+                 "x": value, "y": value, "z": value}
+                for timestamp in (1000, 1010) for sensor in (1, 2, 3)
+            ],
+        }
+
+    first = packet(10000, 2_000_000_000, 1)
+    # Same samples retried later in the same boot remain duplicates.
+    retry = packet(10100, 2_100_000_000, 1)
+    reboot = packet(20000, 1_100_000_000, 2)
+    groups = list(_clock_record_groups([first, retry, reboot]))
+    assert len(groups) == 2
+    assert [row["x"] for row in groups[0]["acc"]] == [1, 1]
+    assert [row["x"] for row in groups[1]["acc"]] == [2, 2]
+
+
+def test_windowing_does_not_bridge_gaps_in_existing_csv(tmp_path):
+    import pandas as pd
+    from src.processing.pipeline import _resample_records
+
+    cfg = _make_cfg(tmp_path, min_total_bytes=0, target_total_bytes=0)
+    frame = _resample_records(_sensor_records(range(1000, 1200, 10)), "s", "u", cfg)
+    second = frame.copy()
+    second["timestamp"] += 10_000
+    frame = pd.concat([frame, second], ignore_index=True)
+    output = tmp_path / "windows.csv"
+    assert _write_windows(frame, output, 0.2, 100, 0.5) == 40
+    windows = pd.read_csv(output)
+    assert windows.groupby("window_id")["timestamp"].agg(lambda x: x.max() - x.min()).tolist() == [190, 190]
+
+
 def test_select_sessions_uses_earliest_prefix_to_hit_target(tmp_path: Path) -> None:
     cfg = _make_cfg(tmp_path, min_total_bytes=0, target_total_bytes=100)
     user_dir = cfg.raw_root / "user1"

@@ -193,6 +193,8 @@ def run_auth_inference(
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"Missing input CSV: {csv_path}")
+    if max_windows is not None and int(max_windows) <= 0:
+        raise ValueError("max_windows must be positive")
 
     if output_csv is None:
         server_root = _server_root()
@@ -247,6 +249,7 @@ def run_auth_inference(
                 windows=np.stack(windows_batch, axis=0).astype("float32", copy=False),
                 device=torch_device,
                 use_amp=True,
+                score_metric=policy.score_metric,
             )
             for meta, score in zip(meta_batch, scores):
                 nonlocal current_session_key
@@ -341,7 +344,7 @@ def run_auth_inference(
             count += 1
             if len(windows_batch) >= 256:
                 flush_batch()
-            if max_windows is not None and idx >= int(max_windows):
+            if max_windows is not None and count >= int(max_windows):
                 break
 
         flush_batch()

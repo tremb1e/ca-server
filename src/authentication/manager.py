@@ -22,6 +22,7 @@ from ..utils.reject_trackers import (
     VoteRejectTracker,
     windows_for_delay,
 )
+from .runner import _sigmoid
 
 if TYPE_CHECKING:
     import torch
@@ -73,31 +74,44 @@ class AuthSessionState:
     consecutive_rejects: Any = None
     vote_rejects: Any = None
     ema_rejects: Any = None
+    last_sensor_timestamps: Dict[str, int] = field(default_factory=dict)
+    last_device_uptime_ns: int = 0
+    last_base_wall_ms: int = 0
 
 
 class VQGANModelCache:
     def __init__(self, *, max_models: int = 4, device: Optional[str] = None) -> None:
-        self._max_models = int(max_models)
+        self._max_models = max(1, int(max_models))
         self._device = device or "auto"
         self._cache: Dict[str, "torch.nn.Module"] = {}
         self._order: List[str] = []
+        self._fingerprints: Dict[str, tuple] = {}
+
+    @staticmethod
+    def _fingerprint(path: Path) -> tuple:
+        stat = path.stat()
+        return (str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
     def get(self, policy: "VQGANPolicy") -> "torch.nn.Module":
         from ..utils.accelerator import resolve_torch_device
         from .vqgan_inference import load_vqgan
 
         key = f"{policy.user}::{policy.vqgan_checkpoint}"
-        if key in self._cache:
+        fingerprint = (self._fingerprint(policy.vqgan_checkpoint), self._fingerprint(policy.vqgan_config))
+        if key in self._cache and self._fingerprints.get(key) == fingerprint:
             self._touch(key)
             return self._cache[key]
 
-        if len(self._order) >= self._max_models:
-            evict = self._order.pop(0)
-            self._cache.pop(evict, None)
-
         device = resolve_torch_device(self._device)
         model = load_vqgan(policy.vqgan_checkpoint, device=device, config_path=policy.vqgan_config)
+        if key in self._cache:
+            self._order.remove(key)
+        elif len(self._order) >= self._max_models:
+            evict = self._order.pop(0)
+            self._cache.pop(evict, None)
+            self._fingerprints.pop(evict, None)
         self._cache[key] = model
+        self._fingerprints[key] = fingerprint
         self._order.append(key)
         return model
 
@@ -197,6 +211,7 @@ class AuthSessionManager:
             ema_alpha=ema_alpha,
             model_version=cfg.model_version or cfg.vqgan_checkpoint.name,
             input_height=int(cfg.input_height),
+            score_metric=cfg.score_metric,
         )
 
     @staticmethod
@@ -536,6 +551,31 @@ class AuthSessionManager:
     def snapshot_model_cache(self) -> Dict[str, Any]:
         return self._model_cache.snapshot()
 
+    @staticmethod
+    def _fresh_sensor_records(state: AuthSessionState, records: Dict[str, List[Dict[str, Any]]], batch: dict) -> Dict[str, List[Dict[str, Any]]]:
+        uptime = int(batch.get("device_uptime_ns", 0) or 0)
+        wall = int(batch.get("base_wall_ms", 0) or 0)
+        # Older/retried packets are not proof of a reboot. Only a newer batch
+        # wall clock with a lower device uptime establishes a new clock domain.
+        if uptime > 0 and wall > state.last_base_wall_ms > 0 and 0 < uptime < state.last_device_uptime_ns:
+            state.tail_records = {"acc": [], "gyr": [], "mag": []}
+            state.last_sensor_timestamps.clear()
+            state.emit_gate.reset()
+            for tracker in (state.consecutive_rejects, state.vote_rejects, state.ema_rejects):
+                if tracker is not None:
+                    tracker.reset()
+        if wall > state.last_base_wall_ms:
+            state.last_base_wall_ms = wall
+            state.last_device_uptime_ns = uptime
+        fresh = {}
+        for sensor in ("acc", "gyr", "mag"):
+            previous = state.last_sensor_timestamps.get(sensor, -1)
+            unique = {int(record["timestamp"]): record for record in records.get(sensor, []) if int(record["timestamp"]) > previous}
+            fresh[sensor] = [unique[timestamp] for timestamp in sorted(unique)]
+            if unique:
+                state.last_sensor_timestamps[sensor] = max(unique)
+        return fresh
+
     async def handle_packet(
         self,
         *,
@@ -562,6 +602,10 @@ class AuthSessionManager:
 
             packets = [{"sensor_batch": parsed_batch}]
             records = _extract_sensor_records(packets)
+            had_samples = any(records.values())
+            records = self._fresh_sensor_records(state, records, parsed_batch)
+            if had_samples and not any(records.values()):
+                return None
             combined_records = {
                 k: (state.tail_records.get(k, []) + records.get(k, []))
                 for k in ("acc", "gyr", "mag")
@@ -613,6 +657,7 @@ class AuthSessionManager:
                     windows,
                     device=device,
                     use_amp=True,
+                    score_metric=state.policy.score_metric,
                 )
 
             # 认证结果发布延迟：把 auth.result_delay_sec 折算成需累积的窗口数。
@@ -631,7 +676,7 @@ class AuthSessionManager:
                 window_id = state.window_index + int(offset)
                 raw_score = float(score)
                 accept = bool(raw_score >= float(state.policy.threshold))
-                normalized_score = float(1.0 / (1.0 + math.exp(-raw_score)))
+                normalized_score = _sigmoid(raw_score)
 
                 interrupt = False
                 decision_accept = accept
@@ -651,8 +696,8 @@ class AuthSessionManager:
                     )
                     ema_score = None if state.ema_rejects.ema_score is None else float(state.ema_rejects.ema_score)
                     decision_accept = not bool(interrupt)
-                    decision_score = float(1.0 / (1.0 + math.exp(-float(ema_score or raw_score))))
-                    decision_threshold = float(1.0 / (1.0 + math.exp(-float(state.policy.threshold))))
+                    decision_score = _sigmoid(raw_score if ema_score is None else ema_score)
+                    decision_threshold = _sigmoid(state.policy.threshold)
                     decision_message = (
                         f"EMA={ema_score:.6f}, alpha={state.policy.ema_alpha:.3f}, threshold={state.policy.threshold:.6f}"
                         if ema_score is not None
