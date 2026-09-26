@@ -84,6 +84,9 @@ def _metrics_report_to_dict(report) -> dict:
         checker = getattr(f, "is_repeated", None)
         if callable(checker):
             return bool(checker())
+        if checker is not None:
+            # Protobuf 7 exposes a boolean property and removes ``label``.
+            return bool(checker)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             return f.label == FieldDescriptor.LABEL_REPEATED

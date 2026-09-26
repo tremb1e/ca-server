@@ -99,3 +99,7 @@ docker build --file Dockerfile \
 在正确加载 `set_env.sh` 的容器中，NPU:6 的小 VQGAN 前向、反向及实际参数更新通过；Token-LM 的 loss、反向、优化器及评分均通过，分数和损失有限。这是组件级实机验证，并非完整 Token-LM 数据集训练。日志为审计目录下 `vqgan_npu6_smoke.log`、`tokenlm_npu6_smoke.log`。
 
 直接使用 `docker exec ... bash -lc` 可能由登录 shell 重置 PATH，导致 CANN 的 `which ccec` 失败并回退到不存在的旧路径。这不是驱动挂载缺失；使用非登录 shell 并加载 toolkit 环境后上述测试通过。
+
+## 镜像内 Protobuf 7 回归
+
+宿主机使用 Protobuf `6.33.5`，实际运行镜像使用 `7.36.2`。镜像内全套测试发现指标上报的 descriptor 兼容函数只识别可调用的 `is_repeated`，随后访问了 Protobuf 7 已移除的 `label`。现同时支持布尔属性、旧版可调用接口及旧 `label` 回退；新增不含 `label` 的描述符回归。修复后的相关接口测试在宿主机 17 项通过，镜像内会重新执行完整测试。

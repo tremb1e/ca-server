@@ -39,6 +39,20 @@ class _AuthManager:
         return None
 
 
+def test_metrics_supports_protobuf_property_descriptors_without_legacy_label():
+    from google.protobuf.descriptor import FieldDescriptor
+
+    report = SimpleNamespace(
+        DESCRIPTOR=SimpleNamespace(fields=[
+            SimpleNamespace(name="count", is_repeated=False, cpp_type=FieldDescriptor.CPPTYPE_INT64),
+            SimpleNamespace(name="samples", is_repeated=True, cpp_type=FieldDescriptor.CPPTYPE_INT64),
+        ]),
+        count=7,
+        samples=[2, 3],
+    )
+    assert _metrics_report_to_dict(report) == {"count": 7, "samples": [2, 3]}
+
+
 def _service(tmp_path) -> SensorDataService:
     ctx = SimpleNamespace(
         storage=_Storage(),
