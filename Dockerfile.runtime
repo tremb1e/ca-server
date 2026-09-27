@@ -1,0 +1,14 @@
+# Rebuild application code on an immutable, locally verified Ascend runtime.
+# Pass VERIFIED_BASE as a sha256 image ID or registry digest.
+ARG VERIFIED_BASE
+FROM ${VERIFIED_BASE}
+WORKDIR /app
+# The base can contain an older frozen executable; always run the new source.
+ENV CA_SERVER_RUNTIME=python
+COPY src/ /app/src/
+COPY ca_train/ /app/ca_train/
+COPY ca_config.toml /app/ca_config.toml
+COPY deploy/entrypoint.sh /usr/local/bin/ca-entrypoint.sh
+RUN chmod +x /usr/local/bin/ca-entrypoint.sh && /opt/venv/bin/python -m compileall -q /app/src /app/ca_train
+ENTRYPOINT ["/usr/local/bin/ca-entrypoint.sh"]
+CMD ["server"]

@@ -4,6 +4,7 @@ x-ca-common-env: &ca-common-env
   - TZ=${TZ:-Asia/Shanghai}
   - APP_ROOT=/app
   - CA_CONFIG_PATH=/app/ca_config.toml
+  - CA_SERVER_RUNTIME=${CA_SERVER_RUNTIME:-auto}
   - HOST=0.0.0.0
   - PORT=${CA_SERVER_HTTP_PORT:-18000}
   - HTTP_ENABLED=${HTTP_ENABLED:-true}
@@ -36,20 +37,20 @@ x-ca-common-env: &ca-common-env
   - PYTHONUNBUFFERED=1
 
 x-ca-common-volumes: &ca-common-volumes
-  - ./deploy/config/ca_config.toml:/app/ca_config.toml:ro
-  - ./deploy/config/${CA_SERVER_ENV_FILE:-server.env.example}:/app/.env:ro
-  - ./deploy/data/raw_data:/app/data_storage/raw_data
-  - ./deploy/data/processed_data:/app/data_storage/processed_data
-  - ./deploy/data/inference:/app/data_storage/inference
-  - ./deploy/data/models:/app/data_storage/models
-  - ./deploy/data/hmog_preprocessed:/app/data_storage/hmog_preprocessed
-  - ./deploy/data/ca_train_cached_windows:/app/runtime/ca_train/cached_windows
-  - ./deploy/data/ca_train_token_caches:/app/runtime/ca_train/token_caches
-  - ./deploy/data/results:/app/results
-  - ./deploy/data/ascend/kernel_meta:/app/kernel_meta
-  - ./deploy/data/ascend/log:/app/ascend_logs
-  - ./deploy/logs:/app/logs
-  - ./deploy/certs:/app/certs:ro
+  - ${CA_DEPLOY_ROOT:-./deploy}/config/ca_config.toml:/app/ca_config.toml:ro
+  - ${CA_DEPLOY_ROOT:-./deploy}/config/${CA_SERVER_ENV_FILE:-server.env.example}:/app/.env:ro
+  - ${CA_DEPLOY_ROOT:-./deploy}/data/raw_data:/app/data_storage/raw_data
+  - ${CA_DEPLOY_ROOT:-./deploy}/data/processed_data:/app/data_storage/processed_data
+  - ${CA_DEPLOY_ROOT:-./deploy}/data/inference:/app/data_storage/inference
+  - ${CA_DEPLOY_ROOT:-./deploy}/data/models:/app/data_storage/models
+  - ${CA_DEPLOY_ROOT:-./deploy}/data/hmog_preprocessed:/app/data_storage/hmog_preprocessed
+  - ${CA_DEPLOY_ROOT:-./deploy}/data/ca_train_cached_windows:/app/runtime/ca_train/cached_windows
+  - ${CA_DEPLOY_ROOT:-./deploy}/data/ca_train_token_caches:/app/runtime/ca_train/token_caches
+  - ${CA_DEPLOY_ROOT:-./deploy}/data/results:/app/results
+  - ${CA_DEPLOY_ROOT:-./deploy}/data/ascend/kernel_meta:/app/kernel_meta
+  - ${CA_DEPLOY_ROOT:-./deploy}/data/ascend/log:/app/ascend_logs
+  - ${CA_DEPLOY_ROOT:-./deploy}/logs:/app/logs
+  - ${CA_DEPLOY_ROOT:-./deploy}/certs:/app/certs:ro
   # Future target hosts are expected to match this machine's Ascend layout.
   # Mount the host runtime directly instead of reinstalling NPU drivers/toolkit
   # into the container image.
