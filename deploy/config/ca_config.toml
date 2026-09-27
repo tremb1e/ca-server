@@ -5,12 +5,12 @@
 
 [processing]
 # 触发预处理/训练的数据阈值：当单个用户（一个设备ID目录）下的 raw session 文件总量达到该值（MB）才开始处理。
-# 默认 300MB。若把该阈值记为 100x，则下面的 split ratio 会把训练/验证/测试动态分成 75x/12.5x/12.5x。
+# 默认 300MB。下面的 split ratio 按有效采样行数切分训练/验证/测试。
 min_total_mb = 300
 
 # 选择用于处理的数据量目标：将 session 按时间顺序（文件名时间戳或 mtime 升序）排序，
-# 再从最早的 session 开始累加，优先凑够该目标值（MB）后停止（得到前 x 个 session）。
-# 对应需求中的“取优先满足阈值数据的前 x 个 session 文件”。
+# 再从最早的 session 开始读取完整 JSONL 数据包，总字节数不超过目标值（MB）。
+# 最后一份 session 只读取预算内的完整行，不修改原始文件；0 表示不限制。
 target_total_mb = 300
 
 # 用户真实数据的时间顺序切分比例。阈值为 100x 时，对应 train=75x、val=12.5x、test=12.5x。
@@ -118,7 +118,7 @@ k_rejects_mode = "by_window"
 # 本轮需求：在尽可能少打断正常用户的前提下提升恶意用户检测率，
 # 因此把窗口级误打断率（FRR）上限收紧到 0.05。
 # 注意：这里的 FRR 以“窗口”为粒度统计，并会排除每个 session 末尾 (N-1) 个窗口（无法组成完整 N 窗投票窗口）。
-target_window_frr = 0.10
+target_window_frr = 0.05
 
 # 限制真实用户会话在 max_decision_time_sec 内被误打断的概率；不填时沿用 target_window_frr。
 # max_genuine_first_interrupt_p = 0.05

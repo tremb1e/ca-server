@@ -36,8 +36,8 @@ class Settings(BaseSettings):
     hmog_data_path: Path = Field(default_factory=lambda: app_root() / "data_storage" / "hmog_preprocessed")
     processing_sampling_rate: int = 100
     # Deprecated: processing thresholds are read from ca_config.toml.
-    processing_min_total_mb: int = 100
-    processing_target_mb: int = 100
+    processing_min_total_mb: int = 300
+    processing_target_mb: int = 300
     hmog_acc_unit: str = "m/s^2"
     hmog_gyr_unit: str = "rad/s"
     hmog_mag_unit: str = "uT"
