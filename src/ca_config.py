@@ -76,7 +76,7 @@ class AuthConfig:
     ema_alpha: float = 0.25
     ema_alpha_candidates: List[float] = None  # type: ignore[assignment]
     # 允许少量真实用户“窗口”误打断的上限（0~1）。
-    target_window_frr: float = 0.10
+    target_window_frr: float = 0.05
     max_genuine_first_interrupt_p: Optional[float] = None
     policy_search_auth_method: Literal["vqgan-only", "vqgan+transformer"] = "vqgan-only"
     # 策略降级开关：默认 False —— 认证启动仅接受 policy_search 产出的正式策略
@@ -87,6 +87,13 @@ class AuthConfig:
     def __post_init__(self) -> None:
         if self.ema_alpha_candidates is None:
             object.__setattr__(self, "ema_alpha_candidates", [0.10, 0.20, 0.30, 0.40, 0.50])
+        if not math.isfinite(self.target_window_frr) or not 0.0 <= self.target_window_frr <= 1.0:
+            raise ValueError("auth.target_window_frr must be finite and between 0 and 1")
+        if self.max_genuine_first_interrupt_p is not None and (
+            not math.isfinite(self.max_genuine_first_interrupt_p)
+            or not 0.0 <= self.max_genuine_first_interrupt_p <= 1.0
+        ):
+            raise ValueError("auth.max_genuine_first_interrupt_p must be finite and between 0 and 1")
 
 
 @dataclass(frozen=True)
@@ -190,10 +197,7 @@ def load_ca_config(path: Optional[Path] = None) -> CAConfig:
         sampling_rate_hz=int(win_raw.get("sampling_rate_hz", WindowConfig.sampling_rate_hz)),
     )
 
-    target_window_frr_raw = auth_raw.get("target_window_frr", None)
-    if target_window_frr_raw is None:
-        # Backward-compatible fallback
-        target_window_frr_raw = auth_raw.get("target_session_frr", AuthConfig.target_window_frr)
+    target_window_frr_raw = auth_raw.get("target_window_frr", AuthConfig.target_window_frr)
 
     decision_strategy = str(auth_raw.get("decision_strategy", AuthConfig.decision_strategy)).strip().lower()
     if decision_strategy not in {"ema", "vote", "k"}:
