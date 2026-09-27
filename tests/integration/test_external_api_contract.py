@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from src.api import health, sensor_data
+from src.ca_config import get_ca_config
 from src.config import settings
 from src.grpc_server import SensorDataService
 from src.management.router import router as management_router
@@ -99,7 +100,7 @@ def _seed_contract_device(device_id: str = "contract-device") -> str:
             "latent_dim": 32,
             "input_height": 9,
             "input_width": 20,
-            "sensor_weights": [0.5, 0.5, 0.0],
+            "sensor_weights": list(get_ca_config().training.sensor_weights),
             "sensor_input_masking_version": SENSOR_INPUT_MASKING_VERSION,
         }),
         encoding="utf-8",
